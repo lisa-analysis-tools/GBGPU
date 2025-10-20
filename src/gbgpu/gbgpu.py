@@ -261,7 +261,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             _start_inds = self.xp.zeros((self.num_bin,), dtype=np.int32)
             if self.num_bin == 0:
                 breakpoint()
-            SharedMemoryWaveComp_wrap(AET_out, _start_inds, amp, f0, fdot, fddot, phi0, iota, psi, lam, theta, T, dt, N, num_bin, tdi_channel_setup_map[tdi_channel_setup])
+            self.backend.sharedmem.SharedMemoryWaveComp_wrap(AET_out, _start_inds, amp, f0, fdot, fddot, phi0, iota, psi, lam, theta, T, dt, N, num_bin, tdi_channel_setup_map[tdi_channel_setup])
             self.start_inds = _start_inds
             AET_out = AET_out.reshape(self.num_bin, nchannels, N)
 
@@ -831,7 +831,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 # for testing
                 try:
                     self.xp.cuda.runtime.deviceSynchronize()
-                    SharedMemoryLikeComp_wrap(*tuple_in)
+                    self.backend.sharedmem.SharedMemoryLikeComp_wrap(*tuple_in)
                     inputs_in.append([gpu, inds_here, tuple_in])
                     self.xp.cuda.runtime.deviceSynchronize()
                 except ValueError:
@@ -1097,7 +1097,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 # for testing
                 try:
                     self.xp.cuda.runtime.deviceSynchronize()
-                    SharedMemoryFstatLikeComp_wrap(*tuple_in)
+                    self.backend.sharedmem.SharedMemoryFstatLikeComp_wrap(*tuple_in)
                     inputs_in.append([gpu, inds_here, tuple_in])
                     self.xp.cuda.runtime.deviceSynchronize()
                 except ValueError:
@@ -1288,7 +1288,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         do_synchronize = True
 
         # raise NotImplementedError
-        SharedMemoryChiSquaredComp_wrap(
+        self.backend.sharedmem.SharedMemoryChiSquaredComp_wrap(
             h1_h1,
             h2_h2,
             h1_h2,
@@ -1585,7 +1585,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     # for testing
                     try:
                         self.xp.cuda.runtime.deviceSynchronize()
-                        SharedMemoryGenerateGlobal_wrap(*tuple_in)
+                        self.backend.sharedmem.SharedMemoryGenerateGlobal_wrap(*tuple_in)
                         inputs_in.append([gpu, tuple_in])
                         self.xp.cuda.runtime.deviceSynchronize()
                     except ValueError:
@@ -1931,7 +1931,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     # for testing
                     try:
                         self.xp.cuda.runtime.deviceSynchronize()
-                        SharedMemorySwapLikeComp_wrap(*tuple_in)
+                        self.backend.sharedmem.SharedMemorySwapLikeComp_wrap(*tuple_in)
                         inputs_in.append([gpu, inds_here, tuple_in])
                         self.xp.cuda.runtime.deviceSynchronize()
                     except ValueError:

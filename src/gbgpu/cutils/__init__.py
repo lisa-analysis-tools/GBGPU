@@ -14,12 +14,12 @@ from gpubackendtools.exceptions import *
 class GBGPUBackendMethods(BackendMethods):
     get_ll: typing.Callable[(...), None]
     fill_global: typing.Callable[(...), None]
-    sharedmem: typing.Callable[(...), None]
+    sharedmem: object
 
 class GBGPUBackend:
     get_ll: typing.Callable[(...), None]
     fill_global: typing.Callable[(...), None]
-    sharedmem: typing.Callable[(...), None]
+    sharedmem: object
 
     def __init__(self, gbgpu_backend_methods):
 
@@ -29,7 +29,7 @@ class GBGPUBackend:
 
         self.get_ll = gbgpu_backend_methods.get_ll
         self.fill_global = gbgpu_backend_methods.fill_global
-
+        self.sharedmem = gbgpu_backend_methods.sharedmem
 
 class GBGPUCpuBackend(CpuBackend, GBGPUBackend):
     """Implementation of the CPU backend"""
