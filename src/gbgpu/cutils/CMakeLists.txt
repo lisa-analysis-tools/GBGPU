@@ -180,7 +180,6 @@ if(GBGPU_WITH_GPU)
   target_sources(gbgpu_gpu_utils PUBLIC FILE_SET HEADERS FILES
                                          cuda_complex.hpp global.h gbgpu_utils.hh)
 
-  set(CMAKE_MODULE_PATH "src/gbgpu/cutils/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06/lib/cmake" "${CMAKE_MODULE_PATH}")
   
   # Add an include directory for a specific target
   # Find a library
@@ -223,15 +222,19 @@ if(GBGPU_WITH_GPU)
   # if(NOT TAR_RESULT EQUAL 0)
   #     message(FATAL_ERROR "Failed to extract archive: ${TAR_ERROR}")
   # endif()
-
+  message(STATUS "CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}")
+  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06/lib/cmake")
+  set(CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06/lib/cmake/" "${CMAKE_PREFIX_PATH}")
   set(mathdx_cufftdx_DISABLE_CUTLASS TRUE)
-  set(cufftdx_ROOT "./src/gbgpu/cutils/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06/")
-  find_package(cufftdx REQUIRED CONFIG)
+  #set(cufftdx_ROOT "./src/gbgpu/cutils/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06/")
+  #find_package(cufftdx REQUIRED CONFIG)
+  set(mathdx_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06/lib/cmake/mathdx")
+  find_package(mathdx REQUIRED COMPONENTS cufftdx CONFIG PATHS "${CMAKE_CURRENT_SOURCE_DIR}/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06/")
   target_sources(gbgpu_gpu_sharedmem PUBLIC FILE_SET HEADERS FILES
   global.hpp Detector.hpp cuda_complex.hpp global.h SharedMemoryGBGPU.hpp
   common.hpp fp16_common.hpp common.hpp)
   target_link_libraries(gbgpu_gpu_sharedmem PUBLIC CUDA::cudart CUDA::cublas
-      CUDA::cusparse cufftdx::cufftdx)
+      CUDA::cusparse mathdx::cufftdx)
   message(STATUS "CMAKE_INSTALL_LIBDIR HERE: ${CMAKE_INSTALL_LIBDIR}")
   install(TARGETS gbgpu_gpu_sharedmem
           LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/site-packages/gbgpu)
