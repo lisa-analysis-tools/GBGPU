@@ -848,14 +848,7 @@ void add_inner_product_contribution(
         {
             for (int chan_2 = 0; chan_2 <= chan_1; chan_2 += 1)
             {
-                if (chan_1 == chan_2)
-                {
-                    multi_factor = 1.0; // PSD
-                }
-                else
-                {
-                    multi_factor = -2.0; // CSD
-                }
+                
                 // nchannels has to be 3 here
                 if (array_type_1 == ARRAY_TYPE_DATA)
                 {
@@ -907,11 +900,27 @@ void add_inner_product_contribution(
                 }
                 n = noise[noise_ind_now];
 
+                if (chan_1 == chan_2)
+                {
+                    // multi_factor lets us skip off-diagonal double counting need
+                    *contrib_h1_h1 += (gcmplx::conj(h1_i) * h1_i * n); // n is invC
+                    *contrib_h2_h2 += (gcmplx::conj(h2_i) * h2_i * n); // n is invC
+                    *contrib_h1_h2 += (gcmplx::conj(h1_i) * h2_i * n); // n is invC
+                }
+                else
+                {
+                    // multi_factor lets us skip off-diagonal double counting need
+                    // takes care of X.conj() * Y and Y.conj() * X in XY contributions.
+                    *contrib_h1_h1 += ((gcmplx::conj(h1_i) * h1_i * n) + (gcmplx::conj(h1_i) * h1_i * n)); // n is invC
+                    *contrib_h2_h2 += ((gcmplx::conj(h2_i) * h2_i * n) + (gcmplx::conj(h2_i) * h2_i * n)); // n is invC
+                    *contrib_h1_h2 += ((gcmplx::conj(h1_i) * h2_i * n) + (gcmplx::conj(h2_i) * h1_i * n)); // n is invC
+                }
+
                 // TODO: check
                 // multi_factor lets us skip off-diagonal double counting need
-                *contrib_h1_h1 += (gcmplx::conj(h1_i) * h1_i * n); // n is invC
-                *contrib_h2_h2 += (gcmplx::conj(h2_i) * h2_i * n); // n is invC
-                *contrib_h1_h2 += (gcmplx::conj(h1_i) * h2_i * n); // n is invC
+                // *contrib_h1_h1 += (gcmplx::conj(h1_i) * h1_i * n); // n is invC
+                // *contrib_h2_h2 += (gcmplx::conj(h2_i) * h2_i * n); // n is invC
+                // *contrib_h1_h2 += (gcmplx::conj(h1_i) * h2_i * n); // n is invC
             }
         }
     }
