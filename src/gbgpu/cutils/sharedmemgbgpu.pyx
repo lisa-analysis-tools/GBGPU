@@ -23,7 +23,10 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         double dt, 
         int N, 
         int num_bin_all,
-        int tdi_channel_setup
+        int tdi_channel_setup,
+        double* Ps,
+        double L_arm,
+        bool tdi2
     ) except+
 
     void SharedMemoryLikeComp(
@@ -52,7 +55,10 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         int device,
         bool do_synchronize,
         int num_data,
-        int num_noise
+        int num_noise,
+        double* Ps,
+        double L_arm,
+        bool tdi2
     ) except+
 
     void SharedMemorySwapLikeComp(
@@ -93,7 +99,10 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         int device,
         bool do_synchronize,
         int num_data,
-        int num_noise
+        int num_noise,
+        double* Ps,
+        double L_arm,
+        bool tdi2
     ) except+
 
     void SharedMemoryChiSquaredComp(
@@ -121,7 +130,10 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         int device,
         bool do_synchronize,
         int num_data, 
-        int num_noise
+        int num_noise,
+        double* Ps,
+        double L_arm,
+        bool tdi2
     ) except+
 
     void SharedMemoryGenerateGlobal(
@@ -145,7 +157,10 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         int data_length,
         int tdi_channel_setup,
         int device,
-        bool do_synchronize
+        bool do_synchronize,
+        double* Ps,
+        double L_arm,
+        bool tdi2
     ) except+
 
     void SharedMemoryFstatLikeComp(
@@ -170,7 +185,10 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         int device,
         bool do_synchronize,
         int num_data,
-        int num_noise
+        int num_noise, 
+        double* Ps,
+        double L_arm, 
+        bool tdi2
     ) except+
 
 def SharedMemoryWaveComp_wrap(*args, **kwargs):
@@ -190,7 +208,10 @@ def SharedMemoryWaveComp_wrap(*args, **kwargs):
         dt, 
         N,
         num_bin_all, 
-        tdi_channel_setup
+        tdi_channel_setup,
+        Ps,
+        L_arm,
+        tdi2
     ), tkwargs = wrapper(*args, **kwargs)
 
     cdef size_t tdi_out_in = tdi_out
@@ -204,6 +225,7 @@ def SharedMemoryWaveComp_wrap(*args, **kwargs):
     cdef size_t psi_in = psi
     cdef size_t lam_in = lam
     cdef size_t theta_in = theta
+    cdef size_t Ps_in = Ps
 
     SharedMemoryWaveComp(
         <cmplx *> tdi_out_in,
@@ -221,7 +243,10 @@ def SharedMemoryWaveComp_wrap(*args, **kwargs):
         dt,
         N,
         num_bin_all,
-        tdi_channel_setup
+        tdi_channel_setup,
+        <double *>Ps_in,
+        L_arm,
+        tdi2
     )
 
 
@@ -252,7 +277,10 @@ def SharedMemoryLikeComp_wrap(*args, **kwargs):
         device,
         do_synchronize,
         num_data,
-        num_noise
+        num_noise,
+        Ps,
+        L_arm,
+        tdi2
     ), tkwargs = wrapper(*args, **kwargs)
     
 
@@ -272,6 +300,7 @@ def SharedMemoryLikeComp_wrap(*args, **kwargs):
     cdef size_t lam_in = lam
     cdef size_t theta_in = theta
     cdef size_t start_freq_inds_in = start_freq_inds
+    cdef size_t Ps_in = Ps
 
     SharedMemoryLikeComp(
         <cmplx *> d_h_in,
@@ -299,7 +328,10 @@ def SharedMemoryLikeComp_wrap(*args, **kwargs):
         device,
         do_synchronize,
         num_data,
-        num_noise
+        num_noise,
+        <double *> Ps_in,
+        L_arm, 
+        tdi2
     )
 
 
@@ -342,7 +374,10 @@ def SharedMemorySwapLikeComp_wrap(*args, **kwargs):
         device,
         do_synchronize,
         num_data,
-        num_noise
+        num_noise,
+        Ps,
+        L_arm,
+        tdi2
     ), tkwargs = wrapper(*args, **kwargs)
 
     cdef size_t d_h_remove_in = d_h_remove
@@ -373,6 +408,7 @@ def SharedMemorySwapLikeComp_wrap(*args, **kwargs):
     cdef size_t lam_remove_in = lam_remove
     cdef size_t theta_remove_in = theta_remove
     cdef size_t start_freq_inds_in = start_freq_inds
+    cdef size_t Ps_in = Ps
 
     SharedMemorySwapLikeComp(
         <cmplx *> d_h_remove_in,
@@ -412,7 +448,10 @@ def SharedMemorySwapLikeComp_wrap(*args, **kwargs):
         device,
         do_synchronize,
         num_data,
-        num_noise
+        num_noise,
+        <double *> Ps_in,
+        L_arm, 
+        tdi2
     )
 
 
@@ -443,7 +482,10 @@ def SharedMemoryChiSquaredComp_wrap(*args, **kwargs):
         device,
         do_synchronize,
         num_data, 
-        num_noise
+        num_noise,
+        Ps,
+        L_arm,
+        tdi2
     ), tkwargs = wrapper(*args, **kwargs)
 
     cdef size_t h1_h1_in = h1_h1
@@ -461,6 +503,7 @@ def SharedMemoryChiSquaredComp_wrap(*args, **kwargs):
     cdef size_t lam_in = lam
     cdef size_t theta_in = theta
     cdef size_t start_freq_inds_in = start_freq_inds
+    cdef size_t Ps_in = Ps
 
     SharedMemoryChiSquaredComp(
         <cmplx *> h1_h1_in,
@@ -487,7 +530,10 @@ def SharedMemoryChiSquaredComp_wrap(*args, **kwargs):
         device,
         do_synchronize,
         num_data, 
-        num_noise
+        num_noise,
+        <double *> Ps_in,
+        L_arm,
+        tdi2
     )
 
 
@@ -513,7 +559,10 @@ def SharedMemoryGenerateGlobal_wrap(*args, **kwargs):
         data_length,
         tdi_channel_setup,
         device,
-        do_synchronize
+        do_synchronize, 
+        Ps,
+        L_arm,
+        tdi2
     ), tkwargs = wrapper(*args, **kwargs)
 
     cdef size_t data_in = data
@@ -529,6 +578,7 @@ def SharedMemoryGenerateGlobal_wrap(*args, **kwargs):
     cdef size_t theta_in = theta
     cdef size_t factors_in = factors
     cdef size_t start_freq_inds_in = start_freq_inds
+    cdef size_t Ps_in = Ps
 
     SharedMemoryGenerateGlobal(
         <cmplx *> data_in,
@@ -551,7 +601,10 @@ def SharedMemoryGenerateGlobal_wrap(*args, **kwargs):
         data_length,
         tdi_channel_setup,
         device,
-        do_synchronize
+        do_synchronize,
+        <double *> Ps_in,
+        L_arm,
+        tdi2
     )
 
 
@@ -578,7 +631,10 @@ def SharedMemoryFstatLikeComp_wrap(*args, **kwargs):
         device,
         do_synchronize,
         num_data,
-        num_noise
+        num_noise,
+        Ps,
+        L_arm,
+        tdi2
     ), tkwargs = wrapper(*args, **kwargs)
 
     cdef size_t M_mat_in = M_mat
@@ -593,6 +649,7 @@ def SharedMemoryFstatLikeComp_wrap(*args, **kwargs):
     cdef size_t lam_in = lam
     cdef size_t theta_in = theta
     cdef size_t start_freq_inds_in = start_freq_inds
+    cdef size_t Ps_in = Ps
 
     SharedMemoryFstatLikeComp(
         <cmplx *> M_mat_in,
@@ -616,5 +673,8 @@ def SharedMemoryFstatLikeComp_wrap(*args, **kwargs):
         device,
         do_synchronize,
         num_data,
-        num_noise
+        num_noise,
+        <double *> Ps_in,
+        L_arm,
+        tdi2
     )

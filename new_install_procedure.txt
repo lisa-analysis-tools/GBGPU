@@ -1,0 +1,6 @@
+To install the dev version of GBGPU copy the dev branch and run the following command:
+pip install scikit_build_core
+pip install setuptools_scm
+pip install cython
+pip install --no-build-isolation .
+

@@ -36,7 +36,10 @@ void SharedMemoryWaveComp(
     double dt,
     int N, 
     int num_bin_all, 
-    int tdi_channel_setup
+    int tdi_channel_setup,
+    double* Ps,
+    double L_arm,
+    bool tdi2
 );
 
 typedef struct InputInfoTag{
@@ -116,6 +119,9 @@ typedef struct InputInfoTag{
     cmplx* M_mat;
     cmplx* N_arr;
     int *start_inds_out;
+    double *Ps;
+    double L_arm;
+    bool tdi2;
 } InputInfo; 
 
 void SharedMemoryLikeComp(
@@ -144,7 +150,10 @@ void SharedMemoryLikeComp(
     int device,
     bool do_synchronize,
     int num_data,
-    int num_noise
+    int num_noise,
+    double* Ps,
+    double L_arm,
+    bool tdi2
 );
 
 
@@ -186,7 +195,10 @@ void SharedMemorySwapLikeComp(
     int device,
     bool do_synchronize,
     int num_data,
-    int num_noise
+    int num_noise,
+    double* Ps,
+    double L_arm,
+    bool tdi2
 );
 
 void SharedMemoryChiSquaredComp(
@@ -214,7 +226,10 @@ void SharedMemoryChiSquaredComp(
     int device,
     bool do_synchronize,
     int num_data, 
-    int num_noise
+    int num_noise,
+    double* Ps,
+    double L_arm,
+    bool tdi2
 );
 
 
@@ -239,7 +254,10 @@ void SharedMemoryGenerateGlobal(
     int data_length,
     int tdi_channel_setup,
     int device,
-    bool do_synchronize
+    bool do_synchronize,
+    double* Ps,
+    double L_arm,
+    bool tdi2
 );
 
 
@@ -265,7 +283,10 @@ void SharedMemoryFstatLikeComp(
     int device,
     bool do_synchronize,
     int num_data,
-    int num_noise
+    int num_noise,
+    double* Ps, 
+    double L_arm,
+    bool tdi2
 );
 
 #endif // __SHAREDMEMORY_GBGPU_HPP__

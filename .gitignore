@@ -210,3 +210,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# weird gpu/cutils installs
+src/gbgpu/cutils/nvidia-mathdx-25.06.1/

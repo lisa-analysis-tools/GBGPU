@@ -86,6 +86,20 @@ endfunction()
 # * * Definition of compiled backends * *
 # * * * * * * * * * * * * * * * * * * * *
 
+execute_process(
+  COMMAND "${PYTHON_EXECUTABLE}" -c "if True:
+    import gpubackendtools
+    print(gpubackendtools.__file__.split('__init__.py')[0] + 'cutils')"
+  OUTPUT_VARIABLE GBT_CUTILS
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+if(EXISTS "${GBT_CUTILS}")
+    message("INFO: ${GBT_CUTILS} exists.")
+else()
+    message(FATAL_ERROR "${GBT_CUTILS} not found.")
+    # Handle the case where the file is missing
+endif()
+
 # ----------------
 # --- utils ---
 # ----------------
@@ -156,6 +170,7 @@ if(GBGPU_WITH_CPU)
 
   python_add_library(gbgpu_cpu_utils MODULE WITH_SOABI Detector.cxx utils.cxx gbgpu_utils.cxx)
   apply_cpu_backend_common_options(utils)
+  target_include_directories(gbgpu_cpu_utils PUBLIC ${GBT_CUTILS})
 
   target_sources(gbgpu_cpu_utils PUBLIC FILE_SET HEADERS FILES
   global.hpp Detector.hpp cuda_complex.hpp global.h gbgpu_utils.hh)
@@ -163,6 +178,7 @@ if(GBGPU_WITH_CPU)
   
   python_add_library(gbgpu_cpu_sharedmem MODULE WITH_SOABI Detector.cxx SharedMemoryGBGPU.cxx sharedmemgbgpu.cxx)
   apply_cpu_backend_common_options(sharedmem)
+  target_include_directories(gbgpu_cpu_sharedmem PUBLIC ${GBT_CUTILS})  
   target_sources(gbgpu_cpu_sharedmem PUBLIC FILE_SET HEADERS FILES
   global.hpp Detector.hpp cuda_complex.hpp global.h SharedMemoryGBGPU.hpp
   common.hpp fp16_common.hpp common.hpp)
@@ -177,6 +193,7 @@ endif()
 if(GBGPU_WITH_GPU)
   python_add_library(gbgpu_gpu_utils MODULE WITH_SOABI utils.cxx gbgpu_utils.cu)
   apply_gpu_backend_common_options(utils)
+  target_include_directories(gbgpu_gpu_utils PUBLIC ${GBT_CUTILS})  
   target_sources(gbgpu_gpu_utils PUBLIC FILE_SET HEADERS FILES
                                          cuda_complex.hpp global.h gbgpu_utils.hh)
 
@@ -185,6 +202,7 @@ if(GBGPU_WITH_GPU)
   # Find a library
   python_add_library(gbgpu_gpu_sharedmem MODULE WITH_SOABI Detector.cu SharedMemoryGBGPU.cu sharedmemgbgpu.cxx)
   apply_gpu_backend_common_options(sharedmem)
+  target_include_directories(gbgpu_gpu_sharedmem PUBLIC ${GBT_CUTILS})  
   message(STATUS "CUDA ARCHS HERE: ${GBGPU_CUDA_ARCH}")
   set_property(TARGET gbgpu_gpu_sharedmem PROPERTY CUDA_ARCHITECTURES ${GBGPU_CUDA_ARCH})
   set_property(TARGET gbgpu_gpu_sharedmem PROPERTY CUDA_SEPARABLE_COMPILATION ON)
@@ -352,5 +370,3 @@ endif()
 
 #   # Installation options
 #   install(TARGETS "${module_name}" DESTINATION ${backend_name})
-
-
