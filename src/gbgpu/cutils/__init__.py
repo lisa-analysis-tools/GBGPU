@@ -7,7 +7,7 @@ import abc
 from typing import Optional, Sequence, TypeVar, Union
 from ..utils.exceptions import *
 
-from gpubackendtools.gpubackendtools import BackendMethods, CpuBackend, Cuda11xBackend, Cuda12xBackend
+from gpubackendtools.gpubackendtools import BackendMethods, CpuBackend, Cuda11xBackend, Cuda12xBackend, Cuda13xBackend
 from gpubackendtools.exceptions import *
 
 @dataclasses.dataclass
@@ -127,6 +127,40 @@ class GBGPUCuda12xBackend(Cuda12xBackend, GBGPUBackend):
             get_ll=gbgpu_backend_cuda12x.utils.get_ll,
             fill_global=gbgpu_backend_cuda12x.utils.fill_global,
             sharedmem=gbgpu_backend_cuda12x.sharedmem,
+            xp=cupy,
+        )
+        
+class GBGPUCuda13xBackend(Cuda13xBackend, GBGPUBackend):
+    """Implementation of CUDA 13.x backend"""
+    _backend_name : str = "gbgpu_backend_cuda13x"
+    _name = "gbgpu_cuda13x"
+    
+    def __init__(self, *args, **kwargs):
+        Cuda13xBackend.__init__(self, *args, **kwargs)
+        GBGPUBackend.__init__(self, self.cuda13x_module_loader())
+        
+    @staticmethod
+    def cuda13x_module_loader():
+        try:
+            import gbgpu_backend_cuda13x.utils
+            import gbgpu_backend_cuda13x.sharedmem
+
+        except (ModuleNotFoundError, ImportError) as e:
+            raise BackendUnavailableException(
+                "'cuda13x' backend could not be imported."
+            ) from e
+
+        try:
+            import cupy
+        except (ModuleNotFoundError, ImportError) as e:
+            raise MissingDependencies(
+                "'cuda13x' backend requires cupy", pip_deps=["cupy-cuda13x"]
+            ) from e
+
+        return GBGPUBackendMethods(
+            get_ll=gbgpu_backend_cuda13x.utils.get_ll,
+            fill_global=gbgpu_backend_cuda13x.utils.fill_global,
+            sharedmem=gbgpu_backend_cuda13x.sharedmem,
             xp=cupy,
         )
 

@@ -196,7 +196,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         T = N_obs * dt
         
         # === This part of the codes checks for Mojito like orbtis and ensures proper handling of t0 ===
-        tm_rel = self.xp.linspace(0, T, num=N, endpoint=False)
+        tm_rel = self.xp.linspace(0, T, num=N_obs, endpoint=False)
         tm_abs = tm_rel + self.t0_abs
         Ps = self._spacecraft(tm_abs)  # Query spacecraft positions at absolute time
         
@@ -235,7 +235,11 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         if N is None:
             # N_temp = self.special_get_N(amp, f0, T, *args, oversample=oversample)
             N_temp = getattr(self, "special_get_N")(amp, f0, T, *args, oversample=oversample)
-            N = N_temp.max()
+            
+            if hasattr(N_temp.max(), "item"):
+                N = int(N_temp.max().item())
+            else:
+                N = int(N_temp.max())
 
         # number of binaries is determined from length of amp array
         self.num_bin = num_bin = len(amp)
@@ -280,8 +284,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 nchannels = 3
 
             tm_abs = tm_rel + self.t0_abs
-    
-            AET_out = self.xp.zeros((self.num_bin * nchannels * N,), dtype=complex)
+            AET_out = self.xp.ones((self.num_bin * nchannels * int(N),), dtype=complex)
             _start_inds = self.xp.zeros((self.num_bin,), dtype=np.int32)
             if self.num_bin == 0:
                 breakpoint()
@@ -1593,7 +1596,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 assert t.shape[0] == nchannels
                 data_length = t.shape[1]
                 # print("check this does not create memory issues")
-                templates_in[t_i] = t.flatten()
+                templates_in[t_i] = t.ravel()
 
             else:
                 ntemplate, _nchannels, data_length = t.shape
@@ -1601,7 +1604,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 assert _nchannels == nchannels
                 # print("check this does not create memory issues")
                 
-                templates_in[t_i] = t.flatten()
+                templates_in[t_i] = t.ravel()
 
         if self.gpus is not None:
             do_synchronize = False

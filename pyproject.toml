@@ -97,6 +97,7 @@ sdist.include = [
   "src/gbgpu/git_version.py",                 #@SKIP_PLUGIN@
   "src/gbgpu_backend_cuda11x/git_version.py",
   "src/gbgpu_backend_cuda12x/git_version.py",
+  "src/gbgpu_backend_cuda13x/git_version.py",
   "tests/"
 ]
 sdist.exclude = [

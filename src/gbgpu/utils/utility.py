@@ -252,6 +252,20 @@ def get_N(amp, f0, Tobs, oversample=1):
     N = M * (M > N) + N * (M < N)
 
     M[M > 8192] = 8192
+    
+    # FIX: Use ceil() to guarantee we land exactly on a power of 2
+    M_pow = np.ceil(np.log2(Acut) + 1.0)
+    M = (2.0 ** M_pow).astype(int)
+
+    # Take the maximum of the baseline N and the SNR-adjusted M
+    M = np.maximum(M, N)
+
+    # FIX: Absolutely enforce that N never exceeds 2048 
+    # to prevent crashing the C++ switch statement
+    M = np.minimum(M, 1024)
+    
+    # Ensure it doesn't drop below the minimum C++ supported size
+    M = np.maximum(M, 32)
 
     N = M
 
