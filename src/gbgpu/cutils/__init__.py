@@ -7,7 +7,7 @@ import abc
 from typing import Optional, Sequence, TypeVar, Union
 from ..utils.exceptions import *
 
-from gpubackendtools.gpubackendtools import BackendMethods, CpuBackend, Cuda11xBackend, Cuda12xBackend
+from gpubackendtools.gpubackendtools import BackendMethods, CpuBackend, Cuda11xBackend, Cuda12xBackend, Cuda13xBackend
 from gpubackendtools.exceptions import *
 
 @dataclasses.dataclass
@@ -91,6 +91,7 @@ class GBGPUCuda11xBackend(Cuda11xBackend, GBGPUBackend):
             xp=cupy,
         )
 
+
 class GBGPUCuda12xBackend(Cuda12xBackend, GBGPUBackend):
     """Implementation of CUDA 12.x backend"""
     _backend_name : str = "gbgpu_backend_cuda12x"
@@ -124,7 +125,41 @@ class GBGPUCuda12xBackend(Cuda12xBackend, GBGPUBackend):
         )
 
 
+class GBGPUCuda13xBackend(Cuda13xBackend, GBGPUBackend):
+    """Implementation of CUDA 13.x backend"""
+    _backend_name : str = "gbgpu_backend_cuda13x"
+    _name = "gbgpu_cuda13x"
+    
+    def __init__(self, *args, **kwargs):
+        Cuda13xBackend.__init__(self, *args, **kwargs)
+        GBGPUBackend.__init__(self, self.cuda13x_module_loader())
+        
+    @staticmethod
+    def cuda13x_module_loader():
+        try:
+            import gbgpu_backend_cuda13x.utils
+
+        except (ModuleNotFoundError, ImportError) as e:
+            raise BackendUnavailableException(
+                "'cuda13x' backend could not be imported."
+            ) from e
+
+        try:
+            import cupy
+        except (ModuleNotFoundError, ImportError) as e:
+            raise MissingDependencies(
+                "'cuda13x' backend requires cupy", pip_deps=["cupy-cuda13x"]
+            ) from e
+
+        return GBGPUBackendMethods(
+            get_ll=gbgpu_backend_cuda13x.utils.get_ll,
+            fill_global=gbgpu_backend_cuda13x.utils.fill_global,
+            xp=cupy,
+        )
+        
+        
 KNOWN_BACKENDS = {
+    "cuda13x": GBGPUCuda13xBackend,
     "cuda12x": GBGPUCuda12xBackend,
     "cuda11x": GBGPUCuda11xBackend,
     "cpu": GBGPUCpuBackend,
