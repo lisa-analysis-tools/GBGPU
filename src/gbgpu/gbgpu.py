@@ -1652,6 +1652,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     tm_abs = tm_rel + self.t0_abs
                     Ps_arr = self.xp.asarray(self._spacecraft(tm_abs)).flatten()
                     
+                    assert isinstance(T, float)
+                    assert isinstance(dt, float)
+                    
                     tuple_in = (
                         (
                             templates_here,
@@ -1667,7 +1670,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                             Ps_arr, self.orbits.armlength, tdi2
                         )
                     )
-                        
+
                     # for testing
                     try:
                         self.xp.cuda.runtime.deviceSynchronize()
@@ -1675,7 +1678,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                         self.shared_mem_backend.SharedMemoryGenerateGlobal_wrap(*tuple_in)
                         inputs_in.append([gpu, tuple_in])
                         self.xp.cuda.runtime.deviceSynchronize()
-                    except ValueError:
+                    except:
                         breakpoint()
   
             for gpu, inputs_tmp in inputs_in:
