@@ -839,52 +839,62 @@ void add_inner_product_contribution(
         {
             for (int chan_2 = 0; chan_2 <= chan_1; chan_2 += 1)
             {
-                
-                // nchannels has to be 3 here
+                cmplx h1_c1, h1_c2, h2_c1, h2_c2;
+                int data_ind_now_1, data_ind_now_2;
+                int template_ind_now_1, template_ind_now_2;
+
                 if (array_type_1 == ARRAY_TYPE_DATA)
                 {
-                    data_ind_now = (data_ind * nchannels + chan_1) * data_length + i_1;
-                    if ((data_ind_now >= nchannels * data_length * num_data) | (i_1 > data_length))
+                    data_ind_now_1 = (data_ind * nchannels + chan_1) * data_length + i_1;
+                    data_ind_now_2 = (data_ind * nchannels + chan_2) * data_length + i_1;
+                    if ((data_ind_now_1 >= nchannels * data_length * num_data) || (i_1 > data_length))
                     {
-                        printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_1, data_length);
+                        printf("Above full data range. %d, %d, %d, %d\n", data_ind_now_1, nchannels * data_length * num_data, i_1, data_length);
                         continue;
                     }
-                    h1_i = h1[data_ind_now];
+                    h1_c1 = h1[data_ind_now_1];
+                    h1_c2 = h1[data_ind_now_2];
                 }
                 else
                 {
-                    template_ind_now = chan_1 * N + i_1;
-                    if ((template_ind_now >= nchannels * N) | (i_1 > N))
+                    template_ind_now_1 = chan_1 * N + i_1;
+                    template_ind_now_2 = chan_2 * N + i_1;
+                    if ((template_ind_now_1 >= nchannels * N) || (i_1 > N))
                     {
-                        printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, N * nchannels, i_1, N);
+                        printf("Above full template range. %d, %d, %d, %d\n", template_ind_now_1, N * nchannels, i_1, N);
                         continue;
                     }
-                    h1_i = h1[template_ind_now];
+                    h1_c1 = h1[template_ind_now_1];
+                    h1_c2 = h1[template_ind_now_2];
                 }
 
                 if (array_type_2 == ARRAY_TYPE_DATA)
                 {
-                    data_ind_now = (data_ind * nchannels + chan_2) * data_length + i_2;
-                    if ((data_ind_now >= nchannels * data_length * num_data) | (i_2 > data_length))
+                    data_ind_now_1 = (data_ind * nchannels + chan_1) * data_length + i_2;
+                    data_ind_now_2 = (data_ind * nchannels + chan_2) * data_length + i_2;
+                    if ((data_ind_now_1 >= nchannels * data_length * num_data) || (i_2 > data_length))
                     {
-                        printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_2, data_length);
+                        printf("Above full data range. %d, %d, %d, %d\n", data_ind_now_1, nchannels * data_length * num_data, i_2, data_length);
                         continue;
                     }
-                    h2_i = h2[data_ind_now];
+                    h2_c1 = h2[data_ind_now_1];
+                    h2_c2 = h2[data_ind_now_2];
                 }
                 else
                 {
-                    template_ind_now = chan_2 * N + i_2;
-                    if ((template_ind_now >= nchannels * N) | (i_2 > N))
+                    template_ind_now_1 = chan_1 * N + i_2;
+                    template_ind_now_2 = chan_2 * N + i_2;
+                    if ((template_ind_now_1 >= nchannels * N) || (i_2 > N))
                     {
-                        printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, N * nchannels, i_2, N);
+                        printf("Above full template range. %d, %d, %d, %d\n", template_ind_now_1, N * nchannels, i_2, N);
                         continue;
                     }
-                    h2_i = h2[template_ind_now];
+                    h2_c1 = h2[template_ind_now_1];
+                    h2_c2 = h2[template_ind_now_2];
                 }
 
                 noise_ind_now = ((noise_ind * 3 + chan_1) * 3 + chan_2) * data_length + noise_i;
-                if ((noise_ind_now >= nchannels * nchannels * data_length * num_noise) | (noise_i > data_length))
+                if ((noise_ind_now >= nchannels * nchannels * data_length * num_noise) || (noise_i > data_length))
                 {
                     printf("Above full noise range.%d, %d, %d, %d\n", noise_ind_now, nchannels * data_length * num_noise, noise_i, data_length);
                     continue;
@@ -893,25 +903,18 @@ void add_inner_product_contribution(
 
                 if (chan_1 == chan_2)
                 {
-                    // multi_factor lets us skip off-diagonal double counting need
-                    *contrib_h1_h1 += (gcmplx::conj(h1_i) * h1_i * n); // n is invC
-                    *contrib_h2_h2 += (gcmplx::conj(h2_i) * h2_i * n); // n is invC
-                    *contrib_h1_h2 += (gcmplx::conj(h1_i) * h2_i * n); // n is invC
+                    // Diagonal components (X-X, Y-Y, Z-Z)
+                    *contrib_h1_h1 += (gcmplx::conj(h1_c1) * h1_c1 * n); // n is invC
+                    *contrib_h2_h2 += (gcmplx::conj(h2_c1) * h2_c1 * n); // n is invC
+                    *contrib_h1_h2 += (gcmplx::conj(h1_c1) * h2_c1 * n); // n is invC
                 }
                 else
                 {
-                    // multi_factor lets us skip off-diagonal double counting need
-                    // takes care of X.conj() * Y and Y.conj() * X in XY contributions.
-                    *contrib_h1_h1 += ((gcmplx::conj(h1_i) * h1_i * n) + (gcmplx::conj(h1_i) * h1_i * n)); // n is invC
-                    *contrib_h2_h2 += ((gcmplx::conj(h2_i) * h2_i * n) + (gcmplx::conj(h2_i) * h2_i * n)); // n is invC
-                    *contrib_h1_h2 += ((gcmplx::conj(h1_i) * h2_i * n) + (gcmplx::conj(h2_i) * h1_i * n)); // n is invC
+                    // Off-diagonal cross components (accounts for hermitian symmetry C_ij = C_ji*)
+                    *contrib_h1_h1 += (gcmplx::conj(h1_c1) * h1_c2 * n) + (gcmplx::conj(h1_c2) * h1_c1 * n); 
+                    *contrib_h2_h2 += (gcmplx::conj(h2_c1) * h2_c2 * n) + (gcmplx::conj(h2_c2) * h2_c1 * n);
+                    *contrib_h1_h2 += (gcmplx::conj(h1_c1) * h2_c2 * n) + (gcmplx::conj(h1_c2) * h2_c1 * n); 
                 }
-
-                // TODO: check
-                // multi_factor lets us skip off-diagonal double counting need
-                // *contrib_h1_h1 += (gcmplx::conj(h1_i) * h1_i * n); // n is invC
-                // *contrib_h2_h2 += (gcmplx::conj(h2_i) * h2_i * n); // n is invC
-                // *contrib_h1_h2 += (gcmplx::conj(h1_i) * h2_i * n); // n is invC
             }
         }
     }
@@ -3290,16 +3293,19 @@ void get_fstat_ll(
             for (int i = start2; i < N; i += incr2)
             {
                 jj = i + start_ind - start_freq_ind;
-               
-                add_inner_product_contribution(
-                    &tmp2, &_ignore_this, &_ignore_this_2, 
-                    data, &wave[ii * 3 * N], 
-                    jj, i, 
-                    ARRAY_TYPE_DATA, ARRAY_TYPE_TEMPLATE,
-                    noise, noise_ind, jj,
-                    data_ind, tdi_channel_setup, data_length, N,
-                    num_data, num_noise
-                );
+                for (int chan = 0; chan < nchannels; chan += 1)
+                {
+                    
+                    add_inner_product_contribution(
+                        &tmp2, &_ignore_this, &_ignore_this_2, 
+                        data, &wave[(ii * 3 * N) + chan * N], 
+                        jj, i, 
+                        ARRAY_TYPE_DATA, ARRAY_TYPE_TEMPLATE,
+                        noise, noise_ind, jj,
+                        data_ind, tdi_channel_setup, data_length, N,
+                        num_data, num_noise
+                    );
+                }
             }
             CUDA_SYNCTHREADS;
             N_temp[tid] = tmp2;
@@ -3331,16 +3337,18 @@ void get_fstat_ll(
                 for (int i = start2; i < N; i += incr2)
                 {
                     jj = i + start_ind - start_freq_ind;
-
-                    add_inner_product_contribution(
-                        &tmp1, &_ignore_this, &_ignore_this_2, 
-                        &wave[ii * 3 * N], &wave[kk * 3 * N], 
-                        i, i,
-                        ARRAY_TYPE_TEMPLATE, ARRAY_TYPE_TEMPLATE,
-                        noise, noise_ind, jj,
-                        data_ind, tdi_channel_setup, data_length, N,
-                        num_data, num_noise
-                    );
+                    for (int chan = 0; chan < nchannels; chan += 1)
+                    {
+                        add_inner_product_contribution(
+                            &tmp1, &_ignore_this, &_ignore_this_2, 
+                            &wave[(ii * 3 * N) + chan * N], &wave[(kk * 3 * N) + chan * N], 
+                            i, i,
+                            ARRAY_TYPE_TEMPLATE, ARRAY_TYPE_TEMPLATE,
+                            noise, noise_ind, jj,
+                            data_ind, tdi_channel_setup, data_length, N,
+                            num_data, num_noise
+                        );
+                    }
                 }
                 
                 M_temp[tid] = tmp1;

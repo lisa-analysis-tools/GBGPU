@@ -3290,16 +3290,19 @@ void get_fstat_ll(
             for (int i = start2; i < N; i += incr2)
             {
                 jj = i + start_ind - start_freq_ind;
-               
-                add_inner_product_contribution(
-                    &tmp2, &_ignore_this, &_ignore_this_2, 
-                    data, &wave[ii * 3 * N], 
-                    jj, i, 
-                    ARRAY_TYPE_DATA, ARRAY_TYPE_TEMPLATE,
-                    noise, noise_ind, jj,
-                    data_ind, tdi_channel_setup, data_length, N,
-                    num_data, num_noise
-                );
+                for (int chan = 0; chan < nchannels; chan += 1)
+                {
+                    
+                    add_inner_product_contribution(
+                        &tmp2, &_ignore_this, &_ignore_this_2, 
+                        data, &wave[(ii * 3 * N) + chan * N], 
+                        jj, i, 
+                        ARRAY_TYPE_DATA, ARRAY_TYPE_TEMPLATE,
+                        noise, noise_ind, jj,
+                        data_ind, tdi_channel_setup, data_length, N,
+                        num_data, num_noise
+                    );
+                }
             }
             CUDA_SYNCTHREADS;
             N_temp[tid] = tmp2;
@@ -3331,16 +3334,18 @@ void get_fstat_ll(
                 for (int i = start2; i < N; i += incr2)
                 {
                     jj = i + start_ind - start_freq_ind;
-
-                    add_inner_product_contribution(
-                        &tmp1, &_ignore_this, &_ignore_this_2, 
-                        &wave[ii * 3 * N], &wave[kk * 3 * N], 
-                        i, i,
-                        ARRAY_TYPE_TEMPLATE, ARRAY_TYPE_TEMPLATE,
-                        noise, noise_ind, jj,
-                        data_ind, tdi_channel_setup, data_length, N,
-                        num_data, num_noise
-                    );
+                    for (int chan = 0; chan < nchannels; chan += 1)
+                    {
+                        add_inner_product_contribution(
+                            &tmp1, &_ignore_this, &_ignore_this_2, 
+                            &wave[(ii * 3 * N) + chan * N], &wave[(kk * 3 * N) + chan * N], 
+                            i, i,
+                            ARRAY_TYPE_TEMPLATE, ARRAY_TYPE_TEMPLATE,
+                            noise, noise_ind, jj,
+                            data_ind, tdi_channel_setup, data_length, N,
+                            num_data, num_noise
+                        );
+                    }
                 }
                 
                 M_temp[tid] = tmp1;

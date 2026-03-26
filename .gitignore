@@ -213,3 +213,7 @@ __marimo__/
 
 # weird gpu/cutils installs
 src/gbgpu/cutils/nvidia-mathdx-25.06.1/
+src/gbgpu/cutils/nvidia-mathdx-25.06.1-cuda12.tar.gz
+
+# not pushing version
+src/gbgpu/_version.py

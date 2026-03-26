@@ -660,8 +660,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         start_freq_ind=0,
         data_index=None,
         noise_index=None,
-        # adjust_inplace=False,
-        # use_c_implementation=False,
+        adjust_inplace=False,
+        use_c_implementation=False,
         N=None,
         T=4 * YRSID_SI,
         dt=10.0,
@@ -886,7 +886,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 )    
                 
                 # self.xp.cuda.runtime.deviceSynchronize()
-                
+
                 # for testing
                 try:
                     self.xp.cuda.runtime.deviceSynchronize()
@@ -946,8 +946,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         start_freq_ind=0,
         data_index=None,
         noise_index=None,
-        # adjust_inplace=False,
-        # use_c_implementation=False,
+        adjust_inplace=False,
+        use_c_implementation=False,
         N=None,
         T=4 * YRSID_SI,
         dt=10.0,
@@ -1165,7 +1165,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 )    
                 
                 # self.xp.cuda.runtime.deviceSynchronize()
-                
+
                 # for testing
                 try:
                     self.xp.cuda.runtime.deviceSynchronize()
