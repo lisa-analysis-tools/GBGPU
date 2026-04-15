@@ -12,7 +12,7 @@ from .utils.parallelbase import GBGPUParallelModule
 
 try:
     from lisatools.sensitivity import A1TDISens
-
+    from lisatools.sensitivity import XYZSensitivityBackend
     tdi_available = True
 
 except (ModuleNotFoundError, ImportError) as e:
@@ -21,7 +21,8 @@ except (ModuleNotFoundError, ImportError) as e:
 
 from .utils.utility import *
 
-from lisatools.detector import EqualArmlengthOrbits, Orbits
+from lisatools.detector import EqualArmlengthOrbits, Orbits, L1Orbits
+from lisatools.domains import FDSettings
 from typing import Optional, Sequence, TypeVar, Union
 
 from gpubackendtools.parallelbase import ParallelModuleBase
@@ -66,12 +67,18 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
     """
 
-    def __init__(self, orbits: Optional[Orbits] = None, force_backend = None, t0 = None):
-        GBGPUParallelModule.__init__(self, force_backend=force_backend)
+    def __init__(self, orbits: Optional[Orbits | L1Orbits] = None, force_backend = None, t0 = None, domain_settings = None):
+        self.force_backend = force_backend
+        GBGPUParallelModule.__init__(self, force_backend=self.force_backend)
+        
         self.d_d = None
         
+        if isinstance(orbits, (Orbits, L1Orbits)):
+            self.orbits = orbits
+        else:
+            raise ValueError("Expected an Orbits object")
+        
         self.orbits = orbits
-        # assert isinstance(self.orbits, Orbits), 'Orbits were not correctly initiated'
         
         # handling of correct orbits for Mojito like-data
         if t0 is None:
@@ -80,6 +87,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             t0_abs = t0
 
         self.t0_abs = t0_abs
+        
+        self.domain_settings = domain_settings
         self.gpus: Optional[list] = None
         
         self.shared_mem_backend = getattr(self.backend, "sharedmem")
@@ -198,7 +207,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         # === This part of the codes checks for Mojito like orbtis and ensures proper handling of t0 ===
         tm_rel = self.xp.linspace(0, T, num=N_obs, endpoint=False)
         tm_abs = tm_rel + self.t0_abs
-        Ps = self._spacecraft(tm_abs)  # Query spacecraft positions at absolute time
+        Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()
         
         # === MODIFIED: Check orbital data availability ===
         # For L1Orbits, use sc_t_base directly instead of t_base
@@ -268,7 +277,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         self.N = N
 
         # figure out start inds
-        q_check = (f0 * T).astype(np.int32)
+        # q_check = (f0 * T).astype(np.int32)
         # self.start_inds = (q_check - N / 2).astype(xp.int32)
         # self.start_inds = (q_check - N / 2).astype(xp.int32)
 
@@ -284,15 +293,13 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 nchannels = 3
 
             tm_abs = tm_rel + self.t0_abs
-            AET_out = self.xp.ones((self.num_bin * nchannels * int(N),), dtype=complex)
+            response_out = self.xp.ones((self.num_bin * nchannels * int(N),), dtype=complex)
             _start_inds = self.xp.zeros((self.num_bin,), dtype=np.int32)
             if self.num_bin == 0:
                 breakpoint()
-                
-            Ps_arr = self.xp.asarray(Ps).flatten()
-            
+                        
             tuple_in = (
-                AET_out,
+                response_out,
                 _start_inds,
                 amp, f0, fdot, fddot, phi0, iota, psi, lam, theta,
                 T, dt, N, num_bin, 
@@ -302,9 +309,12 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             # self.backend.sharedmem.SharedMemoryWaveComp_wrap(*tuple_in)
             self.shared_mem_backend.SharedMemoryWaveComp_wrap(*tuple_in)
             self.start_inds = _start_inds
-            AET_out = AET_out.reshape(self.num_bin, nchannels, N)
+            response_out = response_out.reshape(self.num_bin, nchannels, N)
 
-            self.AETf = AET_out
+            if tdi_channel_setup == "XYZ":
+                self.XYZf = response_out
+            else:
+                self.AETf = response_out
             # setup waveforms for efficient GPU likelihood or global template building
             return
 
@@ -371,7 +381,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             tdi2_factor = 2.0j * self.xp.sin(2 * omegaL) * self.xp.exp(-2j * omegaL)
             fctr *= tdi2_factor
 
-        if isinstance(fctr, float):
+        if isinstance(fctr, (float, int)):
             fctr = self.xp.array([fctr])
 
         XYZf *= fctr[:, None, None]
@@ -688,7 +698,11 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         return_to_main_device = self.gpus[0]
         self.xp.cuda.runtime.setDevice(return_to_main_device)
 
-        
+        # get spacecraft positions
+        tm_rel = self.xp.linspace(0, T, num=int(T/dt), endpoint=False)
+        tm_abs = tm_rel + self.t0_abs
+        Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()  
+
         self.num_bin = num_bin = params.shape[0]
 
         if N is None:
@@ -718,16 +732,14 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         nchannels = 3 if tdi_channel_setup != "AE" else 2
 
         if isinstance(data_minus_template, self.xp.ndarray):
-            data_minus_template_in = [data_minus_template]
-
+            data_minus_template_in = [data_minus_template.astype(self.xp.complex128)]
         else:
-            data_minus_template_in = data_minus_template
+            data_minus_template_in = [tmp.astype(self.xp.complex128) for tmp in data_minus_template]
 
         if isinstance(psd, self.xp.ndarray):
-            psd_in = [psd]
-
+            psd_in = [psd.astype(self.xp.complex128)]
         else:
-            psd_in = psd
+            psd_in = [p.astype(self.xp.complex128) for p in psd]
 
         num_data = []
         for t_i, t in enumerate(data_minus_template_in):
@@ -861,10 +873,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 noise_index_in = self.xp.asarray(noise_index[keep_bool] % num_per_gpu).astype(np.int32)
                 data_index_in = self.xp.asarray(data_index[keep_bool] % num_per_gpu).astype(np.int32)
                 
-                tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
-                tm_abs = tm_rel + self.t0_abs
-                Ps_arr = self.xp.asarray(self._spacecraft(tm_abs)).flatten()
-                
                 tuple_in = (
                     (
                         d_h_temp,
@@ -894,7 +902,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     self.shared_mem_backend.SharedMemoryLikeComp_wrap(*tuple_in)
                     inputs_in.append([gpu, inds_here, tuple_in])
                     self.xp.cuda.runtime.deviceSynchronize()
-                except ValueError:
+                except ValueError as e:
+                    print(f"C++ Kernel Signature Rejection Details: {e}")
                     breakpoint()
 
         for gpu, inds_gpu, inputs_tmp in inputs_in:
@@ -969,6 +978,11 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         return_to_main_device = self.gpus[0]
         self.xp.cuda.runtime.setDevice(return_to_main_device)
 
+        # get spacecraft positions
+        tm_rel = self.xp.linspace(0, T, num=int(T/dt), endpoint=False)
+        tm_abs = tm_rel + self.t0_abs
+        Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten() 
+        
         self.num_bin = num_bin = params.shape[0]
 
         if N is None:
@@ -999,16 +1013,14 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         nchannels = 3 if tdi_channel_setup != "AE" else 2
 
         if isinstance(data_minus_template, self.xp.ndarray):
-            data_minus_template_in = [data_minus_template]
-
+            data_minus_template_in = [data_minus_template.astype(self.xp.complex128)]
         else:
-            data_minus_template_in = data_minus_template
+            data_minus_template_in = [tmp.astype(self.xp.complex128) for tmp in data_minus_template]
 
         if isinstance(psd, self.xp.ndarray):
-            psd_in = [psd]
-
+            psd_in = [psd.astype(self.xp.complex128)]
         else:
-            psd_in = psd
+            psd_in = [p.astype(self.xp.complex128) for p in psd]
 
         num_data = []
         for t_i, t in enumerate(data_minus_template_in):
@@ -1140,10 +1152,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 
                 noise_index_in = self.xp.asarray(noise_index[keep_bool] % num_per_gpu).astype(np.int32)
                 data_index_in = self.xp.asarray(data_index[keep_bool] % num_per_gpu).astype(np.int32)
-                
-                tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
-                tm_abs = tm_rel + self.t0_abs
-                Ps_arr = self.xp.asarray(self._spacecraft(tm_abs)).flatten()
                     
                 tuple_in = (
                     (
@@ -1548,6 +1556,11 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             # set first index gpu device to control main operations
             self.xp.cuda.runtime.setDevice(self.gpus[0])
 
+        # get spacecraft positions
+        tm_rel = self.xp.linspace(0, T, num=int(T/dt), endpoint=False)
+        tm_abs = tm_rel + self.t0_abs
+        Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten() 
+        
         self.num_bin = num_bin = params.shape[0]
 
         if N is None:
@@ -1647,10 +1660,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                         # TODO: fix this num_templates
                         start_freq_ind_tmp = start_freq_ind
                     assert len(start_freq_ind_tmp) == num_templates[gpu_i]
-                    
-                    tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
-                    tm_abs = tm_rel + self.t0_abs
-                    Ps_arr = self.xp.asarray(self._spacecraft(tm_abs)).flatten()
                     
                     assert isinstance(T, float)
                     assert isinstance(dt, float)
@@ -1823,6 +1832,11 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             return_to_main_device = self.gpus[0]
             self.xp.cuda.runtime.setDevice(return_to_main_device)
 
+        # get spacecraft positions
+        tm_rel = self.xp.linspace(0, T, num=int(T/dt), endpoint=False)
+        tm_abs = tm_rel + self.t0_abs
+        Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten() 
+        
         self.num_bin = num_bin = params_add.shape[0]
 
         if N is None:
@@ -1852,16 +1866,14 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         nchannels = 3 if tdi_channel_setup != "AE" else 2
 
         if isinstance(data_minus_template, self.xp.ndarray):
-            data_minus_template_in = [data_minus_template]
-
+            data_minus_template_in = [data_minus_template.astype(self.xp.complex128)]
         else:
-            data_minus_template_in = data_minus_template
+            data_minus_template_in = [tmp.astype(self.xp.complex128) for tmp in data_minus_template]
 
         if isinstance(psd, self.xp.ndarray):
-            psd_in = [psd]
-
+            psd_in = [psd.astype(self.xp.complex128)]
         else:
-            psd_in = psd
+            psd_in = [p.astype(self.xp.complex128) for p in psd]
 
         num_data = []
         for t_i, t in enumerate(data_minus_template_in):
@@ -2002,10 +2014,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
                     noise_index_in = self.xp.asarray(noise_index[keep_bool] % num_per_gpu).astype(np.int32)
                     data_index_in = self.xp.asarray(data_index[keep_bool] % num_per_gpu).astype(np.int32)
-                    
-                    tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
-                    tm_abs = tm_rel + self.t0_abs
-                    Ps_arr = self.xp.asarray(self._spacecraft(tm_abs)).flatten()
                         
                     tuple_in = (
                         (
@@ -2242,7 +2250,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         psd_kwargs={},
         easy_central_difference=False,
         return_gpu=False,
-        **kwargs,
+        **waveform_kwargs,
     ):
         """Get the information matrix for a batch.
 
@@ -2295,7 +2303,23 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 Occurs when NOT providing ``psd_func`` kwarg.
 
         """
-
+        if N is None:
+            raise ValueError("N must be provided up front for Infromation Matrix.")
+            # put the N used here into kwargs
+        waveform_kwargs["N"] = N       
+        self.N = N
+        
+        assert "T" in waveform_kwargs
+        assert 'tdi_channel_setup' in waveform_kwargs
+        
+        params = np.atleast_2d(params)
+        q_check = (params[1,:] / 1000.0 * waveform_kwargs["T"]).astype(np.int32) # sampling params are in mHz
+        self.start_inds = (q_check - N / 2).astype(np.int32)
+        
+        # get frequencies for each binary
+        self.df = 1 / waveform_kwargs["T"]
+        freqs = self.freqs
+        
         if psd_func is None:
             # check if sensitivity information is available
             if not tdi_available:
@@ -2303,18 +2327,36 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     "Sensitivity curve information through LISA Analysis Tools is not available. Stock option for Information matrix will not work. Please install LISA Analysis Tools (pip install lisaanalysistools)."
                 )
             psd_func = A1TDISens.get_Sn
-
-        if N is None:
-            raise ValueError("N must be provided up front for Infromation Matrix.")
-        # put the N used here into kwargs
-        kwargs["N"] = N
-
-        params = np.atleast_2d(params)
-
+        
+        # get psd or csd
+        if psd_func is XYZSensitivityBackend:
+            assert waveform_kwargs["tdi_channel_setup"] == "XYZ"
+            assert isinstance(self.orbits, L1Orbits)
+            assert self.domain_settings is not None
+            assert self.force_backend is not None
+            
+            psd_func = XYZSensitivityBackend(
+                orbits=self.orbits,
+                settings=self.domain_settings,
+                force_backend=self.force_backend,
+                mask_percentage=0.02
+            )
+            psd_full_freq_range = psd_func(**psd_kwargs).sens_mat
+            
+            idx_to_extract = self.start_inds[:, None] + self.xp.arange(self.N)
+            psd = psd_full_freq_range[:, :, idx_to_extract]
+            
+        elif psd_func is A1TDISens:
+            assert waveform_kwargs["tdi_channel_setup"] == "AE"
+            psd = self.xp.asarray(psd_func(freqs, **psd_kwargs))
+            
+        else: 
+            raise NotImplementedError("Only XYZ and AE channel setup is currently supported.")
+        
         # get shape information
-        num_params = len(params)
-        num_bins = len(params[0])
-
+        num_params, num_bins = params.shape
+        nchannels = len(waveform_kwargs["tdi_channel_setup"])
+        
         # fill inds if not given
         if inds is None:
             inds = np.arange(num_params)
@@ -2324,7 +2366,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         info_matrix = self.xp.zeros((num_bins, num_derivs, num_derivs))
 
         # derivative buffer for waveforms
-        dh = self.xp.zeros((num_bins, num_derivs, 2, N), self.xp.complex128)
+        dh = self.xp.zeros((num_bins, num_derivs, nchannels, N), self.xp.complex128)
 
         for i, ind in enumerate(inds):
             # 1 eps up derivative
@@ -2335,8 +2377,10 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             params_up_1 = self._apply_parameter_transforms(
                 params_up_1, parameter_transforms
             )
-            self.run_wave(*params_up_1, **kwargs)
-            h_I_up_eps = self.xp.asarray([self.A, self.E]).transpose((1, 0, 2))
+            self.run_wave(*params_up_1, **waveform_kwargs)
+            h_I_up_eps = self.xp.asarray([
+                getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
+            ]).transpose((1, 0, 2))
 
             # 1 eps down derivative
             # map all the parameters to 1
@@ -2346,8 +2390,10 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             params_down_1 = self._apply_parameter_transforms(
                 params_down_1, parameter_transforms
             )
-            self.run_wave(*params_down_1, **kwargs)
-            h_I_down_eps = self.xp.asarray([self.A, self.E]).transpose((1, 0, 2))
+            self.run_wave(*params_down_1, **waveform_kwargs)
+            h_I_down_eps = self.xp.asarray([
+                getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
+            ]).transpose((1, 0, 2))
 
             # compute derivative and store
             if easy_central_difference:
@@ -2364,8 +2410,11 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 params_up_2 = self._apply_parameter_transforms(
                     params_up_2, parameter_transforms
                 )
-                self.run_wave(*params_up_2, **kwargs)
-                h_I_up_2eps = self.xp.asarray([self.A, self.E]).transpose((1, 0, 2))
+                self.run_wave(*params_up_2, **waveform_kwargs)
+                h_I_up_2eps = self.xp.asarray([
+                    getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
+                ]).transpose((1, 0, 2))
+                
                 # TODO: check this? in ldc validation this was uncommented
                 # if not np.all(self.start_inds == self.start_inds[0]):
                 #     raise ValueError(
@@ -2380,31 +2429,40 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 params_down_2 = self._apply_parameter_transforms(
                     params_down_2, parameter_transforms
                 )
-                self.run_wave(*params_down_2, **kwargs)
-                h_I_down_2eps = self.xp.asarray([self.A, self.E]).transpose((1, 0, 2))
+                self.run_wave(*params_down_2, **waveform_kwargs)
+                h_I_down_2eps = self.xp.asarray([
+                    getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
+                ]).transpose((1, 0, 2))
 
                 dh[:, i] = (
                     -h_I_up_2eps + h_I_down_2eps + 8 * (h_I_up_eps - h_I_down_eps)
                 ) / (12 * eps)
 
-        # get frequencies for each binary
-        freqs = self.freqs
-
-        # get psd
-        psd = self.xp.asarray(psd_func(freqs, **psd_kwargs))
-
+        if waveform_kwargs["tdi_channel_setup"] == "XYZ":
+            csd_batched = psd.transpose(2, 3, 0, 1) # (num_bins, N, 3, 3)
+            inv_csd_batched = self.xp.linalg.inv(csd_batched)
+            inv_csd = inv_csd_batched.transpose(0, 2, 3, 1) # (num_bins, 3, 3, N)
+        
         # compute Information matrix via inner products
         for i in range(num_derivs):
             for j in range(i, num_derivs):
-                # innter product between derivatives
-                inner_prod = (
-                    4
-                    * self.df
-                    * self.xp.sum(
-                        (dh[:, i].conj() * dh[:, j]).real / psd[:, None, :], axis=(1, 2)
+                # inner product between derivatives
+                if waveform_kwargs["tdi_channel_setup"] == "XYZ":
+                    # using einstein summation: b=binary, c=channel 1, d=channel 2, k=frequency
+                    inner_prod= (
+                        4.0 * self.df
+                        * self.xp.einsum(
+                            "bck,bcdk,bdk->b", dh[:, i].conj(), inv_csd, dh[:, j]
+                        ).real
                     )
-                )
-
+                else:
+                    inner_prod = (
+                        4.0 * self.df
+                        * self.xp.sum(
+                            (dh[:, i].conj() * dh[:, j]).real / psd[:, None, :], axis=(1, 2)
+                        )
+                    )
+           
                 # symmetry
                 info_matrix[:, i, j] = inner_prod
                 info_matrix[:, j, i] = info_matrix[:, i, j]

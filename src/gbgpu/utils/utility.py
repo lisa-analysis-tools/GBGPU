@@ -253,24 +253,25 @@ def get_N(amp, f0, Tobs, oversample=1):
 
         Acut = amp * np.sqrt(Tobs / Sm)
 
-        M = (2.0 ** (np.log(Acut) / np.log(2.0) + 1.0)).astype(int)
+        exponent = np.ceil(np.log(Acut) / np.log(2.0) + 1)
+        M = np.round(2.0 ** exponent).astype(int)
 
-        M = M * (M > N) + N * (M < N)
-        N = M * (M > N) + N * (M < N)
+        N = np.maximum(M, N)
     else:
         warnings.warn(
-            "Sensitivity information not available. The number of points in the waveform will not be determined byt the signal strength without the availability of the Sensitivity."
+            "Sensitivity information not available. The number of points in the waveform "
+            "will not be determined by the signal strength."
         )
-        M = N
-
-    # cuda implementation relies on Nmax=2048, previously 8192
-    Nmax = 2048
-    M[M > Nmax] = Nmax
-
-    N = M
-
+        
     # adjust with oversample
-    N_out = (N * oversample).astype(int)
+    N_out = (N * oversample).astype(np.int32)
+
+    # cuda implementation relies on Nmax=2048
+    Nmax = 2048
+    N_out = np.minimum(N_out, Nmax)
+
+    if np.any(N_out) == 0:
+        breakpoint()
 
     return N_out    
 

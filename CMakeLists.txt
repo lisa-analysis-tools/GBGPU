@@ -47,7 +47,7 @@ set_property(
 # backend if it is compiled. See the documentation of CUDA_ARCHITECTURES:
 # https://cmake.org/cmake/help/latest/prop_tgt/CUDA_ARCHITECTURES.html
 set(
-  GBGPU_CUDA_ARCH "80;86;90"
+  GBGPU_CUDA_ARCH "native"
   CACHE STRING "CUDA Architecture targetted for GBGPU compilation (see doc of \
           CMAKE_CUDA_ARCHITECTURES)."
 )

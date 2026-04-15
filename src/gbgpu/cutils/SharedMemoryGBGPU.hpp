@@ -60,7 +60,7 @@ typedef struct InputInfoTag{
     cmplx *d_h;
     cmplx *h_h;
     cmplx *data_arr;
-    double *noise; // invC
+    cmplx *noise; // invC
     int *data_index;
     int *noise_index;
     int start_freq_ind;
@@ -128,7 +128,7 @@ void SharedMemoryLikeComp(
     cmplx* d_h,
     cmplx* h_h,
     cmplx* data,
-    double* noise,
+    cmplx* noise,
     int* data_index,
     int* noise_index,
     double* amp, 
@@ -164,7 +164,7 @@ void SharedMemorySwapLikeComp(
     cmplx* add_add,
     cmplx* add_remove,
     cmplx* data,
-    double* noise,
+    cmplx* noise,
     int* data_index,
     int* noise_index,
     double* amp_add, 
@@ -205,7 +205,7 @@ void SharedMemoryChiSquaredComp(
     cmplx *h1_h1,
     cmplx *h2_h2,
     cmplx *h1_h2,
-    double *noise,
+    cmplx *noise,
     int *noise_index,
     double *amp,
     double *f0,
@@ -265,7 +265,7 @@ void SharedMemoryFstatLikeComp(
     cmplx *M_mat,
     cmplx *N_arr,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *f0,

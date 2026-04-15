@@ -755,7 +755,7 @@ void add_inner_product_contribution(
     int i_2, //
     int array_type_1,
     int array_type_2,
-    double *noise,
+    cmplx *noise, // noise CSD is complex for its off-diagonal elements in frequency domain
     int noise_ind,
     int noise_i,
     int data_ind, // ignored if array types are both templates
@@ -765,153 +765,99 @@ void add_inner_product_contribution(
     int num_data,
     int num_noise
 )
-{
-    int nchannels = 3;
-    double multi_factor = 1.0;
-    cmplx h1_i, h2_i;
-    double n;
-    int noise_ind_now, data_ind_now, template_ind_now;
-    if (tdi_channel_setup == TDI_CHANNEL_SETUP_AE) nchannels = 2;
+{   
+    int nchannels = (tdi_channel_setup == TDI_CHANNEL_SETUP_AE) ? 2 : 3;
+
+    // Local registers to optimize and bound global memory fetches
+    cmplx h1_v[3] = {0.0, 0.0, 0.0};
+    cmplx h2_v[3] = {0.0, 0.0, 0.0};
+    bool valid = true;
+
+    // int nchannels = 3;
+    // double multi_factor = 1.0;
+    // cmplx h1_i, h2_i;
+    // double n;
+    // if (tdi_channel_setup == TDI_CHANNEL_SETUP_AE) nchannels = 2;
+    
+    // gather values for all channels
+    for (int chan = 0; chan < nchannels; chan += 1)
+    {
+        if (array_type_1 == ARRAY_TYPE_DATA)
+        {  
+            int data_ind_now = (data_ind * nchannels + chan) * data_length + i_1;
+            if ((data_ind_now >= nchannels * data_length * num_data) || (i_1 > data_length))
+            {
+                printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_1, data_length);
+            }
+            else h1_v[chan] = h1[data_ind_now];
+        }
+        else
+        {
+            int template_ind_now = chan * N + i_1;
+            if ((template_ind_now >= nchannels * N) || (i_1 > N))
+            {
+                printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, nchannels * N, i_1, N);
+            }
+            else h1_v[chan] = h1[template_ind_now];
+        }
+
+        if (array_type_2 == ARRAY_TYPE_DATA)
+        {
+            int data_ind_now = (data_ind * nchannels + chan) * data_length + i_2;
+            if ((data_ind_now >= nchannels * data_length * num_data) || (i_2 > data_length))
+            {
+                printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_2, data_length);
+            }
+            else h2_v[chan] = h2[data_ind_now];
+        }
+        else
+        {
+            int template_ind_now = chan * N + i_2;
+            if ((template_ind_now >= nchannels * N) || (i_2 > N))
+            {
+                printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, nchannels * N, i_2, N);
+            }
+            else h2_v[chan] = h2[template_ind_now];
+        }
+    }
+
 
     if ((tdi_channel_setup == TDI_CHANNEL_SETUP_AE) || (tdi_channel_setup == TDI_CHANNEL_SETUP_AET))
     {
         for (int chan = 0; chan < nchannels; chan += 1)
         {
-            noise_ind_now = (noise_ind * nchannels + chan) * data_length + noise_i;
-            
-            if ((noise_ind_now >= nchannels * data_length * num_noise) | (noise_i > data_length))
+            int noise_ind_now = (noise_ind * nchannels + chan) * data_length + noise_i;
+            if ((noise_ind_now >= nchannels * data_length * num_noise) || (noise_i > data_length))
             {
                 printf("Above full noise range.%d, %d, %d, %d\n", noise_ind_now, nchannels * data_length * num_noise, noise_i, data_length);
                 continue;
             }
-            n = noise[noise_ind_now];
+            
+            cmplx n = noise[noise_ind_now];
 
-            if (array_type_1 == ARRAY_TYPE_DATA)
-            {
-                data_ind_now = (data_ind * nchannels + chan) * data_length + i_1;
-                if ((data_ind_now >= nchannels * data_length * num_data) | (i_1 > data_length))
-                {
-                    printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_1, data_length);
-                    continue;
-                }
-                h1_i = h1[data_ind_now];
-            }
-            else
-            {
-                template_ind_now = chan * N + i_1;
-                if ((template_ind_now >= nchannels * N) | (i_1 > N))
-                {
-                    printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, nchannels * N, i_1, N);
-                    continue;
-                }
-                h1_i = h1[template_ind_now];
-            }
-
-            if (array_type_2 == ARRAY_TYPE_DATA)
-            {
-                data_ind_now = (data_ind * nchannels + chan) * data_length + i_2;
-                if ((data_ind_now >= nchannels * data_length * num_data) | (i_2 > data_length))
-                {
-                    printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_1, data_length);
-                    continue;
-                }
-                h2_i = h2[data_ind_now];
-            }
-            else
-            {
-                template_ind_now = chan * N + i_2;
-                if ((template_ind_now >= nchannels * N) | (i_2 > N))
-                {
-                    printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, nchannels * N, i_2, N);
-                    continue;
-                }
-                h2_i = h2[template_ind_now];
-            }
-
-            *contrib_h1_h1 += (gcmplx::conj(h1_i) * h1_i * n); // n is invC
-            *contrib_h2_h2 += (gcmplx::conj(h2_i) * h2_i * n); // n is invC
-            *contrib_h1_h2 += (gcmplx::conj(h1_i) * h2_i * n); // n is invC
+            *contrib_h1_h1 += (gcmplx::conj(h1_v[chan]) * h1_v[chan] * n);
+            *contrib_h2_h2 += (gcmplx::conj(h2_v[chan]) * h2_v[chan] * n);
+            *contrib_h1_h2 += (gcmplx::conj(h1_v[chan]) * h2_v[chan] * n);
         }
     }
     else
     {
-        for (int chan_1 = 0; chan_1 < 3; chan_1 += 1)
+        for (int chan_1 = 0; chan_1 < nchannels; chan_1 += 1)
         {
-            for (int chan_2 = 0; chan_2 <= chan_1; chan_2 += 1)
+            for (int chan_2 = 0; chan_2 < nchannels; chan_2 += 1)
             {
-                
-                // nchannels has to be 3 here
-                if (array_type_1 == ARRAY_TYPE_DATA)
+                int noise_ind_now = ((noise_ind * nchannels + chan_1) * nchannels + chan_2) * data_length + noise_i;
+                if ((noise_ind_now >= nchannels * nchannels * data_length * num_noise) || (noise_i > data_length))
                 {
-                    data_ind_now = (data_ind * nchannels + chan_1) * data_length + i_1;
-                    if ((data_ind_now >= nchannels * data_length * num_data) | (i_1 > data_length))
-                    {
-                        printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_1, data_length);
-                        continue;
-                    }
-                    h1_i = h1[data_ind_now];
-                }
-                else
-                {
-                    template_ind_now = chan_1 * N + i_1;
-                    if ((template_ind_now >= nchannels * N) | (i_1 > N))
-                    {
-                        printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, N * nchannels, i_1, N);
-                        continue;
-                    }
-                    h1_i = h1[template_ind_now];
-                }
-
-                if (array_type_2 == ARRAY_TYPE_DATA)
-                {
-                    data_ind_now = (data_ind * nchannels + chan_2) * data_length + i_2;
-                    if ((data_ind_now >= nchannels * data_length * num_data) | (i_2 > data_length))
-                    {
-                        printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_2, data_length);
-                        continue;
-                    }
-                    h2_i = h2[data_ind_now];
-                }
-                else
-                {
-                    template_ind_now = chan_2 * N + i_2;
-                    if ((template_ind_now >= nchannels * N) | (i_2 > N))
-                    {
-                        printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, N * nchannels, i_2, N);
-                        continue;
-                    }
-                    h2_i = h2[template_ind_now];
-                }
-
-                noise_ind_now = ((noise_ind * 3 + chan_1) * 3 + chan_2) * data_length + noise_i;
-                if ((noise_ind_now >= nchannels * nchannels * data_length * num_noise) | (noise_i > data_length))
-                {
-                    printf("Above full noise range.%d, %d, %d, %d\n", noise_ind_now, nchannels * data_length * num_noise, noise_i, data_length);
+                    printf("Above full noise range.%d, %d, %d, %d\n", noise_ind_now, nchannels * nchannels * data_length * num_noise, noise_i, data_length);
                     continue;
                 }
-                n = noise[noise_ind_now];
+                
+                cmplx n = noise[noise_ind_now]; 
 
-                if (chan_1 == chan_2)
-                {
-                    // multi_factor lets us skip off-diagonal double counting need
-                    *contrib_h1_h1 += (gcmplx::conj(h1_i) * h1_i * n); // n is invC
-                    *contrib_h2_h2 += (gcmplx::conj(h2_i) * h2_i * n); // n is invC
-                    *contrib_h1_h2 += (gcmplx::conj(h1_i) * h2_i * n); // n is invC
-                }
-                else
-                {
-                    // multi_factor lets us skip off-diagonal double counting need
-                    // takes care of X.conj() * Y and Y.conj() * X in XY contributions.
-                    *contrib_h1_h1 += ((gcmplx::conj(h1_i) * h1_i * n) + (gcmplx::conj(h1_i) * h1_i * n)); // n is invC
-                    *contrib_h2_h2 += ((gcmplx::conj(h2_i) * h2_i * n) + (gcmplx::conj(h2_i) * h2_i * n)); // n is invC
-                    *contrib_h1_h2 += ((gcmplx::conj(h1_i) * h2_i * n) + (gcmplx::conj(h2_i) * h1_i * n)); // n is invC
-                }
-
-                // TODO: check
-                // multi_factor lets us skip off-diagonal double counting need
-                // *contrib_h1_h1 += (gcmplx::conj(h1_i) * h1_i * n); // n is invC
-                // *contrib_h2_h2 += (gcmplx::conj(h2_i) * h2_i * n); // n is invC
-                // *contrib_h1_h2 += (gcmplx::conj(h1_i) * h2_i * n); // n is invC
+                *contrib_h1_h1 += (gcmplx::conj(h1_v[chan_1]) * h1_v[chan_2] * n);
+                *contrib_h2_h2 += (gcmplx::conj(h2_v[chan_1]) * h2_v[chan_2] * n);
+                *contrib_h1_h2 += (gcmplx::conj(h1_v[chan_1]) * h2_v[chan_2] * n);
             }
         }
     }
@@ -925,7 +871,7 @@ void get_ll(
     cmplx *d_h,
     cmplx *h_h,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *amp,
@@ -988,7 +934,6 @@ void get_ll(
     // example::io<FFT>::load_to_smem(this_block_data, shared_mem);
 
     cmplx d, h;
-    double n;
     int start_freq_ind;
 
 #ifdef __CUDACC__
@@ -1186,7 +1131,7 @@ void SharedMemoryLikeComp(
     cmplx *d_h,
     cmplx *h_h,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *amp,
@@ -1243,7 +1188,7 @@ void SharedMemoryLikeComp(
     inputs.num_noise = num_noise;
     inputs.Ps = Ps;
     inputs.L_arm = L_arm;
-    inputs.tdi2;
+    inputs.tdi2 = tdi2;
 
 #ifdef __CUDACC__
     switch (N)
@@ -1331,7 +1276,7 @@ void get_swap_ll_diff(
     cmplx *add_add,
     cmplx *add_remove,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *amp_add,
@@ -1423,15 +1368,11 @@ void get_swap_ll_diff(
     bool is_add_lower;
     int total_i_vals;
 
-    cmplx h_A, h_E, h_A_add, h_E_add, h_A_remove, h_E_remove;
     int real_ind, real_ind_add, real_ind_remove;
 
     int jj = 0;
     int j = 0;
     // example::io<FFT>::load_to_smem(this_block_data, shared_mem);
-
-    cmplx d_A, d_E;
-    double n_A, n_E;
 
 #ifdef __CUDACC__
     int start1 = blockIdx.x;
@@ -1959,7 +1900,7 @@ void SharedMemorySwapLikeComp(
     cmplx *add_add,
     cmplx *add_remove,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *amp_add,
@@ -2035,9 +1976,9 @@ void SharedMemorySwapLikeComp(
     inputs.do_synchronize = do_synchronize;
     inputs.num_data = num_data;
     inputs.num_noise = num_noise;
-    inputs.Ps;
-    inputs.L_arm;
-    inputs.tdi2;
+    inputs.Ps = Ps;
+    inputs.L_arm = L_arm;
+    inputs.tdi2 = tdi2;
 
 #ifdef __CUDACC__
     switch (N)
@@ -2133,7 +2074,7 @@ void get_chi_squared(
     cmplx *h1_h1,
     cmplx *h2_h2,
     cmplx *h1_h2,
-    double *noise,
+    cmplx *noise,
     int *noise_index,
     double *amp,
     double *f0,
@@ -2212,7 +2153,6 @@ void get_chi_squared(
     cmplx _ignore_this = 0.0;
     cmplx _ignore_this_2 = 0.0;
     // example::io<FFT>::load_to_smem(this_block_data, shared_mem);
-    double n;
 #ifdef __CUDACC__
     int start1 = blockIdx.x;
     int incr1 = gridDim.x;
@@ -2626,7 +2566,7 @@ void SharedMemoryChiSquaredComp(
     cmplx *h1_h1,
     cmplx *h2_h2,
     cmplx *h1_h2,
-    double *noise,
+    cmplx *noise,
     int *noise_index,
     double *amp,
     double *f0,
@@ -3148,7 +3088,7 @@ void get_fstat_ll(
     cmplx *M_mat,
     cmplx *N_arr,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *f0,
@@ -3210,7 +3150,6 @@ void get_fstat_ll(
     // example::io<FFT>::load_to_smem(this_block_data, shared_mem);
 
     cmplx d, h;
-    double n;
     int start_freq_ind;
 
     double iota_arr[4] = {M_PI / 2.0, M_PI / 2.0, M_PI / 2.0, M_PI / 2.0};
@@ -3467,7 +3406,7 @@ void SharedMemoryFstatLikeComp(
     cmplx *M_mat,
     cmplx *N_arr,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *f0,
