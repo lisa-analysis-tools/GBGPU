@@ -1,4 +1,7 @@
-# gbgpu: GPU/CPU Galactic Binary Waveforms
+# GBGPU
+
+[![Doc badge](https://img.shields.io/badge/Docs-master-brightgreen)](https://mikekatz04.github.io/GBGPU)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17138723.svg)](https://doi.org/10.5281/zenodo.17138723)
 
 `GBGPU` is a GPU-accelerated version of the `FastGB` waveform which has been developed by Neil Cornish, Tyson Littenberg, Travis Robson, and Stas Babak. It computes gravitational waveforms for Galactic binary systems observable by LISA using a fast/slow-type decomposition. For more details on the original construction of `FastGB` see [arXiv:0704.1808](https://arxiv.org/abs/0704.1808).
 
@@ -8,96 +11,219 @@ The code is CPU/GPU agnostic. CUDA and NVIDIA GPUs are required to run these cod
 
 See the [documentation](https://mikekatz04.github.io/GBGPU/) for more details. This code was designed for [arXiv:2205.03461](https://arxiv.org/abs/2205.03461). If you use any part of this code, please cite [arXiv:2205.03461](https://arxiv.org/abs/2205.03461), its [Zenodo page](https://zenodo.org/records/16999246), [arXiv:0704.1808](https://arxiv.org/abs/0704.1808), and [arXiv:1806.00500](https://arxiv.org/abs/1806.00500). 
 
-## Getting Started
+To install the latest version of `gbgpu` using `pip`, simply run:
 
-1) Run pip install. This works only for CPU currently. For GPU, see below for installing from source.
-
-```
+```sh
+# For CPU-only version
 pip install gbgpu
+
+# For GPU-enabled versions with CUDA 11.Y.Z
+pip install gbgpu-cuda11x
+
+# For GPU-enabled versions with CUDA 12.Y.Z
+pip install gbgpu-cuda12x
 ```
 
-2) To import gbgpu:
+To know your CUDA version, run the tool `nvidia-smi` in a terminal a check the CUDA version reported in the table header:
 
-```
-from gbgpu.gbgpu import GBGPU
+```sh
+$ nvidia-smi
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 550.54.15              Driver Version: 550.54.15      CUDA Version: 12.4     |
+|-----------------------------------------+------------------------+----------------------+
+...
 ```
 
+Now, in a python file or notebook:
+
+```py3
+import gbgpu
+```
+
+You may check the currently available backends:
+
+```py3
+>>> for backend in ["cpu", "cuda11x", "cuda12x", "cuda", "gpu"]:
+...     print(f" - Backend '{backend}': {"available" if gbgpu.has_backend(backend) else "unavailable"}")
+ - Backend 'cpu': available
+ - Backend 'cuda11x': unavailable
+ - Backend 'cuda12x': unavailable
+ - Backend 'cuda': unavailable
+ - Backend 'gpu': unavailable
+```
+
+Note that the `cuda` backend is an alias for either `cuda11x` or `cuda12x`. If any is available, then the `cuda` backend is available.
+Similarly, the `gpu` backend is (for now) an alias for `cuda`.
+
+If you expected a backend to be available but it is not, run the following command to obtain an error
+message which can guide you to fix this issue:
+
+```py3
+>>> import gbgpu
+>>> gbgpu.get_backend("cuda12x")
+ModuleNotFoundError: No module named 'gbgpu_backend_cuda12x'
+
+The above exception was the direct cause of the following exception:
+...
+
+gbgpu.cutils.BackendNotInstalled: The 'cuda12x' backend is not installed.
+
+The above exception was the direct cause of the following exception:
+...
+
+gbgpu.cutils.MissingDependencies: GBGPU CUDA plugin is missing.
+    If you are using gbgpu in an environment managed using pip, run:
+        $ pip install gbgpu-cuda12x
+
+The above exception was the direct cause of the following exception:
+...
+
+gbgpu.cutils.BackendAccessException: Backend 'cuda12x' is unavailable. See previous error messages.
+```
+
+Once GBGPU is working and the expected backends are selected, check out the [examples notebooks](https://github.com/mikekatz04/GBGPU/tree/master/examples/)
+on how to start with this software.
+
+## Installing from sources
 
 ### Prerequisites
 
-To install this software for CPU usage, you need Python >3.4, and NumPy. We generally recommend installing everything, including gcc and g++ compilers, in the conda environment as is shown in the examples here. This generally helps avoid compilation and linking issues. If you use your own chosen compiler, you may need to add information to the `setup.py` file.
+To install this software from source, you will need:
 
-To install this software for use with NVIDIA GPUs (compute capability >5.0), you need the [CUDA toolkit](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html) and [CuPy](https://cupy.chainer.org/). The CUDA toolkit must have cuda version >8.0. Be sure to properly install CuPy within the correct CUDA toolkit version. Make sure the nvcc binary is on `$PATH` or set it as the `CUDAHOME` environment variable.
+- A C++ compiler (g++, clang++, ...)
+- A Python version supported by [scikit-build-core](https://github.com/scikit-build/scikit-build-core) (>=3.7 as of Jan. 2025)
 
-### Installing
+If you want to enable GPU support in GBGPU, you will also need the NVIDIA CUDA Compiler `nvcc` in your path as well as
+the [CUDA toolkit](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html) (with, in particular, the
+libraries `CUDA Runtime Library`, `cuBLAS` and `cuSPARSE`).
 
-To pip install (only for CPU currently):
-```
-pip install gbgpu
-```
 
-To install from source:
+### Installation instructions using conda
 
-0) [Install Anaconda](https://docs.anaconda.com/anaconda/install/) if you do not have it.
-
-1) Create a virtual environment. **Note**: There is no available `conda` compiler for Windows. If you want to install for Windows, you will probably need to add libraries and include paths to the `setup.py` file.
-
-```
-conda create -n gbgpu_env -c conda-forge gcc_linux-64 gxx_linux-64 gsl numpy Cython scipy jupyter ipython h5py matplotlib python=3.12 cmake
-conda activate gbgpu_env
-```
-
-    If on MACOSX, substitute `gcc_linux-64` and `gxx_linus-64` with `clang_osx-64` and `clangxx_osx-64`.
-
-2) If using GPUs, use pip to [install cupy](https://docs-cupy.chainer.org/en/stable/install.html). If you have cuda version 9.2, for example:
-
-```
-pip install cupy-cuda92
-```
-
-3) Clone the repository.
+We recommend to install GBGPU using conda in order to have the compilers all within an environment.
+First clone the repo
 
 ```
 git clone https://github.com/mikekatz04/GBGPU.git
 cd GBGPU
 ```
 
-4) Run install. Make sure CUDA is on your PATH.
+Now create an environment (these instructions work for all platforms but some
+adjustements can be needed, refer to the
+[detailed installation documentation](https://mikekatz04.github.io/GBGPU) for more information):
 
 ```
-pip install -v -e .
+conda create -n gbgpu_env -y -c conda-forge --override-channels |
+    cxx-compiler pkgconfig conda-forge/label/lapack_rc::liblapacke
 ```
 
-## Running the Tests
+activate the environment
 
-Change to the testing directory:
 ```
-cd gbgpu/tests
+conda activate gbgpu_env
 ```
-Run in the terminal:
+
+Then we can install locally for development:
 ```
-python -m unittest discover
+pip install -e '.[dev, testing]'
 ```
+
+### Installation instructions using conda on GPUs and linux
+Below is a quick set of instructions to install the GBGPU package on GPUs and linux.
+
+```sh
+conda create -n gbgpu_env -c conda-forge gbgpu-cuda12x python=3.12
+conda activate gbgpu_env
+```
+
+Test the installation device by running python
+```python
+import gbgpu
+gbgpu.get_backend("cuda12x")
+```
+
+### Running the installation
+
+To start the from-source installation, ensure the pre-requisite are met, clone
+the repository, and then simply run a `pip install` command:
+
+```sh
+# Clone the repository
+git clone https://github.com/mikekatz04/GBGPU.git
+cd GBGPU
+
+# Run the install
+pip install .
+```
+
+If the installation does not work, first check the [detailed installation
+documentation](https://mikekatz04.github.io/GBGPU). If
+it still does not work, please open an issue on the
+[GitHub repository](https://github.com/mikekatz04/GBGPU/issues)
+or contact the developers through other means.
+
+
+
+### Running the Tests
+
+The tests require a few dependencies which are not installed by default. To install them, add the `[testing]` label to GBGPU package
+name when installing it. E.g:
+
+```sh
+# For CPU-only version with testing enabled
+pip install gbgpu[testing]
+
+# For GPU version with CUDA 12.Y and testing enabled
+pip install gbgpu-cuda12x[testing]
+
+# For from-source install with testing enabled
+git clone https://github.com/mikekatz04/GBGPU.git
+cd GBGPU
+pip install '.[testing]'
+```
+
+To run the tests, open a terminal in a directory containing the sources of GBGPU and then run the `unittest` module in `discover` mode:
+
+```sh
+$ git clone https://github.com/mikekatz04/GBGPU.git
+$ cd GBGPU
+$ python -m gbgpu.tests  # or "python -m unittest discover"
+...
+----------------------------------------------------------------------
+Ran 20 tests in 71.514s
+OK
+```
+
+## Contributing
+
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct, and the process for submitting pull requests to us.
+
+If you want to develop GBGPU and produce documentation, install `gbgpu` from source with the `[dev]` label and in `editable` mode:
+
+```
+$ git clone https://github.com/mikekatz04/GBGPU.git
+$ cd GBGPU
+pip install -e '.[dev, testing]'
+```
+
+This will install necessary packages for building the documentation (`sphinx`, `pypandoc`, `sphinx_rtd_theme`, `nbsphinx`) and to run the tests.
+
+The documentation source files are in `docs/source`. To compile the documentation locally, change to the `docs` directory and run `make html`.
 
 ## Versioning
 
 We use [SemVer](http://semver.org/) for versioning. For the versions available, see the [tags on this repository](https://github.com/mikekatz04/GBGPU/tags).
 
-Current Version: 1.2.2
-
-## Authors
-
-* **Michael Katz**
-* Travis Robson
-* Neil Cornish
-* Tyson Littenberg
-* Stas Babak
-
 ## Contributors
 
-* Mathieu Dubois
-* Maxime Pigou
+A (non-exhaustive) list of contributors to the GBGPU code can be found in [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 ## License
 
-This project is licensed under the Apache License - see the [LICENSE](https://github.com/mikekatz04/GBGPU/blob/master/LICENSE) file for details.
+This project is licensed under the Apache License - see the [LICENSE](LICENSE) file for details.
+
+## Citation
+
+Please make sure to cite GBGPU papers and the GBGPU software on [Zenodo](https://zenodo.org/records/17138723).
+We provide a set of prepared references in [PAPERS.bib](PAPERS.bib). There are other papers that require citation based on the classes used. For most classes this applies to, you can find these by checking the `citation` attribute for that class.  All references are detailed in the [CITATION.cff](CITATION.cff) file.
+
