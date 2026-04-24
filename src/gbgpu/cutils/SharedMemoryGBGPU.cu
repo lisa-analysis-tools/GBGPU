@@ -785,7 +785,7 @@ void add_inner_product_contribution(
         if (array_type_1 == ARRAY_TYPE_DATA)
         {  
             int data_ind_now = (data_ind * nchannels + chan) * data_length + i_1;
-            if ((data_ind_now >= nchannels * data_length * num_data) || (i_1 > data_length))
+            if ((data_ind_now >= nchannels * data_length * num_data) || (i_1 > data_length) || (i_1 < 0))
             {
                 printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_1, data_length);
             }

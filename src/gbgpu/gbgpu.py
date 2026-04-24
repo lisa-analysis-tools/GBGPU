@@ -204,11 +204,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         N_obs = int(T / dt)
         T = N_obs * dt
         
-        # === This part of the codes checks for Mojito like orbtis and ensures proper handling of t0 ===
-        tm_rel = self.xp.linspace(0, T, num=N_obs, endpoint=False)
-        tm_abs = tm_rel + self.t0_abs
-        Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()
-        
         # === MODIFIED: Check orbital data availability ===
         # For L1Orbits, use sc_t_base directly instead of t_base
         t_source = getattr(self.orbits, 'sc_t_base', self.orbits.t_base)
@@ -250,6 +245,14 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             else:
                 N = int(N_temp.max())
 
+        self.N = N
+        
+        # get spacecraft positions
+        tm_rel = self.xp.linspace(0, T, num=N, endpoint=False)
+        tm_abs = tm_rel + self.t0_abs
+        Ps = self._spacecraft(tm_abs)
+        Ps_arr = self.xp.array(Ps).flatten()
+        
         # number of binaries is determined from length of amp array
         self.num_bin = num_bin = len(amp)
 
@@ -271,11 +274,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         psi = self.xp.asarray(psi.copy())
         lam = self.xp.asarray(lam.copy())
         theta = self.xp.asarray(theta.copy())
-
+        
         cosiota = self.xp.cos(iota.copy())
-
-        self.N = N
-
+        
         # figure out start inds
         # q_check = (f0 * T).astype(np.int32)
         # self.start_inds = (q_check - N / 2).astype(xp.int32)
@@ -698,11 +699,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         return_to_main_device = self.gpus[0]
         self.xp.cuda.runtime.setDevice(return_to_main_device)
 
-        # get spacecraft positions
-        tm_rel = self.xp.linspace(0, T, num=int(T/dt), endpoint=False)
-        tm_abs = tm_rel + self.t0_abs
-        Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()  
-
         self.num_bin = num_bin = params.shape[0]
 
         if N is None:
@@ -836,6 +832,12 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         inputs_in = []
         for nnn, N_here in enumerate(unique_N):
             N_here = N_here.item()
+            
+            # get spacecraft positions
+            tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
+            tm_abs = tm_rel + self.t0_abs
+            Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()  
+            
             for gpu_i, gpu in enumerate(self.gpus):
                 self.xp.cuda.runtime.setDevice(main_device)
                 keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[data_index] == gpu)
@@ -872,7 +874,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 
                 noise_index_in = self.xp.asarray(noise_index[keep_bool] % num_per_gpu).astype(np.int32)
                 data_index_in = self.xp.asarray(data_index[keep_bool] % num_per_gpu).astype(np.int32)
-                
+        
                 tuple_in = (
                     (
                         d_h_temp,
@@ -977,11 +979,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         # set first index gpu device to control main operations
         return_to_main_device = self.gpus[0]
         self.xp.cuda.runtime.setDevice(return_to_main_device)
-
-        # get spacecraft positions
-        tm_rel = self.xp.linspace(0, T, num=int(T/dt), endpoint=False)
-        tm_abs = tm_rel + self.t0_abs
-        Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten() 
         
         self.num_bin = num_bin = params.shape[0]
 
@@ -1117,6 +1114,12 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         inputs_in = []
         for nnn, N_here in enumerate(unique_N):
             N_here = N_here.item()
+            
+            # get spacecraft positions
+            tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
+            tm_abs = tm_rel + self.t0_abs
+            Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()  
+            
             for gpu_i, gpu in enumerate(self.gpus):
                 self.xp.cuda.runtime.setDevice(main_device)
                 keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[data_index] == gpu)
@@ -1555,11 +1558,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         if self.gpus is not None:
             # set first index gpu device to control main operations
             self.xp.cuda.runtime.setDevice(self.gpus[0])
-
-        # get spacecraft positions
-        tm_rel = self.xp.linspace(0, T, num=int(T/dt), endpoint=False)
-        tm_abs = tm_rel + self.t0_abs
-        Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten() 
         
         self.num_bin = num_bin = params.shape[0]
 
@@ -1634,6 +1632,12 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             inputs_in = []
             for nnn, N_here in enumerate(unique_N):
                 N_here = N_here.item()
+                
+                # get spacecraft positions
+                tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
+                tm_abs = tm_rel + self.t0_abs
+                Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()  
+            
                 for gpu_i, gpu in enumerate(self.gpus):
                     self.xp.cuda.runtime.setDevice(main_device)
                     keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[group_index] == gpu)
@@ -1831,11 +1835,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             # set first index gpu device to control main operations
             return_to_main_device = self.gpus[0]
             self.xp.cuda.runtime.setDevice(return_to_main_device)
-
-        # get spacecraft positions
-        tm_rel = self.xp.linspace(0, T, num=int(T/dt), endpoint=False)
-        tm_abs = tm_rel + self.t0_abs
-        Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten() 
         
         self.num_bin = num_bin = params_add.shape[0]
 
@@ -1973,6 +1972,12 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             inputs_in = []
             for nnn, N_here in enumerate(unique_N):
                 N_here = N_here.item()
+                
+                # get spacecraft positions
+                tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
+                tm_abs = tm_rel + self.t0_abs
+                Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()  
+                
                 for gpu_i, gpu in enumerate(self.gpus):
                     self.xp.cuda.runtime.setDevice(main_device)
                     keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[data_index] == gpu)
