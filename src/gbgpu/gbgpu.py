@@ -23,7 +23,7 @@ from .utils.utility import *
 
 from lisatools.detector import EqualArmlengthOrbits, Orbits, L1Orbits
 from lisatools.domains import FDSettings
-from typing import Optional, Sequence, TypeVar, Union
+from typing import Optional, Sequence, TypeVar, Union, Dict, Any
 
 from gpubackendtools.parallelbase import ParallelModuleBase
 
@@ -67,7 +67,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
     """
 
-    def __init__(self, orbits: Optional[Orbits | L1Orbits] = None, force_backend = None, t0 = None, domain_settings = None):
+    def __init__(self, orbits: Optional[Orbits | L1Orbits] = None, force_backend = None, t0 = None):
         self.force_backend = force_backend
         GBGPUParallelModule.__init__(self, force_backend=self.force_backend)
         
@@ -88,7 +88,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         self.t0_abs = t0_abs
         
-        self.domain_settings = domain_settings
         self.gpus: Optional[list] = None
         
         self.shared_mem_backend = getattr(self.backend, "sharedmem")
@@ -141,13 +140,13 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         lam,
         beta,
         *args,
-        N=None,
-        T=4 * YRSID_SI,
-        dt=10.0,
-        oversample=1,
-        tdi2=False,
-        tdi_channel_setup="AE",
-        use_c_implementation=False,
+        N: Optional[int] = None,
+        T: float = 4 * YRSID_SI,
+        dt: float = 10.0,
+        oversample: int = 1,
+        tdi2: bool = False,
+        tdi_channel_setup: str = "AE",
+        use_c_implementation: bool = False,
     ):
         """Create waveforms in batches.
 
@@ -2247,15 +2246,26 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
     def information_matrix(
         self,
         params,
-        eps=1e-9,
-        parameter_transforms={},
+        psd,
         inds=None,
-        N=1024,
-        psd_func=None,
-        psd_kwargs={},
-        easy_central_difference=False,
-        return_gpu=False,
-        **waveform_kwargs,
+        eps: float = 1e-9,
+        parameter_transforms: Dict = {},
+        easy_central_difference: bool = False,
+        noise_index=None,
+        adjust_inplace=False,
+        use_c_implementation: bool = False,
+        N = None,
+        T: float = 4 * YRSID_SI,
+        dt: float = 10.0,
+        data_length=None,
+        data_splits=None,
+        tdi_channel_setup: str = "AE",
+        num_per_gpu: Optional[int] = None,
+        oversample: int = 1,
+        return_cupy: bool = False,
+        tdi2: bool = False,
+        batch_size: int = 1000,
+        **kwargs
     ):
         """Get the information matrix for a batch.
 
@@ -2265,218 +2275,546 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         ..math:: \\frac{dh}{d\\lambda_i} = \\frac{-h(\\lambda_i + 2\\epsilon) + h(\\lambda_i - 2\\epsilon) + 8(h(\\lambda_i + \\epsilon) - h(\\lambda_i - \\epsilon))}{12\\epsilson}
 
         Otherwise, it will just calculate the derivate with a first-order central difference.
-
-        This function maps all parameter values to 1. For example, if the square root of
-        the diagonal of the associated covariance matrix is 1e-7 for the frequency
-        parameter, then the standard deviation in the frequency is ``1e-7 * f0``. To
-        properly use with covariance values not on the diagonal, they will have to be
-        multipled by the parameters: :math:`C_{ij} \\vec{\\theta}_j`.
-
+        
+        This function calculates the Information Matrix dynamically. It internally
+        handles memory-safe batching if running in Python, or dispatches the entire
+        array to the C++/CUDA backend if `use_c_implementation=True`.
+        
         Args:
             params (2D double np.ndarrays): Parameters of all binaries to be calculated.
-                The shape is ``(number of parameters, number of binaries)``.
-                See :func:`run_wave` for more information on the adjustable
-                number of parameters when calculating for a third body.
-            eps (double, optional): Step to take when calculating the derivative.
-                The step is relative difference. Default is ``1e-9``.
-            parameter_transforms (dict, optional): Dictionary containing the parameter transform
-                functions. The keys in the dict should be the index associated with the parameter.
-                The items should be the actual transform function. Default is no transforms (``{}``).
-            inds (1D int np.ndarray, optional): Numpy array with the indexes of the parameters to
-                test in the Information matrix. Default is ``None``. When it is not given, it defaults to
-                all parameters.
-            N (int, optional): Number of points for the waveform. Same as the ``N`` parameter in
-                :func:`run_wave`. We recommend using higher ``N`` in the Information Matrix
-                computation because of the numerical derivatives. Default is ``1024``.
-            psd_func (object, optional): Function to compute the PSD for the A and E channels.
-                Must take on argument: the frequencies as an xp.ndarray. When ``None``,
-                it attemps to use the sensitivity functions from LISA Analysis Tools.
-            psd_kwargs (dict, optional): Keyword arguments for the TDI noise generator. Default is ``None``.
-            easy_central_difference (bool, optional): If ``True``, compute the derivatives with
-                a first-order central difference computation. If ``False``, use the higher order
-                derivative that computes two more waveforms during the derivative calculation.
-                Default is ``False``.
-            return_gpu (False, optional): If ``True`` and backend is GPU-based, return Information
-                matrices in cupy array. Default is ``False``.
-
+                Shape should be (num_sources, num_params).
+            psd (xp.ndarray): The 1D flattened linear_psd_arr from AnalysisContainerArray.
+            noise_index (1D int np.ndarray): Specific walker indices mapped to the binaries.
+            data_length (int): Length of the original time-domain data stream.
+            inds (1D int np.ndarray, optional): Indices of the parameters to test.
+            eps (double, optional): Step to take when calculating the derivative. Default is ``1e-9``.
+            parameter_transforms (dict, optional): Dictionary containing the parameter transform functions.
+            easy_central_difference (bool, optional): If ``True``, compute derivatives with a first-order difference.
+            use_c_implementation (bool): If True, invokes the C++/CUDA backend.
+            batch_size (int): Chunk size to use to prevent VRAM overflow when running the Python backend.
+            
         Returns:
-            3D xp.ndarray: Information Matrices for all binaries with shape: ``(number of binaries, number of parameters, number of parameters)``.
-
-        Raises:
-            ValueError: Step size issues.
-            ModuleNotFoundError: LISA Analysis Tools package not available.
-                Occurs when NOT providing ``psd_func`` kwarg.
-
+            3D xp.ndarray: Information Matrices for all binaries with shape: ``(num_sources, num_derivs, num_derivs)``.        
         """
+        # param shape now follows the other methods of gbgpu
+        params = self.xp.atleast_2d(params)
+        self.num_bin = num_bin = params.shape[0]
+        num_params = params.shape[1]
+
         if N is None:
-            raise ValueError("N must be provided up front for Infromation Matrix.")
-            # put the N used here into kwargs
-        waveform_kwargs["N"] = N       
-        self.N = N
-        
-        assert "T" in waveform_kwargs
-        assert 'tdi_channel_setup' in waveform_kwargs
-        
-        params = np.atleast_2d(params)
-        q_check = (params[1,:] / 1000.0 * waveform_kwargs["T"]).astype(np.int32) # sampling params are in mHz
-        self.start_inds = (q_check - N / 2).astype(np.int32)
-        
-        # get frequencies for each binary
-        self.df = 1 / waveform_kwargs["T"]
-        freqs = self.freqs
-        
-        if psd_func is None:
-            # check if sensitivity information is available
-            if not tdi_available:
-                raise ModuleNotFoundError(
-                    "Sensitivity curve information through LISA Analysis Tools is not available. Stock option for Information matrix will not work. Please install LISA Analysis Tools (pip install lisaanalysistools)."
-                )
-            psd_func = A1TDISens.get_Sn
-        
-        # get psd or csd
-        if psd_func is XYZSensitivityBackend:
-            assert waveform_kwargs["tdi_channel_setup"] == "XYZ"
-            assert isinstance(self.orbits, L1Orbits)
-            assert self.domain_settings is not None
-            assert self.force_backend is not None
-            
-            psd_func = XYZSensitivityBackend(
-                orbits=self.orbits,
-                settings=self.domain_settings,
-                force_backend=self.force_backend,
-                mask_percentage=0.02
-            )
-            psd_full_freq_range = psd_func(**psd_kwargs).sens_mat
-            
-            idx_to_extract = self.start_inds[:, None] + self.xp.arange(self.N)
-            psd = psd_full_freq_range[:, :, idx_to_extract]
-            
-        elif psd_func is A1TDISens:
-            assert waveform_kwargs["tdi_channel_setup"] == "AE"
-            psd = self.xp.asarray(psd_func(freqs, **psd_kwargs))
-            
-        else: 
-            raise NotImplementedError("Only XYZ and AE channel setup is currently supported.")
-        
-        # get shape information
-        num_params, num_bins = params.shape
-        nchannels = len(waveform_kwargs["tdi_channel_setup"])
-        
-        # fill inds if not given
+            N = get_N(self.xp.asarray(params[:, 0]), self.xp.asarray(params[:, 1]), T, oversample=oversample)
+            if self.xp.any(N == 0):
+                breakpoint()
+        else:
+            if isinstance(N, self.xp.ndarray):
+                assert params.shape[0] == N.shape[0]
+            elif isinstance(N, (int, self.xp.integer)):
+                N = self.xp.full(params.shape[0], N)
+                          
         if inds is None:
-            inds = np.arange(num_params)
-
-        # setup holder arrays
+            inds = self.xp.arange(num_params)
+        else:
+            inds = self.xp.asarray(inds, dtype=self.xp.int32)
+            
+        if noise_index is None:
+            noise_index = self.xp.zeros(num_bin, dtype=self.xp.int32)
+        
         num_derivs = len(inds)
-        info_matrix = self.xp.zeros((num_bins, num_derivs, num_derivs))
-
-        # derivative buffer for waveforms
-        dh = self.xp.zeros((num_bins, num_derivs, nchannels, N), self.xp.complex128)
-
-        for i, ind in enumerate(inds):
-            # 1 eps up derivative
-            # map all the parameters to 1
-            params_up_1 = np.ones_like(params)
-            params_up_1[ind] += 1 * eps
-            params_up_1 *= params
-            params_up_1 = self._apply_parameter_transforms(
-                params_up_1, parameter_transforms
-            )
-            self.run_wave(*params_up_1, **waveform_kwargs)
-            h_I_up_eps = self.xp.asarray([
-                getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
-            ]).transpose((1, 0, 2))
-
-            # 1 eps down derivative
-            # map all the parameters to 1
-            params_down_1 = np.ones_like(params)
-            params_down_1[ind] -= 1 * eps
-            params_down_1 *= params
-            params_down_1 = self._apply_parameter_transforms(
-                params_down_1, parameter_transforms
-            )
-            self.run_wave(*params_down_1, **waveform_kwargs)
-            h_I_down_eps = self.xp.asarray([
-                getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
-            ]).transpose((1, 0, 2))
-
-            # compute derivative and store
-            if easy_central_difference:
-                dh[:, i] = (h_I_up_eps - h_I_down_eps) / (2 * eps)
-
+        
+        q_check = (params[:, 1] / 1000.0 * T).astype(self.xp.int32) 
+        start_freq_inds = start_freq_inds = (q_check - N / 2).astype(self.xp.int32) # needed for psd slicing
+        self.df = 1 / T
+        
+        info_matrix = self.xp.zeros((num_bin, num_derivs, num_derivs), dtype=self.xp.float64)
+        
+        if True:
+            assert self.gpus is not None and len(self.gpus) == 1, "GPU setup for infomatrix is incorrect"
+            psd = psd[self.gpus[0]] # assume that we are working on one gpu for now, for multi gpu we will likely shift to c++/cuda
+            if tdi_channel_setup == "XYZ":
+                reshaped_psd = psd.reshape(-1, 3, 3, data_length)
             else:
-                # higher degree derivative computation
+                reshaped_psd = psd.reshape(-1, len(tdi_channel_setup), data_length)
+            
+            # I think this is fine for now, cannot have multiple N when setting up dh later   
+            N_val = int(N.max().item()) if isinstance(N, self.xp.ndarray) else int(N)
+            info_matrix = self.xp.zeros((num_bin, num_derivs, num_derivs), dtype=self.xp.float64)
 
-                # 2 eps up derivative
-                # map all the parameters to 1
-                params_up_2 = np.ones_like(params)
-                params_up_2[ind] += 2 * eps
-                params_up_2 *= params
-                params_up_2 = self._apply_parameter_transforms(
-                    params_up_2, parameter_transforms
+            waveform_kwargs: Dict[str, Any] = dict(
+                    N=N_val,T=T, dt=dt, oversample=oversample, tdi2=tdi2,
+                    tdi_channel_setup=tdi_channel_setup, use_c_implementation=use_c_implementation
                 )
-                self.run_wave(*params_up_2, **waveform_kwargs)
-                h_I_up_2eps = self.xp.asarray([
-                    getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
-                ]).transpose((1, 0, 2))
+            
+            # batching here to avoid memory allocation issues (dh is of size 1000x9x3x1024=0.44 GBytes)
+            # TODO: check usual input size of num_bins, maybe we can do batch_size=1e4
+            batches = self.xp.arange(0, num_bin, batch_size, dtype=self.xp.int32)
+            if batches[-1] < num_bin:
+                batches = self.xp.concatenate([batches, self.xp.array([num_bin], dtype=self.xp.int32)])
+            
+            for start, end in zip(batches[:-1], batches[1:]):
+                batched_params = params[start:end]
+                noise_idx_batch = noise_index[start:end]
+                start_idx_batch = start_freq_inds[start:end]
+                num_bin_batch = int(end - start)
                 
-                # TODO: check this? in ldc validation this was uncommented
-                # if not np.all(self.start_inds == self.start_inds[0]):
-                #     raise ValueError(
-                #         "The user should decrease steps size (eps) because the frequency bins are changing during derivative calculation, which is not allowed."
-                #     )
-
-                # 2 eps down derivative
-                # map all the parameters to 1
-                params_down_2 = np.ones_like(params)
-                params_down_2[ind] -= 2 * eps
-                params_down_2 *= params
-                params_down_2 = self._apply_parameter_transforms(
-                    params_down_2, parameter_transforms
+                # Get correct psd slice for each binary out of psd_linear_arr
+                f_idx = start_idx_batch[:, None] + self.xp.arange(N_val)
+                w_idx = self.xp.asarray(noise_idx_batch)
+                
+                if tdi_channel_setup == "XYZ":
+                    w_idx_exp = w_idx[:, None, None, None]               
+                    c1_idx = self.xp.arange(3)[None, :, None, None]       
+                    c2_idx = self.xp.arange(3)[None, None, :, None]      
+                    f_idx_exp = f_idx[:, None, None, :]                  
+                    inv_csd = reshaped_psd[w_idx_exp, c1_idx, c2_idx, f_idx_exp]
+                else: # csd is assumed to be diagonal
+                    w_idx_exp = w_idx[:, None, None]
+                    c_idx = self.xp.arange(psd.shape[1])[None, :, None]
+                    f_idx_exp = f_idx[:, None, :]
+                    inv_psd = reshaped_psd[w_idx_exp, c_idx, f_idx_exp]
+                
+                dh = self.xp.zeros(
+                    (num_bin_batch, num_derivs, len(tdi_channel_setup), N_val), 
+                    dtype=self.xp.complex128
                 )
-                self.run_wave(*params_down_2, **waveform_kwargs)
-                h_I_down_2eps = self.xp.asarray([
-                    getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
-                ]).transpose((1, 0, 2))
 
-                dh[:, i] = (
-                    -h_I_up_2eps + h_I_down_2eps + 8 * (h_I_up_eps - h_I_down_eps)
-                ) / (12 * eps)
+                def get_wave(params_to_run): # seperate function for wave_gen since it is used often
+                    transformed_params = params_to_run.T.copy()
+                    if parameter_transforms:
+                        transformed_params = self._apply_parameter_transforms(
+                            transformed_params, 
+                            parameter_transforms
+                        )
+                    self.run_wave(*transformed_params, **waveform_kwargs)
+                    wave_out = self.XYZf.copy() if tdi_channel_setup == "XYZ" else self.AETf.copy()
+                    return wave_out
 
-        if waveform_kwargs["tdi_channel_setup"] == "XYZ":
-            csd_batched = psd.transpose(2, 3, 0, 1) # (num_bins, N, 3, 3)
-            inv_csd_batched = self.xp.linalg.inv(csd_batched)
-            inv_csd = inv_csd_batched.transpose(0, 2, 3, 1) # (num_bins, 3, 3, N)
+                for i, ind in enumerate(inds):
+                    # 1 eps up derivative
+                    params_up_1 = batched_params.copy()
+                    params_up_1[:, ind] += eps * batched_params[:, ind]
+                    h_I_up_eps = get_wave(params_up_1)
+
+                    # 1 eps down derivative
+                    params_down_1 = batched_params.copy()
+                    params_down_1[:, ind] -= eps * batched_params[:, ind]
+                    h_I_down_eps = get_wave(params_down_1)
+
+                    if easy_central_difference: # compute derivative and store
+                        dh[:, i] = (h_I_up_eps - h_I_down_eps) / (2.0 * eps)
+                        
+                    else: # higher degree derivative computation
+                        # 2 eps up derivative
+                        params_up_2 = batched_params.copy()
+                        params_up_2[:, ind] += 2.0 * eps * batched_params[:, ind]
+                        h_I_up_2eps = get_wave(params_up_2)
+
+                        # 2 eps down derivative
+                        params_down_2 = batched_params.copy()
+                        params_down_2[:, ind] -= 2.0 * eps * batched_params[:, ind]
+                        h_I_down_2eps = get_wave(params_down_2)
+
+                        dh[:, i] = (-h_I_up_2eps + h_I_down_2eps + 8.0 * (h_I_up_eps - h_I_down_eps)) / (12.0 * eps)
+
+                # TODO: Possibly add a check for scenario where \pm 2\epsilon is outside of freq band?
+                
+                # compute Information matrix via inner products
+                if tdi_channel_setup == "XYZ":
+                    # dh shape = [num_bins, num_derivs, 3, N]
+                    # inv_csd shape = [num_bins, 3, 3, N]
+                    # b=num_bins, i=deriv1, c=chan1, k=freq_bin, d=chan2, j=deriv2
+                    info_matrix[start:end] = 4.0 * self.df * self.xp.einsum(
+                        "bick,bcdk,bjdk->bij", dh.conj(), inv_csd, dh
+                    ).real
+                    # output shape = [num_bin, num_derivs, num_derivs]
+                else:
+                    # similar indices as above, but inv_psd is diagonal
+                    info_matrix[start:end] = 4.0 * self.df * self.xp.einsum(
+                        "bick,bjck,bck->bij", dh.conj(), dh, inv_psd
+                    ).real
+
+            if self.backend.name == "gpu" and not return_cupy:
+                info_matrix = info_matrix.get()
+
+            return info_matrix
+        
+        if False:
+            if self.gpus is not None:
+                self.xp.cuda.runtime.setDevice(self.gpus[0])
+            
+            unique_N, inverse = self.xp.unique(self.xp.asarray(N), return_inverse=True)
+            N_groups = self.xp.arange(len(unique_N))[inverse]
+            
+            if noise_index is None:
+                noise_index = self.xp.zeros(self.num_bin, dtype=self.xp.int32)
+            assert noise_index.dtype == self.xp.int32
+            
+            nchannels = 3 if tdi_channel_setup != "AE" else 2
+            
+            if isinstance(psd, self.xp.ndarray):
+                psd_in = [psd.astype(self.xp.complex128)]
+            else:
+                psd_in = [p.astype(self.xp.complex128) for p in psd]
+                
+            if tdi_channel_setup == "AE" or tdi_channel_setup == "AET":
+                psd_sub_shape = (nchannels,)
+            else:
+                assert nchannels == 3
+                psd_sub_shape = (nchannels, nchannels)
+
+            num_psd = []
+            for t_i, t in enumerate(psd_in):
+                if t.ndim == 1:
+                    assert data_length is not None
+                    num_psd.append(int(t.shape[0] / (data_length * np.prod(psd_sub_shape))))
+                elif t.ndim == 2:
+                    assert tdi_channel_setup in ["AET", "AE"]
+                    num_psd.append(1)
+                    data_length = t.shape[1]
+                    psd_in[t_i] = t.flatten()
+                elif t.ndim == 3:
+                    if tdi_channel_setup in ["AE", "AET"]:
+                        ntemplate, _nchannels, data_length = t.shape
+                        num_psd.append(ntemplate)
+                        psd_in[t_i] = t.flatten()
+                    else:  # XYZ
+                        _nchannels, _nchannels, data_length = t.shape
+                        num_psd.append(1)
+                        psd_in[t_i] = t.flatten()
+                elif t.ndim == 4:
+                    assert tdi_channel_setup == "XYZ"
+                    ntemplate, _nchannels, _nchannels, data_length = t.shape
+                    num_psd.append(ntemplate)
+                    psd_in[t_i] = t.flatten()
+            
+            main_device = self.xp.cuda.runtime.getDevice()
+            
+            if data_splits is None:
+                assert len(self.gpus) == 1
+                data_splits = self.xp.full(num_psd[0], self.gpus[0])
+                
+            if num_per_gpu is None:
+                assert len(self.gpus) == 1
+                num_per_gpu = int(1e9)
+
+            info_mat = self.xp.zeros((self.num_bin, num_derivs, num_derivs), dtype=self.xp.float64)
+            inputs_in = []
+
+            for nnn, N_here in enumerate(unique_N):
+                N_here = N_here.item()
+                
+                tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
+                tm_abs = tm_rel + self.t0_abs
+                Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()  
+                
+                for gpu_i, gpu in enumerate(self.gpus):
+                    self.xp.cuda.runtime.setDevice(main_device)
+                    keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[noise_index] == gpu)
+                    num_split_here = keep_bool.sum().item()
+                    inds_here = self.xp.arange(len(keep_bool))[keep_bool]
+                    
+                    if num_split_here == 0:
+                        continue 
+                    self.xp.cuda.runtime.setDevice(gpu)
+                    
+                    params_here = self.xp.asarray(params)[keep_bool]
+                    
+                    # Convert beta to polar coordinate safely
+                    params_here[:, 8] = np.pi / 2 - params_here[:, 8]
+                    
+                    psd_here = psd_in[gpu_i]
+                    params_tuple = tuple([pars_tmp.copy() for pars_tmp in params_here.T])
+                    
+                    # Start indices are passed strictly based on the calculated chunking logic
+                    start_freq_ind_tmp = self.xp.full(num_psd[gpu_i], start_freq_inds[0], dtype=np.int32)
+                    
+                    info_mat_temp = self.xp.zeros(num_split_here * num_derivs * num_derivs, dtype=self.xp.float64)
+                    noise_index_in = self.xp.asarray(noise_index[keep_bool] % num_per_gpu).astype(np.int32)
+            
+                    tuple_in = (
+                        (
+                            info_mat_temp,
+                            psd_here,
+                            noise_index_in,
+                            inds,
+                        ) + params_tuple
+                        + (
+                            eps, T, dt, N_here, 
+                            num_split_here, num_derivs, start_freq_ind_tmp, data_length, 
+                            tdi_channel_setup_map[tdi_channel_setup], 
+                            gpu, False, 
+                            num_psd[0],
+                            Ps_arr, self.orbits.armlength, tdi2, easy_central_difference
+                        )
+                    )    
+                    
+                    try:
+                        self.xp.cuda.runtime.deviceSynchronize()
+                        self.shared_mem_backend.SharedMemoryInfoMatComp_wrap(*tuple_in)
+                        inputs_in.append([gpu, inds_here, tuple_in])
+                        self.xp.cuda.runtime.deviceSynchronize()
+                    except Exception as e:
+                        print(f"C++ Kernel Execution Interruption: {e}")
+                        breakpoint()
+
+            for gpu, inds_gpu, inputs_tmp in inputs_in:
+                with self.xp.cuda.Device(gpu):
+                    self.xp.cuda.runtime.deviceSynchronize()
+
+            for gpu, inds_gpu, inputs_tmp in inputs_in:
+                with self.xp.cuda.Device(main_device):
+                    self.xp.cuda.runtime.deviceSynchronize()
+                    info_mat[inds_gpu] = inputs_tmp[0][:].reshape(-1, num_derivs, num_derivs)
+                    
+            self.xp.cuda.runtime.setDevice(main_device)
+            self.xp.cuda.runtime.deviceSynchronize()
+
+            if return_cupy:
+                return info_mat
+
+            try:
+                return info_mat.get()
+            except AttributeError:
+                return info_mat
+ 
+    # def information_matrix(
+    #     self,
+    #     params,
+    #     eps=1e-9,
+    #     parameter_transforms={},
+    #     inds=None,
+    #     N=1024,
+    #     psd_func=None,
+    #     psd_kwargs={},
+    #     easy_central_difference=False,
+    #     return_gpu=False,
+    #     **waveform_kwargs,
+    # ):
+    #     """Get the information matrix for a batch.
+
+    #     This function computes the Information matrix for a batch of Galactic binaries.
+    #     It uses a 2nd order calculation for the derivative if ``easy_central_difference`` is ``False``:
+
+    #     ..math:: \\frac{dh}{d\\lambda_i} = \\frac{-h(\\lambda_i + 2\\epsilon) + h(\\lambda_i - 2\\epsilon) + 8(h(\\lambda_i + \\epsilon) - h(\\lambda_i - \\epsilon))}{12\\epsilson}
+
+    #     Otherwise, it will just calculate the derivate with a first-order central difference.
+
+    #     This function maps all parameter values to 1. For example, if the square root of
+    #     the diagonal of the associated covariance matrix is 1e-7 for the frequency
+    #     parameter, then the standard deviation in the frequency is ``1e-7 * f0``. To
+    #     properly use with covariance values not on the diagonal, they will have to be
+    #     multipled by the parameters: :math:`C_{ij} \\vec{\\theta}_j`.
+
+    #     Args:
+    #         params (2D double np.ndarrays): Parameters of all binaries to be calculated.
+    #             The shape is ``(number of parameters, number of binaries)``.
+    #             See :func:`run_wave` for more information on the adjustable
+    #             number of parameters when calculating for a third body.
+    #         eps (double, optional): Step to take when calculating the derivative.
+    #             The step is relative difference. Default is ``1e-9``.
+    #         parameter_transforms (dict, optional): Dictionary containing the parameter transform
+    #             functions. The keys in the dict should be the index associated with the parameter.
+    #             The items should be the actual transform function. Default is no transforms (``{}``).
+    #         inds (1D int np.ndarray, optional): Numpy array with the indexes of the parameters to
+    #             test in the Information matrix. Default is ``None``. When it is not given, it defaults to
+    #             all parameters.
+    #         N (int, optional): Number of points for the waveform. Same as the ``N`` parameter in
+    #             :func:`run_wave`. We recommend using higher ``N`` in the Information Matrix
+    #             computation because of the numerical derivatives. Default is ``1024``.
+    #         psd_func (object, optional): Function to compute the PSD for the A and E channels.
+    #             Must take on argument: the frequencies as an xp.ndarray. When ``None``,
+    #             it attemps to use the sensitivity functions from LISA Analysis Tools.
+    #         psd_kwargs (dict, optional): Keyword arguments for the TDI noise generator. Default is ``None``.
+    #         easy_central_difference (bool, optional): If ``True``, compute the derivatives with
+    #             a first-order central difference computation. If ``False``, use the higher order
+    #             derivative that computes two more waveforms during the derivative calculation.
+    #             Default is ``False``.
+    #         return_gpu (False, optional): If ``True`` and backend is GPU-based, return Information
+    #             matrices in cupy array. Default is ``False``.
+
+    #     Returns:
+    #         3D xp.ndarray: Information Matrices for all binaries with shape: ``(number of binaries, number of parameters, number of parameters)``.
+
+    #     Raises:
+    #         ValueError: Step size issues.
+    #         ModuleNotFoundError: LISA Analysis Tools package not available.
+    #             Occurs when NOT providing ``psd_func`` kwarg.
+
+    #     """
+    #     if parameter_transforms is None:
+    #         parameter_transforms = {}
+    #     if psd_kwargs is None:
+    #         psd_kwargs = {}
+            
+    #     if N is None:
+    #         raise ValueError("N must be provided up front for Infromation Matrix.")
+    #         # put the N used here into kwargs
+            
+    #     waveform_kwargs["N"] = N       
+    #     self.N = N
+        
+    #     assert "T" in waveform_kwargs
+    #     assert 'tdi_channel_setup' in waveform_kwargs
+        
+    #     params = np.atleast_2d(params)
+    #     q_check = (params[1,:] / 1000.0 * waveform_kwargs["T"]).astype(np.int32) # sampling params are in mHz
+    #     self.start_inds = (q_check - N / 2).astype(np.int32)
+        
+    #     # get frequencies for each binary
+    #     self.df = 1 / waveform_kwargs["T"]
+    #     freqs = self.freqs
+        
+    #     if psd_func is None:
+    #         # check if sensitivity information is available
+    #         if not tdi_available:
+    #             raise ModuleNotFoundError(
+    #                 "Sensitivity curve information through LISA Analysis Tools is not available. Stock option for Information matrix will not work. Please install LISA Analysis Tools (pip install lisaanalysistools)."
+    #             )
+    #         psd_func = A1TDISens.get_Sn
+        
+    #     # get psd or csd
+    #     if psd_func is XYZSensitivityBackend:
+    #         assert waveform_kwargs["tdi_channel_setup"] == "XYZ"
+    #         assert isinstance(self.orbits, L1Orbits)
+    #         assert self.domain_settings is not None
+    #         assert self.force_backend is not None
+            
+    #         psd_func = XYZSensitivityBackend(
+    #             orbits=self.orbits,
+    #             settings=self.domain_settings,
+    #             force_backend=self.force_backend,
+    #             mask_percentage=0.02
+    #         )
+    #         psd_full_freq_range = psd_func(**psd_kwargs).sens_mat
+            
+    #         idx_to_extract = self.start_inds[:, None] + self.xp.arange(self.N)
+    #         psd = psd_full_freq_range[:, :, idx_to_extract]
+            
+    #     elif psd_func is A1TDISens:
+    #         assert waveform_kwargs["tdi_channel_setup"] == "AE"
+    #         psd = self.xp.asarray(psd_func(freqs, **psd_kwargs))
+            
+    #     else: 
+    #         raise NotImplementedError("Only XYZ and AE channel setup is currently supported.")
+        
+    #     # get shape information
+    #     num_params, num_bins = params.shape
+    #     nchannels = len(waveform_kwargs["tdi_channel_setup"])
+        
+    #     # fill inds if not given
+    #     if inds is None:
+    #         inds = np.arange(num_params)
+
+    #     # setup holder arrays
+    #     num_derivs = len(inds)
+    #     info_matrix = self.xp.zeros((num_bins, num_derivs, num_derivs))
+
+    #     # derivative buffer for waveforms
+    #     dh = self.xp.zeros((num_bins, num_derivs, nchannels, N), self.xp.complex128)
+
+    #     for i, ind in enumerate(inds):
+    #         # 1 eps up derivative
+    #         # map all the parameters to 1
+    #         params_up_1 = np.ones_like(params)
+    #         params_up_1[ind] += 1 * eps
+    #         params_up_1 *= params
+    #         params_up_1 = self._apply_parameter_transforms(
+    #             params_up_1, parameter_transforms
+    #         )
+    #         self.run_wave(*params_up_1, **waveform_kwargs)
+    #         h_I_up_eps = self.xp.asarray([
+    #             getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
+    #         ]).transpose((1, 0, 2))
+
+    #         # 1 eps down derivative
+    #         # map all the parameters to 1
+    #         params_down_1 = np.ones_like(params)
+    #         params_down_1[ind] -= 1 * eps
+    #         params_down_1 *= params
+    #         params_down_1 = self._apply_parameter_transforms(
+    #             params_down_1, parameter_transforms
+    #         )
+    #         self.run_wave(*params_down_1, **waveform_kwargs)
+    #         h_I_down_eps = self.xp.asarray([
+    #             getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
+    #         ]).transpose((1, 0, 2))
+
+    #         # compute derivative and store
+    #         if easy_central_difference:
+    #             dh[:, i] = (h_I_up_eps - h_I_down_eps) / (2 * eps)
+
+    #         else:
+    #             # higher degree derivative computation
+
+    #             # 2 eps up derivative
+    #             # map all the parameters to 1
+    #             params_up_2 = np.ones_like(params)
+    #             params_up_2[ind] += 2 * eps
+    #             params_up_2 *= params
+    #             params_up_2 = self._apply_parameter_transforms(
+    #                 params_up_2, parameter_transforms
+    #             )
+    #             self.run_wave(*params_up_2, **waveform_kwargs)
+    #             h_I_up_2eps = self.xp.asarray([
+    #                 getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
+    #             ]).transpose((1, 0, 2))
+                
+    #             # TODO: check this? in ldc validation this was uncommented
+    #             # if not np.all(self.start_inds == self.start_inds[0]):
+    #             #     raise ValueError(
+    #             #         "The user should decrease steps size (eps) because the frequency bins are changing during derivative calculation, which is not allowed."
+    #             #     )
+
+    #             # 2 eps down derivative
+    #             # map all the parameters to 1
+    #             params_down_2 = np.ones_like(params)
+    #             params_down_2[ind] -= 2 * eps
+    #             params_down_2 *= params
+    #             params_down_2 = self._apply_parameter_transforms(
+    #                 params_down_2, parameter_transforms
+    #             )
+    #             self.run_wave(*params_down_2, **waveform_kwargs)
+    #             h_I_down_2eps = self.xp.asarray([
+    #                 getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
+    #             ]).transpose((1, 0, 2))
+
+    #             dh[:, i] = (
+    #                 -h_I_up_2eps + h_I_down_2eps + 8 * (h_I_up_eps - h_I_down_eps)
+    #             ) / (12 * eps)
+
+    #     if waveform_kwargs["tdi_channel_setup"] == "XYZ":
+    #         csd_batched = psd.transpose(2, 3, 0, 1) # (num_bins, N, 3, 3)
+    #         inv_csd_batched = self.xp.linalg.inv(csd_batched)
+    #         inv_csd = inv_csd_batched.transpose(0, 2, 3, 1) # (num_bins, 3, 3, N)
         
         # compute Information matrix via inner products
-        for i in range(num_derivs):
-            for j in range(i, num_derivs):
-                # inner product between derivatives
-                if waveform_kwargs["tdi_channel_setup"] == "XYZ":
-                    # using einstein summation: b=binary, c=channel 1, d=channel 2, k=frequency
-                    inner_prod= (
-                        4.0 * self.df
-                        * self.xp.einsum(
-                            "bck,bcdk,bdk->b", dh[:, i].conj(), inv_csd, dh[:, j]
-                        ).real
-                    )
-                else:
-                    inner_prod = (
-                        4.0 * self.df
-                        * self.xp.sum(
-                            (dh[:, i].conj() * dh[:, j]).real / psd[:, None, :], axis=(1, 2)
-                        )
-                    )
+        # for i in range(num_derivs):
+        #     for j in range(i, num_derivs):
+        #         # inner product between derivatives
+        #         if waveform_kwargs["tdi_channel_setup"] == "XYZ":
+        #             # using einstein summation: b=binary, c=channel 1, d=channel 2, k=frequency
+        #             inner_prod= (
+        #                 4.0 * self.df
+        #                 * self.xp.einsum(
+        #                     "bck,bcdk,bdk->b", dh[:, i].conj(), inv_csd, dh[:, j]
+        #                 ).real
+        #             )
+        #         else:
+        #             inner_prod = (
+        #                 4.0 * self.df
+        #                 * self.xp.sum(
+        #                     (dh[:, i].conj() * dh[:, j]).real / psd[:, None, :], axis=(1, 2)
+        #                 )
+        #             )
            
-                # symmetry
-                info_matrix[:, i, j] = inner_prod
-                info_matrix[:, j, i] = info_matrix[:, i, j]
+        #         # symmetry
+        #         info_matrix[:, i, j] = inner_prod
+        #         info_matrix[:, j, i] = info_matrix[:, i, j]
 
-        # copy to cpu if needed
-        if self.backend.name == "gpu" and return_gpu is False:
-            info_matrix = info_matrix.get()
+    #     # copy to cpu if needed
+    #     if self.backend.name == "gpu" and return_gpu is False:
+    #         info_matrix = info_matrix.get()
 
-        return info_matrix
+    #     return info_matrix
 
 
 class GBGPU(GBGPUBase):
