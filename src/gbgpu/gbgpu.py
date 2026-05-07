@@ -10,24 +10,23 @@ from lisatools.utils.constants import YRSID_SI
 from .utils.citation import *
 from .utils.parallelbase import GBGPUParallelModule
 
-try:
-    from lisatools.sensitivity import A1TDISens
-    from lisatools.sensitivity import XYZSensitivityBackend
-    tdi_available = True
+# try:
+#     from lisatools.sensitivity import A1TDISens
+#     tdi_available = True
 
-except (ModuleNotFoundError, ImportError) as e:
-    tdi_available = False
-    warnings.warn("tdi module not found. No sensitivity information will be included.")
+# except (ModuleNotFoundError, ImportError) as e:
+#     tdi_available = False
+#     warnings.warn("tdi module not found. No sensitivity information will be included.")
 
 from .utils.utility import *
 
 from lisatools.detector import EqualArmlengthOrbits, Orbits, L1Orbits
-from lisatools.domains import FDSettings
 from typing import Optional, Sequence, TypeVar, Union, Dict, Any
 
 from gpubackendtools.parallelbase import ParallelModuleBase
 
 tdi_channel_setup_map = {"XYZ": 1, "AET": 2, "AE": 3}
+window_map = {"tukey": 1, "planck": 2} # None is mapped to 0
 
 class GBGPUBase(GBGPUParallelModule, abc.ABC):
     """Generate Galactic Binary Waveforms
@@ -147,6 +146,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         tdi2: bool = False,
         tdi_channel_setup: str = "AE",
         use_c_implementation: bool = False,
+        window: Optional[str] = None,
+        window_alpha: float = 0.0
     ):
         """Create waveforms in batches.
 
@@ -246,6 +247,16 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         self.N = N
         
+        # setup window mapping
+        if window is not None:
+            try:
+                window_type = window_map[window]
+            except:
+                raise KeyError(f"The window '{window}' is currently not supported. Only the 'tukey', 'planck', or no/rectangular windows are supported.")
+        else:
+            window_type = 0
+            assert window_alpha == 0.0, "No/Rectangular window does not have a smoothing factor"
+        
         # get spacecraft positions
         tm_rel = self.xp.linspace(0, T, num=N, endpoint=False)
         tm_abs = tm_rel + self.t0_abs
@@ -304,7 +315,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 amp, f0, fdot, fddot, phi0, iota, psi, lam, theta,
                 T, dt, N, num_bin, 
                 tdi_channel_setup_map[tdi_channel_setup],
-                Ps_arr, self.orbits.armlength, tdi2
+                Ps_arr, self.orbits.armlength, tdi2,
+                window_type, window_alpha
             )
             # self.backend.sharedmem.SharedMemoryWaveComp_wrap(*tuple_in)
             self.shared_mem_backend.SharedMemoryWaveComp_wrap(*tuple_in)
@@ -367,11 +379,15 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             *add_args,
         )
 
+        if window_type != 0:
+            w_arr = self._get_window_array(window_type, window_alpha, N)
+            for ij in Gs.keys():
+                Gs[ij] =  Gs[ij] * w_arr[None,:]
+        
         # transform to TDI observables
         XYZf, f_min = self._computeXYZ(T, Gs, f0, fdot, fddot, fstar, amp, q, tm_rel)
         # NOTE this means that the correct times are passed down to construct_slow_part and _computeXYZ
         # Only need to check if these arguments are used correctly
-        self.start_inds = self.kmin = self.xp.round(f_min / df).astype(int)
         self.start_inds = self.kmin = self.xp.round(f_min / df).astype(int)
         fctr = 0.5 * T / N
 
@@ -622,6 +638,49 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         # wfm->TI[i][j] = sinc*(tran1r*tran2i + tran1i*tran2r)
         return Gs, q
 
+    def _get_window_array(self, window_type: int, window_alpha: float, N: int) -> Any:
+        """Generate window array"""
+        if window_type == 0 or window_alpha <= 0.0 or N <= 1:
+            return self.xp.ones(N, dtype=self.xp.float64)
+        
+        i = self.xp.arange(N)
+        if window_type == 1:  # Tukey
+            alpha = window_alpha
+            w = self.xp.zeros(N)
+            r = (2.0 * i) / (alpha * (N - 1))
+            l1 = int(self.xp.rint((alpha * (N - 1)) / 2.0))
+            l2 = int(self.xp.rint((N - 1) * (1.0 - alpha / 2.0)))
+            
+            mask1 = i < l1
+            w = self.xp.where(mask1, 0.5 * (1.0 + self.xp.cos(np.pi * (r - 1.0))), w)
+            mask2 = (i >= l1) & (i < l2)
+            w = self.xp.where(mask2, 1.0, w)
+            mask3 = i >= l2
+            w = self.xp.where(mask3, 0.5 * (1.0 + self.xp.cos(np.pi * (r - 2.0 / alpha + 1.0))), w)
+            return w
+
+        elif window_type == 2:  # Planck
+            epsilon = window_alpha
+            w = self.xp.zeros(N)
+            n1 = epsilon * (N - 1)
+            n2 = (1.0 - epsilon) * (N - 1)
+
+            mask1 = i < n1
+            z1 = self.xp.where(mask1, epsilon * (N - 1) / (i + 1e-15) + epsilon * (N - 1) / ((i - epsilon * (N - 1)) + 1e-15), 0.0)
+            w = self.xp.where(mask1, 1.0 / (1.0 + self.xp.exp(self.xp.clip(z1, -700.0, 700.0))), w)
+
+            mask2 = (i >= n1) & (i <= n2)
+            w = self.xp.where(mask2, 1.0, w)
+
+            mask3 = i > n2
+            z2 = self.xp.where(mask3, epsilon * (N - 1) / ((N - 1) - i + 1e-15) + epsilon * (N - 1) / ((N - 1) - i - epsilon * (N - 1) + 1e-15), 0.0)
+            w = self.xp.where(mask3, 1.0 / (1.0 + self.xp.exp(self.xp.clip(z2, -700.0, 700.0))), w)
+            return w
+        
+        else:
+            raise ValueError("Window type not supported. Supported types are 'None': 0 (retangular/no window), 'tukey': 1 (tukey window) 'planck': 2 (planck window).")
+
+    
     @property
     def A(self):
         """return A channel reshaped based on number of binaries"""
@@ -682,7 +741,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         num_per_gpu=None,
         oversample=1,
         return_cupy=False,
-        tdi2=False,
+        tdi2: bool = False,
+        window: Optional[str] = None,
+        window_alpha: float = 0.0
         # **kwargs
     ):
         if self.d_d is None:
@@ -714,6 +775,16 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         unique_N, inverse = self.xp.unique(self.xp.asarray(N), return_inverse=True)
         N_groups = self.xp.arange(len(unique_N))[inverse]
 
+        # setup window mapping
+        if window is not None:
+            try:
+                window_type = window_map[window]
+            except:
+                raise KeyError(f"The window '{window}' is currently not supported. Only the 'tukey', 'planck', or no/rectangular windows are supported.")
+        else:
+            window_type = 0
+            assert window_alpha == 0.0, "No/Rectangular window does not have a smoothing factor"
+        
         # fill index values if not given
         if data_index is None:
             data_index = self.xp.zeros(self.num_bin, dtype=self.xp.int32)
@@ -890,7 +961,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                         tdi_channel_setup_map[tdi_channel_setup], 
                         gpu, do_synchronize, 
                         num_data[0], num_psd[0],
-                        Ps_arr, self.orbits.armlength, tdi2
+                        Ps_arr, self.orbits.armlength, tdi2,
+                        window_type, window_alpha
                     )
                 )    
                 
@@ -968,7 +1040,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         num_per_gpu=None,
         oversample=1,
         return_cupy=False,
-        tdi2=False,
+        tdi2: bool = False,
+        window: Optional[str] = None,
+        window_alpha: float = 0.0
         # **kwargs
     ):
         if num_per_gpu is not None:
@@ -996,6 +1070,16 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         unique_N, inverse = self.xp.unique(self.xp.asarray(N), return_inverse=True)
         N_groups = self.xp.arange(len(unique_N))[inverse]
 
+        # setup window mapping
+        if window is not None:
+            try:
+                window_type = window_map[window]
+            except:
+                raise KeyError(f"The window '{window}' is currently not supported. Only the 'tukey', 'planck', or no/rectangular windows are supported.")
+        else:
+            window_type = 0
+            assert window_alpha == 0.0, "No/Rectangular window does not have a smoothing factor"
+        
         # check that index values are ready for computation
         if data_index is None:
             data_index = self.xp.zeros(self.num_bin, dtype=self.xp.int32)
@@ -1170,7 +1254,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                         tdi_channel_setup_map[tdi_channel_setup], 
                         gpu, do_synchronize, 
                         num_data[0], num_psd[0],
-                        Ps_arr, self.orbits.armlength, tdi2
+                        Ps_arr, self.orbits.armlength, tdi2,
+                        window_type, window_alpha
                     )
                 )    
                 
@@ -1532,7 +1617,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         data_splits=None,
         num_per_gpu=None,
         factors=None,
-        tdi2=False,
+        tdi2: bool = False,
+        window: Optional[str] = None,
+        window_alpha: float = 0.0,
         **kwargs,
     ):
         """Generate global templates from binary parameters
@@ -1573,14 +1660,23 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         unique_N, inverse = self.xp.unique(self.xp.asarray(N), return_inverse=True)
         N_groups = self.xp.arange(len(unique_N))[inverse]
-
+        
         if factors is not None:
             if use_c_implementation is False:
                 raise NotImplementedError("Currently factors is not implemented for use_c_implementation=False.")
-            
         else:
             factors = self.xp.ones(self.num_bin, dtype=self.xp.float64)
-
+        
+        # setup window mapping
+        if window is not None:
+            try:
+                window_type = window_map[window]
+            except:
+                raise KeyError(f"The window '{window}' is currently not supported. Only the 'tukey', 'planck', or no/rectangular windows are supported.")
+        else:
+            window_type = 0
+            assert window_alpha == 0.0, "No/Rectangular window does not have a smoothing factor"
+        
         # check that index values are ready for computation
         assert len(factors) == self.num_bin
         assert factors.dtype == self.xp.float64
@@ -1679,7 +1775,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                             num_split_here, start_freq_ind_tmp, data_length, 
                             tdi_channel_setup_map[tdi_channel_setup], 
                             gpu, do_synchronize,
-                            Ps_arr, self.orbits.armlength, tdi2
+                            Ps_arr, self.orbits.armlength, tdi2,
+                            window_type, window_alpha
                         )
                     )
 
@@ -1824,7 +1921,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         phase_marginalize=False,
         tdi_channel_setup="AE",
         num_per_gpu=None,
-        tdi2=False,
+        tdi2: bool = False,
+        window: Optional[str] = None,
+        window_alpha: float = 0.0,
         **kwargs,
     ):
         if num_per_gpu is not None:
@@ -1850,6 +1949,16 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         unique_N, inverse = self.xp.unique(self.xp.asarray(N), return_inverse=True)
         N_groups = self.xp.arange(len(unique_N))[inverse]
+
+        # setup window mapping
+        if window is not None:
+            try:
+                window_type = window_map[window]
+            except:
+                raise KeyError(f"The window '{window}' is currently not supported. Only the 'tukey', 'planck', or no/rectangular windows are supported.")
+        else:
+            window_type = 0
+            assert window_alpha == 0.0, "No/Rectangular window does not have a smoothing factor"
 
         # check that index values are ready for computation
         if data_index is None:
@@ -2038,7 +2147,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                             tdi_channel_setup_map[tdi_channel_setup], 
                             gpu, do_synchronize, 
                             num_data[0], num_psd[0],
-                            Ps_arr, self.orbits.armlength, tdi2
+                            Ps_arr, self.orbits.armlength, tdi2,
+                            window_type, window_alpha
                         )
                     )    
                   
@@ -2264,6 +2374,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         oversample: int = 1,
         return_cupy: bool = False,
         tdi2: bool = False,
+        window: Optional[str] = None,
+        window_alpha: float = 0.0,
         batch_size: int = 1000,
         **kwargs
     ):
@@ -2310,7 +2422,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 assert params.shape[0] == N.shape[0]
             elif isinstance(N, (int, self.xp.integer)):
                 N = self.xp.full(params.shape[0], N)
-                          
+
         if inds is None:
             inds = self.xp.arange(num_params)
         else:
@@ -2341,11 +2453,11 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
             waveform_kwargs: Dict[str, Any] = dict(
                     N=N_val,T=T, dt=dt, oversample=oversample, tdi2=tdi2,
-                    tdi_channel_setup=tdi_channel_setup, use_c_implementation=use_c_implementation
+                    tdi_channel_setup=tdi_channel_setup, use_c_implementation=use_c_implementation,
+                    window=window, window_alpha=window_alpha
                 )
             
-            # batching here to avoid memory allocation issues (dh is of size 1000x9x3x1024=0.44 GBytes)
-            # TODO: check usual input size of num_bins, maybe we can do batch_size=1e4
+            # batching here to avoid memory allocation issues (dh is of size 10000x9x3x1024=4.4 GBytes)
             batches = self.xp.arange(0, num_bin, batch_size, dtype=self.xp.int32)
             if batches[-1] < num_bin:
                 batches = self.xp.concatenate([batches, self.xp.array([num_bin], dtype=self.xp.int32)])
@@ -2576,245 +2688,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             except AttributeError:
                 return info_mat
  
-    # def information_matrix(
-    #     self,
-    #     params,
-    #     eps=1e-9,
-    #     parameter_transforms={},
-    #     inds=None,
-    #     N=1024,
-    #     psd_func=None,
-    #     psd_kwargs={},
-    #     easy_central_difference=False,
-    #     return_gpu=False,
-    #     **waveform_kwargs,
-    # ):
-    #     """Get the information matrix for a batch.
-
-    #     This function computes the Information matrix for a batch of Galactic binaries.
-    #     It uses a 2nd order calculation for the derivative if ``easy_central_difference`` is ``False``:
-
-    #     ..math:: \\frac{dh}{d\\lambda_i} = \\frac{-h(\\lambda_i + 2\\epsilon) + h(\\lambda_i - 2\\epsilon) + 8(h(\\lambda_i + \\epsilon) - h(\\lambda_i - \\epsilon))}{12\\epsilson}
-
-    #     Otherwise, it will just calculate the derivate with a first-order central difference.
-
-    #     This function maps all parameter values to 1. For example, if the square root of
-    #     the diagonal of the associated covariance matrix is 1e-7 for the frequency
-    #     parameter, then the standard deviation in the frequency is ``1e-7 * f0``. To
-    #     properly use with covariance values not on the diagonal, they will have to be
-    #     multipled by the parameters: :math:`C_{ij} \\vec{\\theta}_j`.
-
-    #     Args:
-    #         params (2D double np.ndarrays): Parameters of all binaries to be calculated.
-    #             The shape is ``(number of parameters, number of binaries)``.
-    #             See :func:`run_wave` for more information on the adjustable
-    #             number of parameters when calculating for a third body.
-    #         eps (double, optional): Step to take when calculating the derivative.
-    #             The step is relative difference. Default is ``1e-9``.
-    #         parameter_transforms (dict, optional): Dictionary containing the parameter transform
-    #             functions. The keys in the dict should be the index associated with the parameter.
-    #             The items should be the actual transform function. Default is no transforms (``{}``).
-    #         inds (1D int np.ndarray, optional): Numpy array with the indexes of the parameters to
-    #             test in the Information matrix. Default is ``None``. When it is not given, it defaults to
-    #             all parameters.
-    #         N (int, optional): Number of points for the waveform. Same as the ``N`` parameter in
-    #             :func:`run_wave`. We recommend using higher ``N`` in the Information Matrix
-    #             computation because of the numerical derivatives. Default is ``1024``.
-    #         psd_func (object, optional): Function to compute the PSD for the A and E channels.
-    #             Must take on argument: the frequencies as an xp.ndarray. When ``None``,
-    #             it attemps to use the sensitivity functions from LISA Analysis Tools.
-    #         psd_kwargs (dict, optional): Keyword arguments for the TDI noise generator. Default is ``None``.
-    #         easy_central_difference (bool, optional): If ``True``, compute the derivatives with
-    #             a first-order central difference computation. If ``False``, use the higher order
-    #             derivative that computes two more waveforms during the derivative calculation.
-    #             Default is ``False``.
-    #         return_gpu (False, optional): If ``True`` and backend is GPU-based, return Information
-    #             matrices in cupy array. Default is ``False``.
-
-    #     Returns:
-    #         3D xp.ndarray: Information Matrices for all binaries with shape: ``(number of binaries, number of parameters, number of parameters)``.
-
-    #     Raises:
-    #         ValueError: Step size issues.
-    #         ModuleNotFoundError: LISA Analysis Tools package not available.
-    #             Occurs when NOT providing ``psd_func`` kwarg.
-
-    #     """
-    #     if parameter_transforms is None:
-    #         parameter_transforms = {}
-    #     if psd_kwargs is None:
-    #         psd_kwargs = {}
-            
-    #     if N is None:
-    #         raise ValueError("N must be provided up front for Infromation Matrix.")
-    #         # put the N used here into kwargs
-            
-    #     waveform_kwargs["N"] = N       
-    #     self.N = N
-        
-    #     assert "T" in waveform_kwargs
-    #     assert 'tdi_channel_setup' in waveform_kwargs
-        
-    #     params = np.atleast_2d(params)
-    #     q_check = (params[1,:] / 1000.0 * waveform_kwargs["T"]).astype(np.int32) # sampling params are in mHz
-    #     self.start_inds = (q_check - N / 2).astype(np.int32)
-        
-    #     # get frequencies for each binary
-    #     self.df = 1 / waveform_kwargs["T"]
-    #     freqs = self.freqs
-        
-    #     if psd_func is None:
-    #         # check if sensitivity information is available
-    #         if not tdi_available:
-    #             raise ModuleNotFoundError(
-    #                 "Sensitivity curve information through LISA Analysis Tools is not available. Stock option for Information matrix will not work. Please install LISA Analysis Tools (pip install lisaanalysistools)."
-    #             )
-    #         psd_func = A1TDISens.get_Sn
-        
-    #     # get psd or csd
-    #     if psd_func is XYZSensitivityBackend:
-    #         assert waveform_kwargs["tdi_channel_setup"] == "XYZ"
-    #         assert isinstance(self.orbits, L1Orbits)
-    #         assert self.domain_settings is not None
-    #         assert self.force_backend is not None
-            
-    #         psd_func = XYZSensitivityBackend(
-    #             orbits=self.orbits,
-    #             settings=self.domain_settings,
-    #             force_backend=self.force_backend,
-    #             mask_percentage=0.02
-    #         )
-    #         psd_full_freq_range = psd_func(**psd_kwargs).sens_mat
-            
-    #         idx_to_extract = self.start_inds[:, None] + self.xp.arange(self.N)
-    #         psd = psd_full_freq_range[:, :, idx_to_extract]
-            
-    #     elif psd_func is A1TDISens:
-    #         assert waveform_kwargs["tdi_channel_setup"] == "AE"
-    #         psd = self.xp.asarray(psd_func(freqs, **psd_kwargs))
-            
-    #     else: 
-    #         raise NotImplementedError("Only XYZ and AE channel setup is currently supported.")
-        
-    #     # get shape information
-    #     num_params, num_bins = params.shape
-    #     nchannels = len(waveform_kwargs["tdi_channel_setup"])
-        
-    #     # fill inds if not given
-    #     if inds is None:
-    #         inds = np.arange(num_params)
-
-    #     # setup holder arrays
-    #     num_derivs = len(inds)
-    #     info_matrix = self.xp.zeros((num_bins, num_derivs, num_derivs))
-
-    #     # derivative buffer for waveforms
-    #     dh = self.xp.zeros((num_bins, num_derivs, nchannels, N), self.xp.complex128)
-
-    #     for i, ind in enumerate(inds):
-    #         # 1 eps up derivative
-    #         # map all the parameters to 1
-    #         params_up_1 = np.ones_like(params)
-    #         params_up_1[ind] += 1 * eps
-    #         params_up_1 *= params
-    #         params_up_1 = self._apply_parameter_transforms(
-    #             params_up_1, parameter_transforms
-    #         )
-    #         self.run_wave(*params_up_1, **waveform_kwargs)
-    #         h_I_up_eps = self.xp.asarray([
-    #             getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
-    #         ]).transpose((1, 0, 2))
-
-    #         # 1 eps down derivative
-    #         # map all the parameters to 1
-    #         params_down_1 = np.ones_like(params)
-    #         params_down_1[ind] -= 1 * eps
-    #         params_down_1 *= params
-    #         params_down_1 = self._apply_parameter_transforms(
-    #             params_down_1, parameter_transforms
-    #         )
-    #         self.run_wave(*params_down_1, **waveform_kwargs)
-    #         h_I_down_eps = self.xp.asarray([
-    #             getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
-    #         ]).transpose((1, 0, 2))
-
-    #         # compute derivative and store
-    #         if easy_central_difference:
-    #             dh[:, i] = (h_I_up_eps - h_I_down_eps) / (2 * eps)
-
-    #         else:
-    #             # higher degree derivative computation
-
-    #             # 2 eps up derivative
-    #             # map all the parameters to 1
-    #             params_up_2 = np.ones_like(params)
-    #             params_up_2[ind] += 2 * eps
-    #             params_up_2 *= params
-    #             params_up_2 = self._apply_parameter_transforms(
-    #                 params_up_2, parameter_transforms
-    #             )
-    #             self.run_wave(*params_up_2, **waveform_kwargs)
-    #             h_I_up_2eps = self.xp.asarray([
-    #                 getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
-    #             ]).transpose((1, 0, 2))
-                
-    #             # TODO: check this? in ldc validation this was uncommented
-    #             # if not np.all(self.start_inds == self.start_inds[0]):
-    #             #     raise ValueError(
-    #             #         "The user should decrease steps size (eps) because the frequency bins are changing during derivative calculation, which is not allowed."
-    #             #     )
-
-    #             # 2 eps down derivative
-    #             # map all the parameters to 1
-    #             params_down_2 = np.ones_like(params)
-    #             params_down_2[ind] -= 2 * eps
-    #             params_down_2 *= params
-    #             params_down_2 = self._apply_parameter_transforms(
-    #                 params_down_2, parameter_transforms
-    #             )
-    #             self.run_wave(*params_down_2, **waveform_kwargs)
-    #             h_I_down_2eps = self.xp.asarray([
-    #                 getattr(self, channel) for channel in waveform_kwargs["tdi_channel_setup"]
-    #             ]).transpose((1, 0, 2))
-
-    #             dh[:, i] = (
-    #                 -h_I_up_2eps + h_I_down_2eps + 8 * (h_I_up_eps - h_I_down_eps)
-    #             ) / (12 * eps)
-
-    #     if waveform_kwargs["tdi_channel_setup"] == "XYZ":
-    #         csd_batched = psd.transpose(2, 3, 0, 1) # (num_bins, N, 3, 3)
-    #         inv_csd_batched = self.xp.linalg.inv(csd_batched)
-    #         inv_csd = inv_csd_batched.transpose(0, 2, 3, 1) # (num_bins, 3, 3, N)
-        
-        # compute Information matrix via inner products
-        # for i in range(num_derivs):
-        #     for j in range(i, num_derivs):
-        #         # inner product between derivatives
-        #         if waveform_kwargs["tdi_channel_setup"] == "XYZ":
-        #             # using einstein summation: b=binary, c=channel 1, d=channel 2, k=frequency
-        #             inner_prod= (
-        #                 4.0 * self.df
-        #                 * self.xp.einsum(
-        #                     "bck,bcdk,bdk->b", dh[:, i].conj(), inv_csd, dh[:, j]
-        #                 ).real
-        #             )
-        #         else:
-        #             inner_prod = (
-        #                 4.0 * self.df
-        #                 * self.xp.sum(
-        #                     (dh[:, i].conj() * dh[:, j]).real / psd[:, None, :], axis=(1, 2)
-        #                 )
-        #             )
-           
-        #         # symmetry
-        #         info_matrix[:, i, j] = inner_prod
-        #         info_matrix[:, j, i] = info_matrix[:, i, j]
-
-    #     # copy to cpu if needed
-    #     if self.backend.name == "gpu" and return_gpu is False:
-    #         info_matrix = info_matrix.get()
-
-    #     return info_matrix
 
 
 class GBGPU(GBGPUBase):

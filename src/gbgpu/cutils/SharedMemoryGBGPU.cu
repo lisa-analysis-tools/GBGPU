@@ -106,6 +106,48 @@ __inline__ void AET_from_XYZ_swap(cmplx *X_in, cmplx *Y_in, cmplx *Z_in)
     *Z_in = (X + Y + Z) / sqrt(3.0);
 }
 
+CUDA_DEVICE
+__inline__ double get_window_val(int i, int N, int window_type, double alpha)
+{
+    if (window_type == 0 || alpha <= 0.0 || N <= 1) return 1.0;
+    
+    if (window_type == 1) // Tukey
+    {
+        double r = (2.0 * i) / (alpha * (N - 1));
+        double l1 = rint((alpha * (N - 1)) / 2.0);
+        double l2 = rint((N - 1) * (1.0 - alpha / 2.0));
+        
+        if (i < l1) {
+            return 0.5 * (1.0 + cos(M_PI * (r - 1.0)));
+        } else if (i < l2) {
+            return 1.0;
+        } else {
+            return 0.5 * (1.0 + cos(M_PI * (r - 2.0 / alpha + 1.0)));
+        }
+    }
+    else if (window_type == 2) // Planck
+    {
+        double epsilon = alpha;
+        double n1 = epsilon * (N - 1);
+        double n2 = (1.0 - epsilon) * (N - 1);
+        
+        if (i < n1) {
+            double z1 = epsilon * (N - 1) / ((double)i + 1e-15) + epsilon * (N - 1) / ((double)i - epsilon * (N - 1) + 1e-15);
+            if (z1 > 700.0) z1 = 700.0;
+            if (z1 < -700.0) z1 = -700.0;
+            return 1.0 / (1.0 + exp(z1));
+        } else if (i <= n2) {
+            return 1.0;
+        } else {
+            double z2 = epsilon * (N - 1) / ((N - 1) - (double)i + 1e-15) + epsilon * (N - 1) / ((N - 1) - (double)i - epsilon * (N - 1) + 1e-15);
+            if (z2 > 700.0) z2 = 700.0;
+            if (z2 < -700.0) z2 = -700.0;
+            return 1.0 / (1.0 + exp(z2));
+        }
+    }
+    return 1.0;
+}
+
 #ifdef __CUDACC__
 template <class FFT>
  
@@ -130,7 +172,9 @@ void build_single_waveform(
     int tdi_channel_setup, 
     double *Ps, 
     double L_arm,
-    bool tdi2) // Watch out this naming is close to Larm
+    bool tdi2,
+    int window_type,
+    double window_alpha) 
 {
 
     using complex_type = cmplx;
@@ -348,6 +392,8 @@ void build_single_waveform(
         fctr = gcmplx::exp(-I * omL);
         fctr2 = 4.0 * omL * SomL * fctr / amp;
 
+        double w_val = get_window_val(i, N, window_type, window_alpha);
+
         // order is (12, 23, 31, 21, 32, 13)
 
         // Xsl = Gs["21"] - Gs["31"] + (Gs["12"] - Gs["13"]) * fctr
@@ -355,16 +401,16 @@ void build_single_waveform(
 
         // tmp_X = sin(2. * M_PI * f0 * t) + I * cos(2. * M_PI * f0 * t);
         // tmp2_X = complex_type {tmp_X.real(), tmp_X.imag()};
-        X[i] = tmp_X;
+        X[i] = tmp_X * w_val;
 
         tmp_Y = fctr2 * ((Gs[4] - Gs[0] + (Gs[1] - Gs[3]) * fctr));
         // tmp2_Y = complex_type {tmp_Y.real(), tmp_Y.imag()};
-        Y[i] = tmp_Y;
+        Y[i] = tmp_Y * w_val;
 
         tmp_Z = fctr2 * ((Gs[5] - Gs[1] + (Gs[2] - Gs[4]) * fctr));
         // tmp_Z = sin(2. * M_PI * f0 * t) + I * cos(2. * M_PI * f0 * t);
         // tmp2_Z = complex_type {tmp_Z.real(), tmp_Z.imag()};
-        Z[i] = tmp_Z;
+        Z[i] = tmp_Z * w_val;
     }
 
     CUDA_SYNCTHREADS;
@@ -480,7 +526,9 @@ void get_waveform(
     int tdi_channel_setup,
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -532,7 +580,9 @@ void get_waveform(
             tdi_channel_setup,
             Ps,
             L_arm,
-            tdi2);
+            tdi2,
+            window_type,
+            window_alpha);
 
         start_inds_out[bin_i] = start_ind;
         
@@ -614,7 +664,9 @@ void get_waveform_wrap(InputInfo inputs)
         inputs.tdi_channel_setup,
         inputs.Ps,
         inputs.L_arm,
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     CUDA_CHECK_AND_EXIT(cudaDeviceSynchronize());
 
@@ -653,7 +705,9 @@ void SharedMemoryWaveComp(
     int tdi_channel_setup, 
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -676,6 +730,8 @@ void SharedMemoryWaveComp(
     inputs.Ps = Ps;
     inputs.L_arm = L_arm;
     inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -731,7 +787,9 @@ void SharedMemoryWaveComp(
         inputs.tdi_channel_setup,
         inputs.Ps,
         inputs.L_arm,
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 #endif
 }
 
@@ -894,7 +952,9 @@ void get_ll(
     int num_noise,
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -973,7 +1033,9 @@ void get_ll(
             tdi_channel_setup,
             Ps,
             L_arm,
-            tdi2);
+            tdi2,
+            window_type,
+            window_alpha);
 
         CUDA_SYNCTHREADS;
         tmp1 = 0.0;
@@ -1103,7 +1165,9 @@ void get_ll_wrap(InputInfo inputs)
         inputs.num_noise,
         inputs.Ps,
         inputs.L_arm,
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     if (inputs.do_synchronize)
@@ -1156,7 +1220,9 @@ void SharedMemoryLikeComp(
     int num_noise,
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -1189,6 +1255,8 @@ void SharedMemoryLikeComp(
     inputs.Ps = Ps;
     inputs.L_arm = L_arm;
     inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -1249,7 +1317,9 @@ void SharedMemoryLikeComp(
         inputs.num_noise,
         inputs.Ps,
         inputs.L_arm,
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
 #endif
     // const unsigned int arch = example::get_cuda_device_arch();
@@ -1308,7 +1378,9 @@ void get_swap_ll_diff(
     int num_noise, 
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -1417,7 +1489,9 @@ void get_swap_ll_diff(
             tdi_channel_setup,
             Ps,
             L_arm,
-            tdi2);
+            tdi2,
+            window_type,
+            window_alpha);
         CUDA_SYNCTHREADS;
 #ifdef __CUDACC__
         build_single_waveform<FFT>(
@@ -1442,7 +1516,9 @@ void get_swap_ll_diff(
             tdi_channel_setup,
             Ps,
             L_arm,
-            tdi2);
+            tdi2,
+            window_type,
+            window_alpha);
         CUDA_SYNCTHREADS;
 
         // subtract start_freq_ind to find index into subarray
@@ -1869,7 +1945,9 @@ void get_swap_ll_diff_wrap(InputInfo inputs)
         inputs.num_noise,
         inputs.Ps,
         inputs.L_arm,
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     if (inputs.do_synchronize)
@@ -1934,7 +2012,9 @@ void SharedMemorySwapLikeComp(
     int num_noise,
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -1979,6 +2059,8 @@ void SharedMemorySwapLikeComp(
     inputs.Ps = Ps;
     inputs.L_arm = L_arm;
     inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -2051,7 +2133,9 @@ void SharedMemorySwapLikeComp(
         inputs.num_noise,
         inputs.Ps,
         inputs.L_arm,
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
 #endif
     // const unsigned int arch = example::get_cuda_device_arch();
@@ -2096,7 +2180,9 @@ void get_chi_squared(
     int num_noise,
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -2202,7 +2288,9 @@ void get_chi_squared(
                 bin_i, tdi_channel_setup,
                 Ps,
                 L_arm,
-                tdi2);
+                tdi2,
+                window_type,
+                window_alpha);
             CUDA_SYNCTHREADS;
 #ifdef __CUDACC__
             build_single_waveform<FFT>(
@@ -2226,7 +2314,9 @@ void get_chi_squared(
                 bin_i, tdi_channel_setup,
                 Ps,
                 L_arm,
-                tdi2);
+                tdi2,
+                window_type,
+                window_alpha);
             CUDA_SYNCTHREADS;
 
             // subtract start_freq_ind to find index into subarray
@@ -2538,7 +2628,9 @@ void get_chi_squared_wrap(InputInfo inputs)
         inputs.num_noise, 
         inputs.Ps,
         inputs.L_arm,
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     if (inputs.do_synchronize)
@@ -2590,7 +2682,9 @@ void SharedMemoryChiSquaredComp(
     int num_noise,
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -2623,6 +2717,8 @@ void SharedMemoryChiSquaredComp(
     inputs.Ps = Ps;
     inputs.L_arm = L_arm;
     inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -2682,7 +2778,9 @@ void SharedMemoryChiSquaredComp(
         inputs.num_noise,
         inputs.Ps,
         inputs.L_arm, 
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 #endif
     // const unsigned int arch = example::get_cuda_device_arch();
     // simple_block_fft<800>(x);
@@ -2766,7 +2864,9 @@ void generate_global_template(
     int tdi_channel_setup,
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -2837,7 +2937,9 @@ void generate_global_template(
             tdi_channel_setup,
             Ps,
             L_arm, 
-            tdi2);
+            tdi2,
+            window_type,
+            window_alpha);
 
         CUDA_SYNCTHREADS;
 #ifdef __CUDACC__
@@ -2932,7 +3034,9 @@ void generate_global_template_wrap(InputInfo inputs)
         inputs.tdi_channel_setup,
         inputs.Ps,
         inputs.L_arm,
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     if (inputs.do_synchronize)
@@ -2980,7 +3084,9 @@ void SharedMemoryGenerateGlobal(
     bool do_synchronize,
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -3008,6 +3114,8 @@ void SharedMemoryGenerateGlobal(
     inputs.Ps = Ps;
     inputs.L_arm = L_arm;
     inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -3063,7 +3171,9 @@ void SharedMemoryGenerateGlobal(
         inputs.tdi_channel_setup,
         inputs.Ps,
         inputs.L_arm,
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
 #endif
     // const unsigned int arch = example::get_cuda_device_arch();
@@ -3107,7 +3217,9 @@ void get_fstat_ll(
     int num_noise, 
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -3205,7 +3317,9 @@ void get_fstat_ll(
                 tdi_channel_setup,
                 Ps,
                 L_arm,
-                tdi2
+                tdi2,
+                window_type,
+                window_alpha
             );
             CUDA_SYNCTHREADS;
         }
@@ -3378,7 +3492,9 @@ void get_fstat_ll_wrap(InputInfo inputs)
         inputs.num_noise,
         inputs.Ps,
         inputs.L_arm,
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     if (inputs.do_synchronize)
@@ -3427,7 +3543,9 @@ void SharedMemoryFstatLikeComp(
     int num_noise,
     double *Ps,
     double L_arm,
-    bool tdi2)
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -3456,6 +3574,8 @@ void SharedMemoryFstatLikeComp(
     inputs.Ps = Ps;
     inputs.L_arm = L_arm;
     inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -3513,7 +3633,9 @@ void SharedMemoryFstatLikeComp(
         inputs.num_noise,
         inputs.Ps,
         inputs.L_arm,
-        inputs.tdi2);
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
 #endif
     // const unsigned int arch = example::get_cuda_device_arch();

@@ -26,7 +26,9 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         int tdi_channel_setup,
         double* Ps,
         double L_arm,
-        bool tdi2
+        bool tdi2,
+        int window_type,
+        double window_alpha
     ) except+
 
     void SharedMemoryLikeComp(
@@ -58,7 +60,9 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         int num_noise,
         double* Ps,
         double L_arm,
-        bool tdi2
+        bool tdi2,
+        int window_type,
+        double window_alpha
     ) except+
 
     void SharedMemorySwapLikeComp(
@@ -102,7 +106,9 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         int num_noise,
         double* Ps,
         double L_arm,
-        bool tdi2
+        bool tdi2,
+        int window_type,
+        double window_alpha
     ) except+
 
     void SharedMemoryChiSquaredComp(
@@ -133,7 +139,9 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         int num_noise,
         double* Ps,
         double L_arm,
-        bool tdi2
+        bool tdi2,
+        int window_type,
+        double window_alpha
     ) except+
 
     void SharedMemoryGenerateGlobal(
@@ -160,7 +168,9 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         bool do_synchronize,
         double* Ps,
         double L_arm,
-        bool tdi2
+        bool tdi2,
+        int window_type,
+        double window_alpha
     ) except+
 
     void SharedMemoryFstatLikeComp(
@@ -188,7 +198,9 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         int num_noise, 
         double* Ps,
         double L_arm, 
-        bool tdi2
+        bool tdi2,
+        int window_type,
+        double window_alpha
     ) except+
 
 def SharedMemoryWaveComp_wrap(*args, **kwargs):
@@ -211,7 +223,9 @@ def SharedMemoryWaveComp_wrap(*args, **kwargs):
         tdi_channel_setup,
         Ps,
         L_arm,
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     ), tkwargs = wrapper(*args, **kwargs)
 
     cdef size_t tdi_out_in = tdi_out
@@ -246,7 +260,9 @@ def SharedMemoryWaveComp_wrap(*args, **kwargs):
         tdi_channel_setup,
         <double *>Ps_in,
         L_arm,
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     )
 
 
@@ -280,7 +296,9 @@ def SharedMemoryLikeComp_wrap(*args, **kwargs):
         num_noise,
         Ps,
         L_arm,
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     ), tkwargs = wrapper(*args, **kwargs)
     
 
@@ -331,7 +349,9 @@ def SharedMemoryLikeComp_wrap(*args, **kwargs):
         num_noise,
         <double *> Ps_in,
         L_arm, 
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     )
 
 
@@ -377,7 +397,9 @@ def SharedMemorySwapLikeComp_wrap(*args, **kwargs):
         num_noise,
         Ps,
         L_arm,
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     ), tkwargs = wrapper(*args, **kwargs)
 
     cdef size_t d_h_remove_in = d_h_remove
@@ -451,10 +473,10 @@ def SharedMemorySwapLikeComp_wrap(*args, **kwargs):
         num_noise,
         <double *> Ps_in,
         L_arm, 
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     )
-
-
 
 def SharedMemoryChiSquaredComp_wrap(*args, **kwargs):
     (
@@ -485,7 +507,9 @@ def SharedMemoryChiSquaredComp_wrap(*args, **kwargs):
         num_noise,
         Ps,
         L_arm,
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     ), tkwargs = wrapper(*args, **kwargs)
 
     cdef size_t h1_h1_in = h1_h1
@@ -533,9 +557,10 @@ def SharedMemoryChiSquaredComp_wrap(*args, **kwargs):
         num_noise,
         <double *> Ps_in,
         L_arm,
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     )
-
 
 def SharedMemoryGenerateGlobal_wrap(*args, **kwargs):
     (   
@@ -562,7 +587,9 @@ def SharedMemoryGenerateGlobal_wrap(*args, **kwargs):
         do_synchronize, 
         Ps,
         L_arm,
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     ), tkwargs = wrapper(*args, **kwargs)
 
     cdef size_t data_in = data
@@ -604,9 +631,10 @@ def SharedMemoryGenerateGlobal_wrap(*args, **kwargs):
         do_synchronize,
         <double *> Ps_in,
         L_arm,
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     )
-
 
 def SharedMemoryFstatLikeComp_wrap(*args, **kwargs):
     (
@@ -634,7 +662,9 @@ def SharedMemoryFstatLikeComp_wrap(*args, **kwargs):
         num_noise,
         Ps,
         L_arm,
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     ), tkwargs = wrapper(*args, **kwargs)
 
     cdef size_t M_mat_in = M_mat
@@ -676,5 +706,7 @@ def SharedMemoryFstatLikeComp_wrap(*args, **kwargs):
         num_noise,
         <double *> Ps_in,
         L_arm,
-        tdi2
+        tdi2,
+        window_type,
+        window_alpha
     )

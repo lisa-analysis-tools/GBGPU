@@ -39,7 +39,9 @@ void SharedMemoryWaveComp(
     int tdi_channel_setup,
     double* Ps,
     double L_arm,
-    bool tdi2
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
 
 typedef struct InputInfoTag{
@@ -122,6 +124,8 @@ typedef struct InputInfoTag{
     double *Ps;
     double L_arm;
     bool tdi2;
+    int window_type;
+    double window_alpha;
 } InputInfo; 
 
 void SharedMemoryLikeComp(
@@ -153,7 +157,9 @@ void SharedMemoryLikeComp(
     int num_noise,
     double* Ps,
     double L_arm,
-    bool tdi2
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
 
 
@@ -198,7 +204,9 @@ void SharedMemorySwapLikeComp(
     int num_noise,
     double* Ps,
     double L_arm,
-    bool tdi2
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
 
 void SharedMemoryChiSquaredComp(
@@ -229,7 +237,9 @@ void SharedMemoryChiSquaredComp(
     int num_noise,
     double* Ps,
     double L_arm,
-    bool tdi2
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
 
 
@@ -257,7 +267,9 @@ void SharedMemoryGenerateGlobal(
     bool do_synchronize,
     double* Ps,
     double L_arm,
-    bool tdi2
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
 
 
@@ -286,7 +298,9 @@ void SharedMemoryFstatLikeComp(
     int num_noise,
     double* Ps, 
     double L_arm,
-    bool tdi2
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
 
 #endif // __SHAREDMEMORY_GBGPU_HPP__

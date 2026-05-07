@@ -4,6 +4,7 @@ requires = [
   "numpy",
   "lisaanalysistools>=1.0.17",
   "scikit_build_core",
+  "gpubackendtools",
 ]
 build-backend = "scikit_build_core.build"
 
