@@ -1673,6 +1673,47 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 #         templates[:, 0] += template_A.reshape(total_groups, data_length)
                 #         templates[:, 1] += template_E.reshape(total_groups, data_length)
 
+        elif not self.backend.uses_cupy:
+            # CPU path: mirrors the GPU branch above but without any
+            # cuda.runtime calls. data_splits picks which template buffer
+            # entry each source contributes to; on CPU we just use a single
+            # buffer (gpu id 0).
+            do_synchronize = False
+            gpu = 0
+            if data_splits is None:
+                data_splits = self.xp.full(num_templates[0], gpu)
+            if num_per_gpu is None:
+                num_per_gpu = int(10000000)
+
+            for nnn, N_here in enumerate(unique_N):
+                N_here = N_here.item()
+                keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[group_index] == gpu)
+                num_split_here = keep_bool.sum().item()
+                if num_split_here == 0:
+                    continue
+                params_here = self.xp.asarray(params)[keep_bool]
+                group_index_here = (group_index[keep_bool] % num_per_gpu).astype(np.int32)
+                factors_here = factors[keep_bool]
+                params_here[:, 8] = np.pi / 2 - params_here[:, 8]
+
+                templates_here = templates_in[0]
+                params_N_tuple = tuple([pars_tmp.copy() for pars_tmp in params_here.T])
+
+                if isinstance(start_freq_ind, int):
+                    start_freq_ind_tmp = self.xp.full(num_templates[0], start_freq_ind, dtype=np.int32)
+                else:
+                    assert isinstance(start_freq_ind, self.xp.ndarray) and start_freq_ind.dtype == np.int32
+                    start_freq_ind_tmp = start_freq_ind
+                assert len(start_freq_ind_tmp) == num_templates[0]
+
+                tuple_in = (
+                    (templates_here, group_index_here, factors_here)
+                    + params_N_tuple
+                    + (T, dt, N_here, num_split_here, start_freq_ind_tmp, data_length,
+                       tdi_channel_setup_map[tdi_channel_setup], gpu, do_synchronize)
+                )
+                self.backend.sharedmem.SharedMemoryGenerateGlobal_wrap(*tuple_in)
+
         else:
             raise NotImplementedError
             kwargs["T"] = T

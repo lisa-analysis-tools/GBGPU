@@ -12,6 +12,16 @@
 get_target_property(GBGPU_WITH_CPU gbgpu WITH_CPU)
 get_target_property(GBGPU_WITH_GPU gbgpu WITH_GPU)
 
+# Locate the gpubackendtools cutils directory so we can find gbt_global.h /
+# common helpers that the downloaded LISAanalysistools Detector.cu pulls in.
+# Mirrors how lisa-on-gpu/src/fastlisaresponse/cutils/CMakeLists.txt does it.
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c "if True:
+    import gpubackendtools
+    print(gpubackendtools.__file__.split('__init__.py')[0] + 'cutils')"
+  OUTPUT_VARIABLE GBT_CUTILS
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+
 # Adapter to let inplace editable install work: the compiled backend will be
 # placed into the source-tree in the 'src' directory:
 # TODO: is this needed ?
@@ -156,13 +166,17 @@ if(GBGPU_WITH_CPU)
 
   python_add_library(gbgpu_cpu_utils MODULE WITH_SOABI Detector.cxx utils.cxx gbgpu_utils.cxx)
   apply_cpu_backend_common_options(utils)
+  # Detector.cu (downloaded from LISAanalysistools) includes gbt_global.h from
+  # gpubackendtools; make that path visible to the CPU build.
+  target_include_directories(gbgpu_cpu_utils PUBLIC ${GBT_CUTILS})
 
   target_sources(gbgpu_cpu_utils PUBLIC FILE_SET HEADERS FILES
   global.hpp Detector.hpp cuda_complex.hpp global.h gbgpu_utils.hh)
 
-  
+
   python_add_library(gbgpu_cpu_sharedmem MODULE WITH_SOABI Detector.cxx SharedMemoryGBGPU.cxx sharedmemgbgpu.cxx)
   apply_cpu_backend_common_options(sharedmem)
+  target_include_directories(gbgpu_cpu_sharedmem PUBLIC ${GBT_CUTILS})
   target_sources(gbgpu_cpu_sharedmem PUBLIC FILE_SET HEADERS FILES
   global.hpp Detector.hpp cuda_complex.hpp global.h SharedMemoryGBGPU.hpp
   common.hpp fp16_common.hpp common.hpp)
