@@ -3642,6 +3642,310 @@ void SharedMemoryFstatLikeComp(
     // simple_block_fft<800>(x);
 }
 
+
+#ifdef __CUDACC__
+template <class FFT>
+__launch_bounds__(FFT::max_threads_per_block) __global__ 
+void get_info_dh_kernel(
+    cmplx* d_dh,
+    double* amp, 
+    double* f0, 
+    double* fdot0, 
+    double* fddot0, 
+    double* phi0,
+    double* iota, 
+    double* psi,
+    double* lam, 
+    double* theta,
+    int* inds, 
+    double* eps_scaled, 
+    double eps_orig, 
+    bool easy_central_difference,
+    double T, 
+    double dt, 
+    int N, 
+    int num_bin_all, 
+    int num_derivs,
+    int tdi_channel_setup, 
+    double* Ps, 
+    double L_arm, 
+    bool tdi2,
+    int window_type, 
+    double window_alpha
+) {
+    int bin_i = blockIdx.x;
+    int deriv_i = blockIdx.y;
+    if (bin_i >= num_bin_all || deriv_i >= num_derivs) return;
+
+    int ind = inds[deriv_i];
+    cmplx* my_dh = &d_dh[(bin_i * num_derivs + deriv_i) * 3 * N];
+
+    double step = eps_scaled[bin_i * num_derivs + deriv_i];
+
+    extern __shared__ unsigned char shared_mem[];
+    cmplx* wave = (cmplx*)shared_mem;
+
+    unsigned int start_ind = 0;
+
+    for (int i = threadIdx.x; i < 3 * N; i += blockDim.x) {
+        my_dh[i] = 0.0;
+    }
+    CUDA_SYNCTHREADS;
+
+    auto build_and_add = [&](double coef, double step_mult) {
+        double p_amp = amp[bin_i];
+        double p_f0 = f0[bin_i];
+        double p_fdot0 = fdot0[bin_i];
+        double p_fddot0 = fddot0[bin_i];
+        double p_phi0 = phi0[bin_i];
+        double p_iota = iota[bin_i];
+        double p_psi = psi[bin_i];
+        double p_lam = lam[bin_i];
+        double p_theta = theta[bin_i];
+
+        double mod_eps = step_mult * step * eps_orig;
+        if (ind == 0) p_amp += mod_eps;
+        else if (ind == 1) p_f0 += mod_eps;
+        else if (ind == 2) p_fdot0 += mod_eps;
+        else if (ind == 3) p_fddot0 += mod_eps;
+        else if (ind == 4) p_phi0 += mod_eps;
+        else if (ind == 5) p_iota += mod_eps;
+        else if (ind == 6) p_psi += mod_eps;
+        else if (ind == 7) p_lam += mod_eps;
+        else if (ind == 8) p_theta += mod_eps;
+
+        build_single_waveform<FFT>(
+            wave, &start_ind,
+            p_amp, p_f0, p_fdot0, p_fddot0, p_phi0, p_iota, p_psi, p_lam, p_theta,
+            T, dt, N, bin_i, tdi_channel_setup, Ps, L_arm, tdi2, window_type, window_alpha
+        );
+        CUDA_SYNCTHREADS;
+
+        for (int i = threadIdx.x; i < 3 * N; i += blockDim.x) {
+            my_dh[i] += coef * wave[i];
+        }
+        CUDA_SYNCTHREADS;
+    };
+    // double abs_step = fabs(step);
+    if (easy_central_difference) {
+
+        build_and_add(1.0 / (2.0 * eps_orig), 1.0);
+        build_and_add(-1.0 / (2.0 * eps_orig), -1.0);
+    } else {
+        build_and_add(-1.0 / (12.0 * eps_orig), 2.0);
+        build_and_add(1.0 / (12.0 * eps_orig), -2.0);
+        build_and_add(8.0 / (12.0 * eps_orig), 1.0);
+        build_and_add(-8.0 / (12.0 * eps_orig), -1.0);
+    }
+}
+
+template <class FFT>
+__launch_bounds__(FFT::max_threads_per_block) __global__ 
+void get_info_inner_kernel(
+    double* info_mat, cmplx* d_dh,
+    cmplx* noise, int* noise_index, int* start_freq_inds,
+    double T, int N, int num_bin_all, int num_derivs,
+    int data_length, int tdi_channel_setup
+) {
+    int bin_i = blockIdx.x;
+    if (bin_i >= num_bin_all) return;
+
+    extern __shared__ double sdata_info[]; 
+
+    int nchannels = (tdi_channel_setup == TDI_CHANNEL_SETUP_AE) ? 2 : 3;
+    double df = 1.0 / T;
+    int noise_ind = noise_index[bin_i];
+    int start_freq_ind = start_freq_inds[bin_i];
+
+    int tid = threadIdx.x;
+
+    for (int d1 = 0; d1 < num_derivs; d1++) {
+        for (int d2 = d1; d2 < num_derivs; d2++) {
+            cmplx* dh1 = &d_dh[(bin_i * num_derivs + d1) * 3 * N];
+            cmplx* dh2 = &d_dh[(bin_i * num_derivs + d2) * 3 * N];
+
+            double sum = 0.0;
+            for (int i = tid; i < N; i += blockDim.x) {
+                int jj = start_freq_ind + i;
+                if (jj < 0 || jj >= data_length) continue; 
+
+                if (tdi_channel_setup == TDI_CHANNEL_SETUP_XYZ) {
+                    for (int c1 = 0; c1 < 3; c1++) {
+                        for (int c2 = 0; c2 < 3; c2++) {
+                            int noise_idx = ((noise_ind * 3 + c1) * 3 + c2) * data_length + jj;
+                            cmplx n = noise[noise_idx];
+                            cmplx v1 = dh1[c1 * N + i];
+                            cmplx v2 = dh2[c2 * N + i];
+                            sum += (gcmplx::conj(v1) * n * v2).real();
+                        }
+                    }
+                } else {
+                    for (int c1 = 0; c1 < nchannels; c1++) {
+                        int noise_idx = (noise_ind * nchannels + c1) * data_length + jj;
+                        cmplx n = noise[noise_idx];
+                        cmplx v1 = dh1[c1 * N + i];
+                        cmplx v2 = dh2[c1 * N + i];
+                        sum += (gcmplx::conj(v1) * n * v2).real();
+                    }
+                }
+            }
+
+            sdata_info[tid] = sum;
+            CUDA_SYNCTHREADS;
+
+            for (unsigned int s = 1; s < blockDim.x; s *= 2) {
+                if (tid % (2 * s) == 0) {
+                    sdata_info[tid] += sdata_info[tid + s];
+                }
+                CUDA_SYNCTHREADS;
+            }
+
+            if (tid == 0) {
+                double final_val = 4.0 * df * sdata_info[0];
+                info_mat[(bin_i * num_derivs + d1) * num_derivs + d2] = final_val;
+                if (d1 != d2) {
+                    info_mat[(bin_i * num_derivs + d2) * num_derivs + d1] = final_val;
+                }
+            }
+            CUDA_SYNCTHREADS;
+        }
+    }
+}
+
+template <unsigned int Arch, unsigned int N>
+void get_info_mat_wrap(InputInfo inputs) {
+    using namespace cufftdx;
+    if (inputs.device >= 0) {
+        CUDA_CHECK_AND_EXIT(cudaSetDevice(inputs.device));
+    }
+
+    using FFT = decltype(Block() + Size<N>() + Type<fft_type::c2c>() + Direction<fft_direction::forward>() +
+                         Precision<double>() + ElementsPerThread<8>() + FFTsPerBlock<1>() + SM<Arch>());
+
+    auto size_bytes = FFT::ffts_per_block * cufftdx::size_of<FFT>::value * sizeof(cmplx);
+    auto shared_memory_size = std::max((unsigned int)FFT::shared_memory_size, (unsigned int)(3 * N * sizeof(cmplx)));
+
+    CUDA_CHECK_AND_EXIT(cudaFuncSetAttribute(get_info_dh_kernel<FFT>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_memory_size));
+
+    dim3 grid1(inputs.num_bin_all, inputs.num_derivs);
+    get_info_dh_kernel<FFT><<<grid1, FFT::block_dim, shared_memory_size>>>(
+        inputs.d_dh_workspace,
+        inputs.amp, inputs.f0, inputs.fdot0, inputs.fddot0, inputs.phi0,
+        inputs.iota, inputs.psi, inputs.lam, inputs.theta,
+        inputs.inds, inputs.eps_scaled, inputs.eps_orig, inputs.easy_central_difference,
+        inputs.T, inputs.dt, inputs.N, inputs.num_bin_all, inputs.num_derivs,
+        inputs.tdi_channel_setup, inputs.Ps, inputs.L_arm, inputs.tdi2,
+        inputs.window_type, inputs.window_alpha
+    );
+    CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
+
+    dim3 grid2(inputs.num_bin_all);
+    size_t smem_reduce = FFT::block_dim.x * sizeof(double);
+    CUDA_CHECK_AND_EXIT(cudaFuncSetAttribute(get_info_inner_kernel<FFT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_reduce));
+
+    get_info_inner_kernel<FFT><<<grid2, FFT::block_dim, smem_reduce>>>(
+        inputs.info_mat, inputs.d_dh_workspace, inputs.noise, inputs.noise_index, inputs.start_freq_inds,
+        inputs.T, inputs.N, inputs.num_bin_all, inputs.num_derivs,
+        inputs.data_length, inputs.tdi_channel_setup
+    );
+    CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
+
+    if (inputs.do_synchronize) {
+        CUDA_CHECK_AND_EXIT(cudaDeviceSynchronize());
+    }
+}
+
+template <unsigned int Arch, unsigned int N>
+struct get_info_mat_wrap_functor {
+    void operator()(InputInfo inputs) { return get_info_mat_wrap<Arch, N>(inputs); }
+};
+#endif
+
+void SharedMemoryInfoMatComp(
+    double* info_mat,
+    cmplx* d_dh_workspace,
+    cmplx* noise,
+    int* noise_index,
+    int* inds,
+    double* amp, 
+    double* f0, 
+    double* fdot0, 
+    double* fddot0, 
+    double* phi0, 
+    double* iota,
+    double* psi, 
+    double* lam,
+    double* theta,
+    double* eps_scaled, 
+    double eps_orig,
+    double T, 
+    double dt,
+    int N,
+    int num_bin_all,
+    int num_derivs,
+    int* start_freq_inds,
+    int data_length,
+    int tdi_channel_setup,
+    int device,
+    bool do_synchronize,
+    int num_noise,
+    double* Ps,
+    double L_arm,
+    bool tdi2,
+    bool easy_central_difference,
+    int window_type,
+    double window_alpha
+) {
+    InputInfo inputs;
+    inputs.info_mat = info_mat;
+    inputs.d_dh_workspace = d_dh_workspace;
+    inputs.noise = noise;
+    inputs.noise_index = noise_index;
+    inputs.inds = inds;
+    inputs.amp = amp;
+    inputs.f0 = f0;
+    inputs.fdot0 = fdot0;
+    inputs.fddot0 = fddot0;
+    inputs.phi0 = phi0;
+    inputs.iota = iota;
+    inputs.psi = psi;
+    inputs.lam = lam;
+    inputs.theta = theta;
+    inputs.eps_scaled = eps_scaled;
+    inputs.eps_orig = eps_orig;
+    inputs.T = T;
+    inputs.dt = dt;
+    inputs.N = N;
+    inputs.num_bin_all = num_bin_all;
+    inputs.num_derivs = num_derivs;
+    inputs.start_freq_inds = start_freq_inds;
+    inputs.data_length = data_length;
+    inputs.tdi_channel_setup = tdi_channel_setup;
+    inputs.device = device;
+    inputs.do_synchronize = do_synchronize;
+    inputs.num_noise = num_noise;
+    inputs.Ps = Ps;
+    inputs.L_arm = L_arm;
+    inputs.tdi2 = tdi2;
+    inputs.easy_central_difference = easy_central_difference;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
+
+#ifdef __CUDACC__
+    switch (N) {
+    case 32:   example::sm_runner<get_info_mat_wrap_functor, 32>(inputs);   return;
+    case 64:   example::sm_runner<get_info_mat_wrap_functor, 64>(inputs);   return;
+    case 128:  example::sm_runner<get_info_mat_wrap_functor, 128>(inputs);  return;
+    case 256:  example::sm_runner<get_info_mat_wrap_functor, 256>(inputs);  return;
+    case 512:  example::sm_runner<get_info_mat_wrap_functor, 512>(inputs);  return;
+    case 1024: example::sm_runner<get_info_mat_wrap_functor, 1024>(inputs); return;
+    case 2048: example::sm_runner<get_info_mat_wrap_functor, 2048>(inputs); return;
+    default:
+        throw std::invalid_argument("N must be a multiple of 2 between 32 and 2048.");
+    }
+#endif
+}
+
 //////////////////
 //////////////////
 //////////////////

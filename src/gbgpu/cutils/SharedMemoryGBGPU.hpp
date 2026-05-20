@@ -126,6 +126,13 @@ typedef struct InputInfoTag{
     bool tdi2;
     int window_type;
     double window_alpha;
+    double* info_mat;
+    cmplx* d_dh_workspace;
+    int* inds;
+    double* eps_scaled; 
+    double eps_orig;
+    int num_derivs;
+    bool easy_central_difference;
 } InputInfo; 
 
 void SharedMemoryLikeComp(
@@ -302,5 +309,43 @@ void SharedMemoryFstatLikeComp(
     int window_type = 0,
     double window_alpha = 0.0
 );
+
+
+void SharedMemoryInfoMatComp(
+    double* info_mat,
+    cmplx* d_dh_workspace,
+    cmplx* noise,
+    int* noise_index,
+    int* inds,
+    double* amp, 
+    double* f0, 
+    double* fdot0, 
+    double* fddot0, 
+    double* phi0, 
+    double* iota,
+    double* psi, 
+    double* lam,
+    double* theta,
+    double* eps_scaled, 
+    double eps_orig, 
+    double T, 
+    double dt,
+    int N,
+    int num_bin_all,
+    int num_derivs,
+    int* start_freq_inds,
+    int data_length,
+    int tdi_channel_setup,
+    int device,
+    bool do_synchronize,
+    int num_noise,
+    double* Ps,
+    double L_arm,
+    bool tdi2,
+    bool easy_central_difference,
+    int window_type = 0,
+    double window_alpha = 0.0
+);
+
 
 #endif // __SHAREDMEMORY_GBGPU_HPP__

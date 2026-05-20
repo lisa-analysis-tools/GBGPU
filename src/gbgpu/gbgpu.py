@@ -2362,7 +2362,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         parameter_transforms: Dict = {},
         easy_central_difference: bool = False,
         noise_index=None,
-        adjust_inplace=False,
         use_c_implementation: bool = False,
         N = None,
         T: float = 4 * YRSID_SI,
@@ -2376,7 +2375,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         tdi2: bool = False,
         window: Optional[str] = None,
         window_alpha: float = 0.0,
-        batch_size: int = 1000,
+        batch_size: int = 50000,
         **kwargs
     ):
         """Get the information matrix for a batch.
@@ -2408,7 +2407,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         Returns:
             3D xp.ndarray: Information Matrices for all binaries with shape: ``(num_sources, num_derivs, num_derivs)``.        
         """
-        # param shape now follows the other methods of gbgpu
         params = self.xp.atleast_2d(params)
         self.num_bin = num_bin = params.shape[0]
         num_params = params.shape[1]
@@ -2432,30 +2430,164 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             noise_index = self.xp.zeros(num_bin, dtype=self.xp.int32)
         
         num_derivs = len(inds)
-        
-        q_check = (params[:, 1] / 1000.0 * T).astype(self.xp.int32) 
-        start_freq_inds = start_freq_inds = (q_check - N / 2).astype(self.xp.int32) # needed for psd slicing
         self.df = 1 / T
+
+        # Setup window mapping
+        if window is not None:
+            try:
+                window_type = window_map[window]
+            except KeyError:
+                raise KeyError(f"The window '{window}' is not supported.")
+        else:
+            window_type = 0
+            assert window_alpha == 0.0, "No/Rectangular window does not have a smoothing factor"
+
+        nchannels = 3 if tdi_channel_setup != "AE" else 2
+
+        # cuda/c++ backend
+        if use_c_implementation:
+            assert self.gpus is not None and data_length is not None, f"GPU setup is {self.gpus}, {data_length=}"
+            info_matrix = self.xp.zeros((num_bin, num_derivs, num_derivs), dtype=self.xp.float64)
+
+            eps_scaled = self.xp.zeros((num_bin, num_derivs), dtype=self.xp.float64)
+            if parameter_transforms:
+                for i, ind in enumerate(inds):
+                    p_up = params.copy()
+                    p_up[:, ind] += eps
+                    p_down = params.copy()
+                    p_down[:, ind] -= eps
+                    
+                    phys_up = self._apply_parameter_transforms(p_up.T.copy(), parameter_transforms).T
+                    phys_down = self._apply_parameter_transforms(p_down.T.copy(), parameter_transforms).T
+                    
+                    phys_up[:, 8] = np.pi / 2.0 - phys_up[:, 8]
+                    phys_down[:, 8] = np.pi / 2.0 - phys_down[:, 8]
+                        
+                    eps_scaled[:, i] = (phys_up[:, ind] - phys_down[:, ind]) / (2.0 * eps)
+                    
+                phys_base = self._apply_parameter_transforms(params.T.copy(), parameter_transforms).T
+            else:
+                eps_scaled = self.xp.full((num_bin, num_derivs), eps, dtype=self.xp.float64)
+                phys_base = params.copy()
+                if 8 in inds:
+                    idx_8 = list(inds).index(8)
+                    eps_scaled[:, idx_8] = -eps  # Theta = pi/2 - Beta logic
+
+            phys_base[:, 8] = np.pi / 2.0 - phys_base[:, 8]
+
+            q_check = (phys_base[:, 1] * T).astype(self.xp.int32) 
+            start_freq_inds = (q_check - N / 2).astype(self.xp.int32) 
+            
+            if isinstance(psd, self.xp.ndarray):
+                psd_in = [psd.astype(self.xp.complex128)]
+            else:
+                psd_in = [p.astype(self.xp.complex128) for p in psd]
+
+            psd_sub_shape = (nchannels,) if tdi_channel_setup in ["AE", "AET"] else (nchannels, nchannels)
+            num_psd = []
+            for t_i, t in enumerate(psd_in):
+                if t.ndim == 1:
+                    num_psd.append(int(t.shape[0] / (data_length * np.prod(psd_sub_shape))))
+                else:
+                    if t.ndim == 2: num_psd.append(1); data_length = t.shape[1]
+                    elif t.ndim == 3: num_psd.append(t.shape[0] if tdi_channel_setup in ["AE", "AET"] else 1); data_length = t.shape[2]
+                    elif t.ndim == 4: num_psd.append(t.shape[0]); data_length = t.shape[3]
+                    psd_in[t_i] = t.flatten()
+
+            unique_N, inverse = self.xp.unique(self.xp.asarray(N), return_inverse=True)
+            N_groups = self.xp.arange(len(unique_N))[inverse]
+            
+            do_synchronize = False
+            main_device = self.xp.cuda.runtime.getDevice()
+            
+            if data_splits is None:
+                data_splits = self.xp.full(num_bin, self.gpus[0])
+            if num_per_gpu is None:
+                num_per_gpu = int(1e9)
+
+            inputs_in = []
+            for nnn, N_here in enumerate(unique_N):
+                N_here = N_here.item()
+                tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
+                tm_abs = tm_rel + self.t0_abs
+                Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()  
+                
+                for gpu_i, gpu in enumerate(self.gpus):
+                    self.xp.cuda.runtime.setDevice(main_device)
+                    keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[noise_index] == gpu)
+                    num_split_total = keep_bool.sum().item()
+                    
+                    if num_split_total == 0: continue 
+                    
+                    batches = self.xp.arange(0, num_split_total, batch_size, dtype=self.xp.int32)
+                    if batches[-1] < num_split_total:
+                        batches = self.xp.concatenate([batches, self.xp.array([num_split_total], dtype=self.xp.int32)])
+
+                    full_inds_here = self.xp.arange(len(keep_bool))[keep_bool]
+                    psd_here = psd_in[gpu_i]
+
+                    for start, end in zip(batches[:-1], batches[1:]):
+                        num_split_here = int(end - start)
+                        self.xp.cuda.runtime.setDevice(gpu)
+                        
+                        inds_here = full_inds_here[start:end]
+                        params_here = phys_base[inds_here]
+                        params_tuple = tuple([pars_tmp.copy() for pars_tmp in params_here.T])
+                        
+                        start_freq_ind_tmp = start_freq_inds[inds_here]
+                        noise_index_in = self.xp.asarray(noise_index[inds_here] % num_per_gpu).astype(np.int32)
+                        eps_scaled_here = eps_scaled[inds_here].flatten()
+                        
+                        info_mat_temp = self.xp.zeros(num_split_here * num_derivs * num_derivs, dtype=self.xp.float64)
+                        d_dh_workspace = self.xp.zeros(num_split_here * num_derivs * 3 * N_here, dtype=self.xp.complex128)
+                
+                        tuple_in = (
+                            (info_mat_temp, d_dh_workspace, psd_here, noise_index_in, inds)
+                            + params_tuple 
+                            + (eps_scaled_here, eps, T, dt, N_here, num_split_here, num_derivs, 
+                               start_freq_ind_tmp, data_length, tdi_channel_setup_map[tdi_channel_setup], 
+                               gpu, do_synchronize, num_psd[gpu_i], Ps_arr, self.orbits.armlength, 
+                               tdi2, easy_central_difference, window_type, window_alpha)
+                        )    
+                        
+                        self.xp.cuda.runtime.deviceSynchronize()
+                        self.shared_mem_backend.SharedMemoryInfoMatComp_wrap(*tuple_in)
+                        inputs_in.append([gpu, inds_here, tuple_in])
+                        self.xp.cuda.runtime.deviceSynchronize()
+
+            for gpu, inds_gpu, inputs_tmp in inputs_in:
+                with self.xp.cuda.Device(main_device):
+                    self.xp.cuda.runtime.deviceSynchronize()
+                    info_matrix[inds_gpu] = inputs_tmp[0][:].reshape(-1, num_derivs, num_derivs)
+                    
+            self.xp.cuda.runtime.setDevice(main_device)
+            self.xp.cuda.runtime.deviceSynchronize()
+
+            if self.backend.name == "gpu" and not return_cupy:
+                info_matrix = info_matrix.get()
+
+            return info_matrix
         
-        info_matrix = self.xp.zeros((num_bin, num_derivs, num_derivs), dtype=self.xp.float64)
-        
-        if True:
-            assert self.gpus is not None and len(self.gpus) == 1, "GPU setup for infomatrix is incorrect"
-            psd = psd[self.gpus[0]] # assume that we are working on one gpu for now, for multi gpu we will likely shift to c++/cuda
+        # python implementation
+        else:
+            info_matrix = self.xp.zeros((num_bin, num_derivs, num_derivs), dtype=self.xp.float64)
+
+            q_check = (params[:, 1] * T).astype(self.xp.int32) 
+            start_freq_inds = (q_check - N / 2).astype(self.xp.int32) 
+
             if tdi_channel_setup == "XYZ":
                 reshaped_psd = psd.reshape(-1, 3, 3, data_length)
             else:
                 reshaped_psd = psd.reshape(-1, len(tdi_channel_setup), data_length)
-            
-            # I think this is fine for now, cannot have multiple N when setting up dh later   
+
+            # I think this is fine for now, cannot have multiple N when setting up dh later
             N_val = int(N.max().item()) if isinstance(N, self.xp.ndarray) else int(N)
-            info_matrix = self.xp.zeros((num_bin, num_derivs, num_derivs), dtype=self.xp.float64)
 
             waveform_kwargs: Dict[str, Any] = dict(
-                    N=N_val,T=T, dt=dt, oversample=oversample, tdi2=tdi2,
-                    tdi_channel_setup=tdi_channel_setup, use_c_implementation=use_c_implementation,
-                    window=window, window_alpha=window_alpha
-                )
+                N=N_val, T=T, dt=dt, oversample=oversample, tdi2=tdi2,
+                tdi_channel_setup=tdi_channel_setup, use_c_implementation=False,
+                window=window, window_alpha=window_alpha
+            )
             
             # batching here to avoid memory allocation issues (dh is of size 10000x9x3x1024=4.4 GBytes)
             batches = self.xp.arange(0, num_bin, batch_size, dtype=self.xp.int32)
@@ -2477,10 +2609,10 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     c1_idx = self.xp.arange(3)[None, :, None, None]       
                     c2_idx = self.xp.arange(3)[None, None, :, None]      
                     f_idx_exp = f_idx[:, None, None, :]                  
-                    inv_csd = reshaped_psd[w_idx_exp, c1_idx, c2_idx, f_idx_exp]
-                else: # csd is assumed to be diagonal
+                    inv_psd = reshaped_psd[w_idx_exp, c1_idx, c2_idx, f_idx_exp]
+                else: 
                     w_idx_exp = w_idx[:, None, None]
-                    c_idx = self.xp.arange(psd.shape[1])[None, :, None]
+                    c_idx = self.xp.arange(nchannels)[None, :, None]
                     f_idx_exp = f_idx[:, None, :]
                     inv_psd = reshaped_psd[w_idx_exp, c_idx, f_idx_exp]
                 
@@ -2489,7 +2621,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     dtype=self.xp.complex128
                 )
 
-                def get_wave(params_to_run): # seperate function for wave_gen since it is used often
+                def get_wave(params_to_run): # wrapper function for wave_gen with parameter transforms
                     transformed_params = params_to_run.T.copy()
                     if parameter_transforms:
                         transformed_params = self._apply_parameter_transforms(
@@ -2497,18 +2629,22 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                             parameter_transforms
                         )
                     self.run_wave(*transformed_params, **waveform_kwargs)
-                    wave_out = self.XYZf.copy() if tdi_channel_setup == "XYZ" else self.AETf.copy()
-                    return wave_out
+                    if tdi_channel_setup == "XYZ":
+                        return self.XYZf.copy()
+                    elif tdi_channel_setup == "AE":
+                        return self.AETf[:, :2].copy()
+                    else: # "AET"
+                        return self.AETf.copy()
 
                 for i, ind in enumerate(inds):
                     # 1 eps up derivative
                     params_up_1 = batched_params.copy()
-                    params_up_1[:, ind] += eps * batched_params[:, ind]
+                    params_up_1[:, ind] += eps # to match sharedmem backend * batched_params[:, ind]
                     h_I_up_eps = get_wave(params_up_1)
 
                     # 1 eps down derivative
                     params_down_1 = batched_params.copy()
-                    params_down_1[:, ind] -= eps * batched_params[:, ind]
+                    params_down_1[:, ind] -= eps # to match sharedmem backend * batched_params[:, ind]
                     h_I_down_eps = get_wave(params_down_1)
 
                     if easy_central_difference: # compute derivative and store
@@ -2517,12 +2653,12 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     else: # higher degree derivative computation
                         # 2 eps up derivative
                         params_up_2 = batched_params.copy()
-                        params_up_2[:, ind] += 2.0 * eps * batched_params[:, ind]
+                        params_up_2[:, ind] += 2.0 * eps # to match sharedmem backend * batched_params[:, ind]
                         h_I_up_2eps = get_wave(params_up_2)
 
                         # 2 eps down derivative
                         params_down_2 = batched_params.copy()
-                        params_down_2[:, ind] -= 2.0 * eps * batched_params[:, ind]
+                        params_down_2[:, ind] -= 2.0 * eps # to match sharedmem backend * batched_params[:, ind]
                         h_I_down_2eps = get_wave(params_down_2)
 
                         dh[:, i] = (-h_I_up_2eps + h_I_down_2eps + 8.0 * (h_I_up_eps - h_I_down_eps)) / (12.0 * eps)
@@ -2535,7 +2671,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     # inv_csd shape = [num_bins, 3, 3, N]
                     # b=num_bins, i=deriv1, c=chan1, k=freq_bin, d=chan2, j=deriv2
                     info_matrix[start:end] = 4.0 * self.df * self.xp.einsum(
-                        "bick,bcdk,bjdk->bij", dh.conj(), inv_csd, dh
+                        "bick,bcdk,bjdk->bij", dh.conj(), inv_psd, dh
                     ).real
                     # output shape = [num_bin, num_derivs, num_derivs]
                 else:
@@ -2548,145 +2684,204 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 info_matrix = info_matrix.get()
 
             return info_matrix
+    #* Old infomatrix setup
+    # def information_matrix(
+    #     self,
+    #     params,
+    #     psd,
+    #     inds=None,
+    #     eps: float = 1e-9,
+    #     parameter_transforms: Dict = {},
+    #     easy_central_difference: bool = False,
+    #     noise_index=None,
+    #     adjust_inplace=False,
+    #     use_c_implementation: bool = False,
+    #     N = None,
+    #     T: float = 4 * YRSID_SI,
+    #     dt: float = 10.0,
+    #     data_length=None,
+    #     data_splits=None,
+    #     tdi_channel_setup: str = "AE",
+    #     num_per_gpu: Optional[int] = None,
+    #     oversample: int = 1,
+    #     return_cupy: bool = False,
+    #     tdi2: bool = False,
+    #     window: Optional[str] = None,
+    #     window_alpha: float = 0.0,
+    #     batch_size: int = 1000,
+    #     **kwargs
+    # ):
+    #     """Get the information matrix for a batch.
+
+    #     This function computes the Information matrix for a batch of Galactic binaries.
+    #     It uses a 2nd order calculation for the derivative if ``easy_central_difference`` is ``False``:
+
+    #     ..math:: \\frac{dh}{d\\lambda_i} = \\frac{-h(\\lambda_i + 2\\epsilon) + h(\\lambda_i - 2\\epsilon) + 8(h(\\lambda_i + \\epsilon) - h(\\lambda_i - \\epsilon))}{12\\epsilson}
+
+    #     Otherwise, it will just calculate the derivate with a first-order central difference.
         
-        if False:
-            if self.gpus is not None:
-                self.xp.cuda.runtime.setDevice(self.gpus[0])
+    #     This function calculates the Information Matrix dynamically. It internally
+    #     handles memory-safe batching if running in Python, or dispatches the entire
+    #     array to the C++/CUDA backend if `use_c_implementation=True`.
+        
+    #     Args:
+    #         params (2D double np.ndarrays): Parameters of all binaries to be calculated.
+    #             Shape should be (num_sources, num_params).
+    #         psd (xp.ndarray): The 1D flattened linear_psd_arr from AnalysisContainerArray.
+    #         noise_index (1D int np.ndarray): Specific walker indices mapped to the binaries.
+    #         data_length (int): Length of the original time-domain data stream.
+    #         inds (1D int np.ndarray, optional): Indices of the parameters to test.
+    #         eps (double, optional): Step to take when calculating the derivative. Default is ``1e-9``.
+    #         parameter_transforms (dict, optional): Dictionary containing the parameter transform functions.
+    #         easy_central_difference (bool, optional): If ``True``, compute derivatives with a first-order difference.
+    #         use_c_implementation (bool): If True, invokes the C++/CUDA backend.
+    #         batch_size (int): Chunk size to use to prevent VRAM overflow when running the Python backend.
             
-            unique_N, inverse = self.xp.unique(self.xp.asarray(N), return_inverse=True)
-            N_groups = self.xp.arange(len(unique_N))[inverse]
+    #     Returns:
+    #         3D xp.ndarray: Information Matrices for all binaries with shape: ``(num_sources, num_derivs, num_derivs)``.        
+    #     """
+    #     # param shape now follows the other methods of gbgpu
+    #     params = self.xp.atleast_2d(params)
+    #     self.num_bin = num_bin = params.shape[0]
+    #     num_params = params.shape[1]
+
+    #     if N is None:
+    #         N = get_N(self.xp.asarray(params[:, 0]), self.xp.asarray(params[:, 1]), T, oversample=oversample)
+    #         if self.xp.any(N == 0):
+    #             breakpoint()
+    #     else:
+    #         if isinstance(N, self.xp.ndarray):
+    #             assert params.shape[0] == N.shape[0]
+    #         elif isinstance(N, (int, self.xp.integer)):
+    #             N = self.xp.full(params.shape[0], N)
+
+    #     if inds is None:
+    #         inds = self.xp.arange(num_params)
+    #     else:
+    #         inds = self.xp.asarray(inds, dtype=self.xp.int32)
             
-            if noise_index is None:
-                noise_index = self.xp.zeros(self.num_bin, dtype=self.xp.int32)
-            assert noise_index.dtype == self.xp.int32
+    #     if noise_index is None:
+    #         noise_index = self.xp.zeros(num_bin, dtype=self.xp.int32)
+        
+    #     num_derivs = len(inds)
+        
+    #     q_check = (params[:, 1] / 1000.0 * T).astype(self.xp.int32) 
+    #     start_freq_inds = start_freq_inds = (q_check - N / 2).astype(self.xp.int32) # needed for psd slicing
+    #     self.df = 1 / T
+        
+    #     info_matrix = self.xp.zeros((num_bin, num_derivs, num_derivs), dtype=self.xp.float64)
+        
+    #     if True:
+    #         assert self.gpus is not None and len(self.gpus) == 1, "GPU setup for infomatrix is incorrect"
+    #         psd = psd[self.gpus[0]] # assume that we are working on one gpu for now, for multi gpu we will likely shift to c++/cuda
+    #         if tdi_channel_setup == "XYZ":
+    #             reshaped_psd = psd.reshape(-1, 3, 3, data_length)
+    #         else:
+    #             reshaped_psd = psd.reshape(-1, len(tdi_channel_setup), data_length)
             
-            nchannels = 3 if tdi_channel_setup != "AE" else 2
+    #         # I think this is fine for now, cannot have multiple N when setting up dh later   
+    #         N_val = int(N.max().item()) if isinstance(N, self.xp.ndarray) else int(N)
+    #         info_matrix = self.xp.zeros((num_bin, num_derivs, num_derivs), dtype=self.xp.float64)
+
+    #         waveform_kwargs: Dict[str, Any] = dict(
+    #                 N=N_val,T=T, dt=dt, oversample=oversample, tdi2=tdi2,
+    #                 tdi_channel_setup=tdi_channel_setup, use_c_implementation=use_c_implementation,
+    #                 window=window, window_alpha=window_alpha
+    #             )
             
-            if isinstance(psd, self.xp.ndarray):
-                psd_in = [psd.astype(self.xp.complex128)]
-            else:
-                psd_in = [p.astype(self.xp.complex128) for p in psd]
+    #         # batching here to avoid memory allocation issues (dh is of size 10000x9x3x1024=4.4 GBytes)
+    #         batches = self.xp.arange(0, num_bin, batch_size, dtype=self.xp.int32)
+    #         if batches[-1] < num_bin:
+    #             batches = self.xp.concatenate([batches, self.xp.array([num_bin], dtype=self.xp.int32)])
+            
+    #         for start, end in zip(batches[:-1], batches[1:]):
+    #             batched_params = params[start:end]
+    #             noise_idx_batch = noise_index[start:end]
+    #             start_idx_batch = start_freq_inds[start:end]
+    #             num_bin_batch = int(end - start)
                 
-            if tdi_channel_setup == "AE" or tdi_channel_setup == "AET":
-                psd_sub_shape = (nchannels,)
-            else:
-                assert nchannels == 3
-                psd_sub_shape = (nchannels, nchannels)
-
-            num_psd = []
-            for t_i, t in enumerate(psd_in):
-                if t.ndim == 1:
-                    assert data_length is not None
-                    num_psd.append(int(t.shape[0] / (data_length * np.prod(psd_sub_shape))))
-                elif t.ndim == 2:
-                    assert tdi_channel_setup in ["AET", "AE"]
-                    num_psd.append(1)
-                    data_length = t.shape[1]
-                    psd_in[t_i] = t.flatten()
-                elif t.ndim == 3:
-                    if tdi_channel_setup in ["AE", "AET"]:
-                        ntemplate, _nchannels, data_length = t.shape
-                        num_psd.append(ntemplate)
-                        psd_in[t_i] = t.flatten()
-                    else:  # XYZ
-                        _nchannels, _nchannels, data_length = t.shape
-                        num_psd.append(1)
-                        psd_in[t_i] = t.flatten()
-                elif t.ndim == 4:
-                    assert tdi_channel_setup == "XYZ"
-                    ntemplate, _nchannels, _nchannels, data_length = t.shape
-                    num_psd.append(ntemplate)
-                    psd_in[t_i] = t.flatten()
-            
-            main_device = self.xp.cuda.runtime.getDevice()
-            
-            if data_splits is None:
-                assert len(self.gpus) == 1
-                data_splits = self.xp.full(num_psd[0], self.gpus[0])
+    #             # Get correct psd slice for each binary out of psd_linear_arr
+    #             f_idx = start_idx_batch[:, None] + self.xp.arange(N_val)
+    #             w_idx = self.xp.asarray(noise_idx_batch)
                 
-            if num_per_gpu is None:
-                assert len(self.gpus) == 1
-                num_per_gpu = int(1e9)
-
-            info_mat = self.xp.zeros((self.num_bin, num_derivs, num_derivs), dtype=self.xp.float64)
-            inputs_in = []
-
-            for nnn, N_here in enumerate(unique_N):
-                N_here = N_here.item()
+    #             if tdi_channel_setup == "XYZ":
+    #                 w_idx_exp = w_idx[:, None, None, None]               
+    #                 c1_idx = self.xp.arange(3)[None, :, None, None]       
+    #                 c2_idx = self.xp.arange(3)[None, None, :, None]      
+    #                 f_idx_exp = f_idx[:, None, None, :]                  
+    #                 inv_csd = reshaped_psd[w_idx_exp, c1_idx, c2_idx, f_idx_exp]
+    #             else: # csd is assumed to be diagonal
+    #                 w_idx_exp = w_idx[:, None, None]
+    #                 c_idx = self.xp.arange(psd.shape[1])[None, :, None]
+    #                 f_idx_exp = f_idx[:, None, :]
+    #                 inv_psd = reshaped_psd[w_idx_exp, c_idx, f_idx_exp]
                 
-                tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
-                tm_abs = tm_rel + self.t0_abs
-                Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()  
+    #             dh = self.xp.zeros(
+    #                 (num_bin_batch, num_derivs, len(tdi_channel_setup), N_val), 
+    #                 dtype=self.xp.complex128
+    #             )
+
+    #             def get_wave(params_to_run): # seperate function for wave_gen since it is used often
+    #                 transformed_params = params_to_run.T.copy()
+    #                 if parameter_transforms:
+    #                     transformed_params = self._apply_parameter_transforms(
+    #                         transformed_params, 
+    #                         parameter_transforms
+    #                     )
+    #                 self.run_wave(*transformed_params, **waveform_kwargs)
+    #                 wave_out = self.XYZf.copy() if tdi_channel_setup == "XYZ" else self.AETf.copy()
+    #                 return wave_out
+
+    #             for i, ind in enumerate(inds):
+    #                 # 1 eps up derivative
+    #                 params_up_1 = batched_params.copy()
+    #                 params_up_1[:, ind] += eps * batched_params[:, ind]
+    #                 h_I_up_eps = get_wave(params_up_1)
+
+    #                 # 1 eps down derivative
+    #                 params_down_1 = batched_params.copy()
+    #                 params_down_1[:, ind] -= eps * batched_params[:, ind]
+    #                 h_I_down_eps = get_wave(params_down_1)
+
+    #                 if easy_central_difference: # compute derivative and store
+    #                     dh[:, i] = (h_I_up_eps - h_I_down_eps) / (2.0 * eps)
+                        
+    #                 else: # higher degree derivative computation
+    #                     # 2 eps up derivative
+    #                     params_up_2 = batched_params.copy()
+    #                     params_up_2[:, ind] += 2.0 * eps * batched_params[:, ind]
+    #                     h_I_up_2eps = get_wave(params_up_2)
+
+    #                     # 2 eps down derivative
+    #                     params_down_2 = batched_params.copy()
+    #                     params_down_2[:, ind] -= 2.0 * eps * batched_params[:, ind]
+    #                     h_I_down_2eps = get_wave(params_down_2)
+
+    #                     dh[:, i] = (-h_I_up_2eps + h_I_down_2eps + 8.0 * (h_I_up_eps - h_I_down_eps)) / (12.0 * eps)
+
+    #             # TODO: Possibly add a check for scenario where \pm 2\epsilon is outside of freq band?
                 
-                for gpu_i, gpu in enumerate(self.gpus):
-                    self.xp.cuda.runtime.setDevice(main_device)
-                    keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[noise_index] == gpu)
-                    num_split_here = keep_bool.sum().item()
-                    inds_here = self.xp.arange(len(keep_bool))[keep_bool]
-                    
-                    if num_split_here == 0:
-                        continue 
-                    self.xp.cuda.runtime.setDevice(gpu)
-                    
-                    params_here = self.xp.asarray(params)[keep_bool]
-                    
-                    # Convert beta to polar coordinate safely
-                    params_here[:, 8] = np.pi / 2 - params_here[:, 8]
-                    
-                    psd_here = psd_in[gpu_i]
-                    params_tuple = tuple([pars_tmp.copy() for pars_tmp in params_here.T])
-                    
-                    # Start indices are passed strictly based on the calculated chunking logic
-                    start_freq_ind_tmp = self.xp.full(num_psd[gpu_i], start_freq_inds[0], dtype=np.int32)
-                    
-                    info_mat_temp = self.xp.zeros(num_split_here * num_derivs * num_derivs, dtype=self.xp.float64)
-                    noise_index_in = self.xp.asarray(noise_index[keep_bool] % num_per_gpu).astype(np.int32)
-            
-                    tuple_in = (
-                        (
-                            info_mat_temp,
-                            psd_here,
-                            noise_index_in,
-                            inds,
-                        ) + params_tuple
-                        + (
-                            eps, T, dt, N_here, 
-                            num_split_here, num_derivs, start_freq_ind_tmp, data_length, 
-                            tdi_channel_setup_map[tdi_channel_setup], 
-                            gpu, False, 
-                            num_psd[0],
-                            Ps_arr, self.orbits.armlength, tdi2, easy_central_difference
-                        )
-                    )    
-                    
-                    try:
-                        self.xp.cuda.runtime.deviceSynchronize()
-                        self.shared_mem_backend.SharedMemoryInfoMatComp_wrap(*tuple_in)
-                        inputs_in.append([gpu, inds_here, tuple_in])
-                        self.xp.cuda.runtime.deviceSynchronize()
-                    except Exception as e:
-                        print(f"C++ Kernel Execution Interruption: {e}")
-                        breakpoint()
+    #             # compute Information matrix via inner products
+    #             if tdi_channel_setup == "XYZ":
+    #                 # dh shape = [num_bins, num_derivs, 3, N]
+    #                 # inv_csd shape = [num_bins, 3, 3, N]
+    #                 # b=num_bins, i=deriv1, c=chan1, k=freq_bin, d=chan2, j=deriv2
+    #                 info_matrix[start:end] = 4.0 * self.df * self.xp.einsum(
+    #                     "bick,bcdk,bjdk->bij", dh.conj(), inv_csd, dh
+    #                 ).real
+    #                 # output shape = [num_bin, num_derivs, num_derivs]
+    #             else:
+    #                 # similar indices as above, but inv_psd is diagonal
+    #                 info_matrix[start:end] = 4.0 * self.df * self.xp.einsum(
+    #                     "bick,bjck,bck->bij", dh.conj(), dh, inv_psd
+    #                 ).real
 
-            for gpu, inds_gpu, inputs_tmp in inputs_in:
-                with self.xp.cuda.Device(gpu):
-                    self.xp.cuda.runtime.deviceSynchronize()
+    #         if self.backend.name == "gpu" and not return_cupy:
+    #             info_matrix = info_matrix.get()
 
-            for gpu, inds_gpu, inputs_tmp in inputs_in:
-                with self.xp.cuda.Device(main_device):
-                    self.xp.cuda.runtime.deviceSynchronize()
-                    info_mat[inds_gpu] = inputs_tmp[0][:].reshape(-1, num_derivs, num_derivs)
-                    
-            self.xp.cuda.runtime.setDevice(main_device)
-            self.xp.cuda.runtime.deviceSynchronize()
-
-            if return_cupy:
-                return info_mat
-
-            try:
-                return info_mat.get()
-            except AttributeError:
-                return info_mat
+    #         return info_matrix
+        
+    
  
 
 

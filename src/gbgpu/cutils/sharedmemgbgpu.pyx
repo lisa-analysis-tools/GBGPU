@@ -203,6 +203,42 @@ cdef extern from "SharedMemoryGBGPU.hpp":
         double window_alpha
     ) except+
 
+    void SharedMemoryInfoMatComp(
+        double *info_mat,
+        cmplx *d_dh_workspace,
+        cmplx *noise,
+        int *noise_index,
+        int *inds,
+        double *amp,
+        double *f0,
+        double *fdot0,
+        double *fddot0,
+        double *phi0,
+        double *iota,
+        double *psi,
+        double *lam,
+        double *theta,
+        double *eps_scaled,
+        double eps_orig,
+        double T,
+        double dt,
+        int N,
+        int num_bin_all,
+        int num_derivs,
+        int *start_freq_inds,
+        int data_length,
+        int tdi_channel_setup,
+        int device,
+        bool do_synchronize,
+        int num_noise,
+        double *Ps,
+        double L_arm,
+        bool tdi2,
+        bool easy_central_difference,
+        int window_type,
+        double window_alpha
+    ) except+
+
 def SharedMemoryWaveComp_wrap(*args, **kwargs):
     (
         tdi_out,
@@ -708,5 +744,96 @@ def SharedMemoryFstatLikeComp_wrap(*args, **kwargs):
         L_arm,
         tdi2,
         window_type,
+        window_alpha
+    )
+
+def SharedMemoryInfoMatComp_wrap(*args, **kwargs):
+    (
+        info_mat,
+        d_dh_workspace,
+        noise,
+        noise_index,
+        inds,
+        amp, 
+        f0, 
+        fdot0, 
+        fddot0, 
+        phi0, 
+        iota, 
+        psi, 
+        lam, 
+        theta,
+        eps_scaled, 
+        eps_orig, 
+        T, 
+        dt, 
+        N, 
+        num_bin_all, 
+        num_derivs, 
+        start_freq_inds,
+        data_length, 
+        tdi_channel_setup, 
+        device, 
+        do_synchronize,
+        num_noise, 
+        Ps, 
+        L_arm, 
+        tdi2, 
+        easy_central_difference,
+        window_type, 
+        window_alpha
+    ), tkwargs = wrapper(*args, **kwargs)
+
+    cdef size_t info_mat_in = info_mat
+    cdef size_t d_dh_workspace_in = d_dh_workspace
+    cdef size_t noise_in = noise
+    cdef size_t noise_index_in = noise_index
+    cdef size_t inds_in = inds
+    cdef size_t amp_in = amp
+    cdef size_t f0_in = f0
+    cdef size_t fdot0_in = fdot0
+    cdef size_t fddot0_in = fddot0
+    cdef size_t phi0_in = phi0
+    cdef size_t iota_in = iota
+    cdef size_t psi_in = psi
+    cdef size_t lam_in = lam
+    cdef size_t theta_in = theta
+    cdef size_t eps_scaled_in = eps_scaled
+    cdef size_t start_freq_inds_in = start_freq_inds
+    cdef size_t Ps_in = Ps
+
+    SharedMemoryInfoMatComp(
+        <double *>info_mat_in,
+        <cmplx *>d_dh_workspace_in,
+        <cmplx *>noise_in,
+        <int *>noise_index_in,
+        <int *>inds_in,
+        <double *>amp_in, 
+        <double *>f0_in, 
+        <double *>fdot0_in, 
+        <double *>fddot0_in, 
+        <double *>phi0_in, 
+        <double *>iota_in,
+        <double *>psi_in, 
+        <double *>lam_in,
+        <double *>theta_in,
+        <double *>eps_scaled_in, 
+        eps_orig, 
+        T, 
+        dt, 
+        N, 
+        num_bin_all, 
+        num_derivs,
+        <int *>start_freq_inds_in,
+        data_length, 
+        tdi_channel_setup, 
+        device, 
+        do_synchronize, 
+        num_noise,
+        <double *>Ps_in, 
+        L_arm, 
+        tdi2, 
+        easy_central_difference,
+        window_type, 
         window_alpha
     )
