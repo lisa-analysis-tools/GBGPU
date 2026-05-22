@@ -2411,15 +2411,23 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         self.num_bin = num_bin = params.shape[0]
         num_params = params.shape[1]
 
+        if parameter_transforms is not None:
+            phys_base = self._apply_parameter_transforms(params.T.copy(), parameter_transforms).T
+        else:
+            phys_base = params.copy()
+        
         if N is None:
-            N = get_N(self.xp.asarray(params[:, 0]), self.xp.asarray(params[:, 1]), T, oversample=oversample)
+            N = get_N(self.xp.asarray(phys_base[:, 0]), self.xp.asarray(phys_base[:, 1]), T, oversample=oversample)
             if self.xp.any(N == 0):
                 breakpoint()
         else:
             if isinstance(N, self.xp.ndarray):
-                assert params.shape[0] == N.shape[0]
+                assert phys_base.shape[0] == N.shape[0]
             elif isinstance(N, (int, self.xp.integer)):
-                N = self.xp.full(params.shape[0], N)
+                N = self.xp.full(phys_base.shape[0], N)
+                            
+        q_check = (phys_base[:, 1] * T).astype(self.xp.int32) 
+        start_freq_inds = (q_check - N / 2).astype(self.xp.int32) 
 
         if inds is None:
             inds = self.xp.arange(num_params)
@@ -2464,19 +2472,13 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     phys_down[:, 8] = np.pi / 2.0 - phys_down[:, 8]
                         
                     eps_scaled[:, i] = (phys_up[:, ind] - phys_down[:, ind]) / (2.0 * eps)
-                    
-                phys_base = self._apply_parameter_transforms(params.T.copy(), parameter_transforms).T
             else:
                 eps_scaled = self.xp.full((num_bin, num_derivs), eps, dtype=self.xp.float64)
-                phys_base = params.copy()
                 if 8 in inds:
                     idx_8 = list(inds).index(8)
                     eps_scaled[:, idx_8] = -eps  # Theta = pi/2 - Beta logic
 
             phys_base[:, 8] = np.pi / 2.0 - phys_base[:, 8]
-
-            q_check = (phys_base[:, 1] * T).astype(self.xp.int32) 
-            start_freq_inds = (q_check - N / 2).astype(self.xp.int32) 
             
             if isinstance(psd, self.xp.ndarray):
                 psd_in = [psd.astype(self.xp.complex128)]
@@ -2571,9 +2573,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         # python implementation
         else:
             info_matrix = self.xp.zeros((num_bin, num_derivs, num_derivs), dtype=self.xp.float64)
-
-            q_check = (params[:, 1] * T).astype(self.xp.int32) 
-            start_freq_inds = (q_check - N / 2).astype(self.xp.int32) 
 
             if tdi_channel_setup == "XYZ":
                 reshaped_psd = psd.reshape(-1, 3, 3, data_length)
