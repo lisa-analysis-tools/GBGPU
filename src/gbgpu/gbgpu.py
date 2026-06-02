@@ -66,7 +66,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
     """
 
-    def __init__(self, orbits: Optional[Orbits | L1Orbits] = None, force_backend = None, t0 = None):
+    def __init__(self, orbits: Optional[Orbits | L1Orbits] = None, force_backend = None, t0 = None, flip_ref_phase=False):
         self.force_backend = force_backend
         GBGPUParallelModule.__init__(self, force_backend=self.force_backend)
         
@@ -90,6 +90,8 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         self.gpus: Optional[list] = None
         
         self.shared_mem_backend = getattr(self.backend, "sharedmem")
+        
+        self.flip_ref_phase = flip_ref_phase
 
     @classmethod
     def supported_backends(cls):
@@ -226,6 +228,10 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         psi = np.atleast_1d(psi)
         lam = np.atleast_1d(lam)
         beta = np.atleast_1d(beta)
+        
+        if self.flip_ref_phase:
+            # if matching jaxgb, then we need to input - phi0
+            phi0 = -phi0
 
         # if circular base
         if len(args) == 0:
@@ -760,6 +766,10 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         self.xp.cuda.runtime.setDevice(return_to_main_device)
 
         self.num_bin = num_bin = params.shape[0]
+        
+        if self.flip_ref_phase:
+            # if matching jaxgb, then we need to input - phi0
+            params[:, 4] = -params[:, 4]
 
         if N is None:
             # TODO: G
@@ -918,8 +928,6 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 self.xp.cuda.runtime.setDevice(gpu)
                 
                 params_here = self.xp.asarray(params)[keep_bool]
-                data_index_here = (data_index[keep_bool] % num_per_gpu).astype(np.int32)
-                noise_index_here = (noise_index[keep_bool] % num_per_gpu).astype(np.int32)
                 
                 # theta_add = np.pi / 2 - beta_add
                 params_here[:, 8] = np.pi / 2 - params_here[:, 8]
@@ -1055,6 +1063,10 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         
         self.num_bin = num_bin = params.shape[0]
 
+        if self.flip_ref_phase:
+            # if matching jaxgb, then we need to input - phi0
+            params[:, 4] = -params[:, 4]
+        
         if N is None:
             # TODO: G
             #params are different for fstat
@@ -1647,6 +1659,10 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         
         self.num_bin = num_bin = params.shape[0]
 
+        if self.flip_ref_phase:
+            # if matching jaxgb, then we need to input - phi0
+            params[:, 4] = -params[:, 4]
+
         if N is None:
             # TODO: G
             N = get_N(self.xp.asarray(params[:, 0]), self.xp.asarray(params[:, 1]), T, oversample=oversample)
@@ -1935,7 +1951,12 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             self.xp.cuda.runtime.setDevice(return_to_main_device)
         
         self.num_bin = num_bin = params_add.shape[0]
-
+        
+        if self.flip_ref_phase:
+            # if matching jaxgb, then we need to input - phi0
+            params_add[:, 4] = -params_add[:, 4]
+            params_remove[:, 4] = -params_remove[:, 4]
+        
         if N is None:
             # TODO: G
             N = get_N(self.xp.asarray(params_add[:, 0]), self.xp.asarray(params_add[:, 1]), T, oversample=oversample)
@@ -2411,6 +2432,10 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         self.num_bin = num_bin = params.shape[0]
         num_params = params.shape[1]
 
+        if self.flip_ref_phase:
+            # if matching jaxgb, then we need to input - phi0
+            params[:, 4] = -params[:, 4]
+        
         if parameter_transforms is not None:
             phys_base = self._apply_parameter_transforms(params.T.copy(), parameter_transforms).T
         else:
