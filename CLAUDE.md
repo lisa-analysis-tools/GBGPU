@@ -22,6 +22,24 @@ These import generic infrastructure absolutely from `lisatools.jax.{response,wdm
 - Python: `gbcomps.py` (`GBWDMComputations`, `GBFDComputations`).
 - JAX: `computation_group.py`'s `GBComputationGroupWrapJAX` (currently mixed with SOBBH in lisa-on-gpu's `fastlisaresponse.jax.wdm.computation_group`; split during the C++ carve-out).
 
+**Pending arrival (V2 signal-heterodyne port, independent work item):**
+- C++: `cutils/GBSignalHet.{hh,cu}` (source-class entry) +
+  `cutils/GBAbsoluteFD.{hh,cu}` (`compute_fd_bin(params9, ch, k_global) → cmplx`,
+  bin-by-bin, no TD intermediate, no full-N rfft) +
+  `cutils/binding_gbsignalhet.cxx`.
+- Python: `gbgpu/gbsignalhetcomputations.py` — `GBSignalHetComputations`,
+  parallels `GBWDMComputations` (chunked-het) but uses the polyphase
+  signal-het kernel suite (`gb_signal_het_{fill_global,get_ll,swap_ll,
+  get_ll_grad,hessian,get_fstat_ll}`).
+- JAX: `gbgpu/jax/wdm/gb_signal_het_kernels.py` + `gb_signal_het_computation_group.py`.
+- The generic polyphase + bin-fold + reconstruct primitives live in LAT
+  (`lisatools/cutils/SignalHet*.hh,cu`) — GBGPU only owns the
+  GB-specific FD-bin producer.
+- Full plan: `~/.claude/plans/yes-find-and-read-sprightly-garden.md`.
+- Python prototype + walkthrough live at
+  `LISAanalysistools/scripts/gb_chunked_het/gb_signal_het_wdm_v2*.py`
+  (mm5 ≈ 1.6e-9 median, ~130× faster than v1 dense path).
+
 **Single-registrant rule (sprint-wide)**: GBGPU's binding TUs MUST NOT
 register `OrbitsWrap`, `LISAResponseWrap`, `TDIConfigWrap`,
 `OrbitsWrap_responselisa`, or `CubicSplineWrap_responselisa`. Those are
