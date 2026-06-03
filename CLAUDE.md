@@ -9,6 +9,17 @@ GBGPU is the **GB-physics owner** in the sprint's layered architecture.
 LISAanalysistools (LAT) owns generic LISA infrastructure; GBGPU owns
 GB-specific physics on top of it.
 
+**Build infrastructure (post-2026-06-03):**
+- GBGPU's CMakeLists consumes LAT's `Detector.cu`, `Detector.hpp`, `global.hpp`
+  via the same `python -c "import lisatools"` shell-out pattern used by
+  lisa-on-gpu (`LISATOOLS_CUTILS` variable, then `file(COPY ${LISATOOLS_CUTILS}/...)`).
+  This replaced an older `file(DOWNLOAD https://raw.githubusercontent.com/.../refs/heads/main/...)`
+  pattern that pulled stale snapshots ignoring the version-pinned
+  lisaanalysistools build dep. The copied files live under
+  `src/gbgpu/cutils/` and are gitignored — source of truth is LAT.
+- Same flow for `${GBT_CUTILS}` (gpubackendtools cutils dir, already
+  in place pre-2026-06-03).
+
 **Already received from lisa-on-gpu (Phase 3F):**
 - `gbgpu.jax.sources.ucb` — `JaxUCBSource`.
 - `gbgpu.jax.wdm.kernels` — `gb_wdm_get_ll_jax`, `gb_wdm_fill_global_jax`, `gb_wdm_swap_ll_jax`.

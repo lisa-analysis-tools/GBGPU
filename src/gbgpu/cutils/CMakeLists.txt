@@ -13,14 +13,37 @@ get_target_property(GBGPU_WITH_CPU gbgpu WITH_CPU)
 get_target_property(GBGPU_WITH_GPU gbgpu WITH_GPU)
 
 # Locate the gpubackendtools cutils directory so we can find gbt_global.h /
-# common helpers that the downloaded LISAanalysistools Detector.cu pulls in.
-# Mirrors how lisa-on-gpu/src/fastlisaresponse/cutils/CMakeLists.txt does it.
+# common helpers that LISAanalysistools' Detector.cu pulls in. Mirrors how
+# lisa-on-gpu/src/fastlisaresponse/cutils/CMakeLists.txt does it.
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -c "if True:
     import gpubackendtools
     print(gpubackendtools.__file__.split('__init__.py')[0] + 'cutils')"
   OUTPUT_VARIABLE GBT_CUTILS
   OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+# Locate the LISAanalysistools cutils directory (same pattern as lisa-on-gpu).
+# Replaces the prior "file(DOWNLOAD ... refs/heads/main ...)" pattern that
+# pulled stale snapshots from GitHub; instead we consume LAT's local install
+# directly, which guarantees Detector.cu/.hpp + global.hpp are version-
+# matched with the lisaanalysistools build-system dependency declared in
+# this repo's pyproject.toml.
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c "if True:
+    import lisatools
+    print(lisatools.__file__.split('__init__.py')[0] + 'cutils')"
+  OUTPUT_VARIABLE LISATOOLS_CUTILS
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+if(NOT EXISTS "${LISATOOLS_CUTILS}/Detector.cu")
+  message(FATAL_ERROR
+          "${LISATOOLS_CUTILS}/Detector.cu does not exist -- "
+          "lisaanalysistools install is broken or LISATOOLS_CUTILS detection "
+          "failed. Ensure 'pip install lisaanalysistools' completed before "
+          "building gbgpu.")
+endif()
+
+message(STATUS "LISATOOLS_CUTILS location is ${LISATOOLS_CUTILS}.")
 
 # Adapter to let inplace editable install work: the compiled backend will be
 # placed into the source-tree in the 'src' directory:
@@ -100,22 +123,17 @@ endfunction()
 # --- utils ---
 # ----------------
 
-# 0. Download lisa analysis tools c files.
-file(
-  DOWNLOAD 
-  https://raw.githubusercontent.com/mikekatz04/LISAanalysistools/refs/heads/main/src/lisatools/cutils/Detector.cu 
-  "./src/gbgpu/cutils/Detector.cu"
-)
-file(
-  DOWNLOAD 
-  https://raw.githubusercontent.com/mikekatz04/LISAanalysistools/refs/heads/main/src/lisatools/cutils/Detector.hpp 
-  "./src/gbgpu/cutils/Detector.hpp"
-)
-file(
-  DOWNLOAD 
-  https://raw.githubusercontent.com/mikekatz04/LISAanalysistools/refs/heads/main/src/lisatools/cutils/global.hpp 
-  "./src/gbgpu/cutils/global.hpp"
-)
+# 0. Copy lisaanalysistools C/CUDA files from the installed LAT package.
+# Was previously a hardcoded GitHub URL download from refs/heads/main, which
+# (a) required network access at configure time, (b) silently pulled stale
+# snapshots that didn't match the version-pinned lisaanalysistools build
+# dep, and (c) broke when LAT's main branch advanced past the API GBGPU
+# expects. The new pattern reads from ${LISATOOLS_CUTILS} (resolved above
+# via 'import lisatools'), so the consumed sources are always the ones the
+# user actually installed.
+file(COPY "${LISATOOLS_CUTILS}/Detector.cu"  DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}")
+file(COPY "${LISATOOLS_CUTILS}/Detector.hpp" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}")
+file(COPY "${LISATOOLS_CUTILS}/global.hpp"   DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}")
 # I. Process gbgpu_utils_wrap.pyx into a C++ file
 add_custom_command(
   OUTPUT "utils.cxx"

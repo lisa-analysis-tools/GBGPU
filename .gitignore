@@ -1,5 +1,12 @@
 # From https://github.com/github/gitignore/blob/main/Python.gitignore
 
+# Auto-copied at CMake configure time from the installed lisaanalysistools
+# package (see src/gbgpu/cutils/CMakeLists.txt). Source of truth lives in
+# LISAanalysistools; this repo just consumes them at build time.
+src/gbgpu/cutils/Detector.cu
+src/gbgpu/cutils/Detector.hpp
+src/gbgpu/cutils/global.hpp
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
