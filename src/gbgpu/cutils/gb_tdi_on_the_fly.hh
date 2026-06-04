@@ -60,12 +60,13 @@
 // (b) The pybind11 wrappers (GBTDIonTheFlyWrap + GBComputationGroupWrap)
 //     get their own aliasing in `binding_gbgpu.hpp` -- see the macro
 //     block there.
+// Phase 3L.7c (2026-06-04): only GBTDIonTheFly migrates in this slice.
+// GBComputationGroup aliasing + declaration stay in lisa-on-gpu's
+// TDIonTheFly.hh until a subsequent slice carves the full class out.
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
 #define GBTDIonTheFly      GBTDIonTheFlyGPU
-#define GBComputationGroup GBComputationGroupGPU
 #else
 #define GBTDIonTheFly      GBTDIonTheFlyCPU
-#define GBComputationGroup GBComputationGroupCPU
 #endif
 
 
@@ -152,37 +153,10 @@ void gb_run_fd_wave_tdi_wrap(
     double tukey_alpha);
 
 
-// ============================================================================
-// GBComputationGroup
-// ----------------------------------------------------------------------------
-// Python-facing computation surface for GB-specific TDI-on-the-fly
-// likelihoods. Holds host-side parameters (T, t_ref, source-class
-// indices) and exposes `*_wrap` methods that instantiate LAT's
-// templated kernel launchers against `<GBTDIonTheFly>`.
-//
-// Method families:
-// - `gb_fd_*_wrap` — frequency-domain (heterodyne) inner-product /
-//   template-fill / RJMCMC swap accumulators + their gradient
-//   variants.
-// - `gb_wdm_het_*_wrap` — chunked-WDM-heterodyne paths that call
-//   `wdm_het_*_impl<GBTDIonTheFly>(...)` from LAT.
-// - `gb_signal_het_*_wrap` — V2 polyphase signal-heterodyne paths
-//   (in-flight at session close; see v2 plan).
-// - `gb_wdm_spline_eval_inputs_wrap` — spline-path diagnostic.
-//
-// Method signatures placeholder for Phase 3L.7c slice -- bodies + full
-// signatures land in subsequent commits.
-// ============================================================================
-class GBComputationGroup {
-  public:
-    GBComputationGroup() = default;
-    ~GBComputationGroup() = default;
-
-    // Method signatures populated alongside their .cu implementations
-    // in subsequent Phase 3L.7 sub-slices. See lisa-on-gpu's
-    // `TDIonTheFly.hh:474-860` for the source-of-truth signatures
-    // pending the move.
-};
+// GBComputationGroup class declaration stays in lisa-on-gpu's
+// TDIonTheFly.hh for now (Phase 3L.7c slice migrates only
+// GBTDIonTheFly). A subsequent slice will carve GBComputationGroup
+// + its methods (gb_fd_*, gb_wdm_het_*, gb_signal_het_*) here.
 
 
 #endif // __GB_TDI_ON_THE_FLY_HH__
