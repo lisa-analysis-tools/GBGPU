@@ -167,6 +167,30 @@ if(GBGPU_WITH_CPU)
             "${CMAKE_CURRENT_BINARY_DIR}/SharedMemoryGBGPU.cxx"
     DEPENDS "SharedMemoryGBGPU.cu"
     VERBATIM)
+
+  # Phase 3L.7d (2026-06-04): the GBTDIonTheFly method bodies + the
+  # gb_run_wave_tdi kernel/wrap live in gb_tdi_on_the_fly.cu. Copy to
+  # .cxx for the host C++ compiler (CPU backend).
+  add_custom_command(
+    OUTPUT "gb_tdi_on_the_fly.cxx"
+    COMMENT "Copy gb_tdi_on_the_fly.cu to gb_tdi_on_the_fly.cxx (for cgbgpu CPU)"
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/gb_tdi_on_the_fly.cu"
+            "${CMAKE_CURRENT_BINARY_DIR}/gb_tdi_on_the_fly.cxx"
+    DEPENDS "gb_tdi_on_the_fly.cu"
+    VERBATIM)
+
+  # Phase 3L.7d (2026-06-04): GBTDIonTheFly inherits from LISATDIonTheFly,
+  # whose method bodies live in LAT's lat_tdi_on_the_fly.cu (Phase 3L.5).
+  # Copy-compile that source into cgbgpu so the virtual-class typeinfo
+  # is present in the cgbgpu .so (mirrors how lisa-on-gpu's tdionthefly
+  # module already copy-compiles lat_tdi_on_the_fly.cu since Phase 3L.5).
+  add_custom_command(
+    OUTPUT "lat_tdi_on_the_fly.cxx"
+    COMMENT "Copy LAT's lat_tdi_on_the_fly.cu to lat_tdi_on_the_fly.cxx (for cgbgpu CPU)"
+    COMMAND ${CMAKE_COMMAND} -E copy "${LISATOOLS_CUTILS}/lat_tdi_on_the_fly.cu"
+            "${CMAKE_CURRENT_BINARY_DIR}/lat_tdi_on_the_fly.cxx"
+    DEPENDS "${LISATOOLS_CUTILS}/lat_tdi_on_the_fly.cu"
+    VERBATIM)
 endif()
 
 
@@ -238,13 +262,15 @@ endif()
 
 if(GBGPU_WITH_CPU)
   # cgbgpu CPU build: one .so per backend wheel containing the pybind11
-  # binding + gbgpu_utils + SharedMemoryGBGPU + LAT's Detector,
-  # mirroring LAT's `lisaanalysistools_cpu_pycppdetector` layout.
+  # binding + gbgpu_utils + SharedMemoryGBGPU + LAT's Detector +
+  # (Phase 3L.7d) GBTDIonTheFly bodies + LAT's LISATDIonTheFly typeinfo.
   pybind11_add_module(gbgpu_cpu_cgbgpu
     binding_gbgpu.cxx
     Detector.cxx
     gbgpu_utils.cxx
-    SharedMemoryGBGPU.cxx)
+    SharedMemoryGBGPU.cxx
+    gb_tdi_on_the_fly.cxx
+    lat_tdi_on_the_fly.cxx)
   apply_cpu_backend_common_options(cgbgpu)
   target_include_directories(gbgpu_cpu_cgbgpu PRIVATE
     "${LISATOOLS_CUTILS}"  # ReturnPointerBase + lisatools_header_abi.hpp + LAT Detector.hpp
@@ -264,12 +290,19 @@ endif()
 
 if(GBGPU_WITH_GPU)
   # cgbgpu GPU build: same layout, .cu sources compiled directly by
-  # nvcc, plus the mathdx::cufftdx link for SharedMemoryGBGPU.cu.
+  # nvcc, plus the mathdx::cufftdx link for SharedMemoryGBGPU.cu. Phase
+  # 3L.7d adds gb_tdi_on_the_fly.cu (GBTDIonTheFly method bodies +
+  # gb_run_wave_tdi kernel/wrap) and pulls in LAT's lat_tdi_on_the_fly.cu
+  # so the LISATDIonTheFly virtual-class typeinfo lives in cgbgpu's
+  # .so (same pattern as lisa-on-gpu's tdionthefly module since
+  # Phase 3L.5).
   pybind11_add_module(gbgpu_gpu_cgbgpu
     binding_gbgpu.cxx
     "${LISATOOLS_CUTILS}/Detector.cu"
+    "${LISATOOLS_CUTILS}/lat_tdi_on_the_fly.cu"
     gbgpu_utils.cu
-    SharedMemoryGBGPU.cu)
+    SharedMemoryGBGPU.cu
+    gb_tdi_on_the_fly.cu)
   apply_gpu_backend_common_options(cgbgpu)
   target_include_directories(gbgpu_gpu_cgbgpu PRIVATE
     "${LISATOOLS_CUTILS}"
