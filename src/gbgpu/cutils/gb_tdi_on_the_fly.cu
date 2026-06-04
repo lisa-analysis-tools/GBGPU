@@ -266,23 +266,9 @@ int GBTDIonTheFly::get_gb_fd_buffer_size(int N, int nchannels)
 //      (num_bin, nchannels, N_sparse) complex result, along with k_f0[bin_i]
 //      and f0_grid[bin_i] (dense rfft bin and snapped carrier).
 
-CUDA_DEVICE inline int gbfd_log2_int(int n)
-{
-    int r = 0;
-    while ((n >>= 1) != 0) ++r;
-    return r;
-}
-
-CUDA_DEVICE inline int gbfd_bit_reverse(int x, int log2n)
-{
-    int r = 0;
-    for (int i = 0; i < log2n; ++i)
-    {
-        r = (r << 1) | (x & 1);
-        x >>= 1;
-    }
-    return r;
-}
+// gbfd_log2_int + gbfd_bit_reverse are header-inline in
+// gb_tdi_on_the_fly.hh (Phase 3L.7f.1, 2026-06-04). Same for
+// gbfd_dense_bin below.
 
 CUDA_DEVICE
 void gbfd_radix2_fft_inplace(cmplx *a, int N, int log2N)
@@ -479,14 +465,8 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
     if (dts_out)      *dts_out      = dts;
 }
 
-// Helper: dense rfft bin index for sparse FFT bin m (FFT order) when the
-// heterodyne carrier was snapped to dense bin kf0.  Inlined identical math
-// to np.fft.fftfreq(N, d=1/N): m_signed = (m < N/2) ? m : m - N.
-CUDA_DEVICE inline int gbfd_dense_bin(int m, int N, int kf0)
-{
-    int m_signed = (m < (N >> 1)) ? m : (m - N);
-    return kf0 + m_signed;
-}
+// gbfd_dense_bin header-inline in gb_tdi_on_the_fly.hh
+// (Phase 3L.7f.1, 2026-06-04).
 
 CUDA_DEVICE
 void gbfd_run_one_source(GBTDIonTheFly *tof, void *shared_mem,
