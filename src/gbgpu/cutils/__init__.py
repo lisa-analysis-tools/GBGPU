@@ -43,9 +43,7 @@ class GBGPUCpuBackend(CpuBackend, GBGPUBackend):
     @staticmethod
     def cpu_methods_loader() -> GBGPUBackendMethods:
         try:
-            import gbgpu_backend_cpu.utils
-            import gbgpu_backend_cpu.sharedmem
-            
+            import gbgpu_backend_cpu.cgbgpu  # Phase GBGPU.pybind.bulk: sole GBGPU backend module
         except (ModuleNotFoundError, ImportError) as e:
             raise BackendUnavailableException(
                 "'cpu' backend could not be imported."
@@ -53,10 +51,16 @@ class GBGPUCpuBackend(CpuBackend, GBGPUBackend):
 
         numpy = GBGPUCpuBackend.check_numpy()
 
+        # Single-instance GBGPUComputationWrap holds every migrated wrapper
+        # (utils + sharedmem methods both land as members on the same wrap).
+        # `sharedmem` exposes the same instance under its prior namespace
+        # name so user code (`self.backend.sharedmem.SharedMemoryWaveComp_wrap(...)`)
+        # keeps working unchanged.
+        _cgbgpu = gbgpu_backend_cpu.cgbgpu.GBGPUComputationWrapCPU()
         return GBGPUBackendMethods(
-            get_ll=gbgpu_backend_cpu.utils.get_ll,
-            fill_global=gbgpu_backend_cpu.utils.fill_global,
-            sharedmem=gbgpu_backend_cpu.sharedmem,
+            get_ll=_cgbgpu.get_ll,
+            fill_global=_cgbgpu.fill_global,
+            sharedmem=_cgbgpu,
             xp=numpy,
         )
 
@@ -74,9 +78,7 @@ class GBGPUCuda11xBackend(Cuda11xBackend, GBGPUBackend):
     @staticmethod
     def cuda11x_module_loader():
         try:
-            import gbgpu_backend_cuda11x.utils
-            import gbgpu_backend_cuda11x.sharedmem
-
+            import gbgpu_backend_cuda11x.cgbgpu  # Phase GBGPU.pybind.bulk
         except (ModuleNotFoundError, ImportError) as e:
             raise BackendUnavailableException(
                 "'cuda11x' backend could not be imported."
@@ -89,10 +91,11 @@ class GBGPUCuda11xBackend(Cuda11xBackend, GBGPUBackend):
                 "'cuda11x' backend requires cupy", pip_deps=["cupy-cuda11x"]
             ) from e
 
+        _cgbgpu = gbgpu_backend_cuda11x.cgbgpu.GBGPUComputationWrapGPU()
         return GBGPUBackendMethods(
-            get_ll=gbgpu_backend_cuda11x.utils.get_ll,
-            fill_global=gbgpu_backend_cuda11x.utils.fill_global,
-            sharedmem=gbgpu_backend_cuda11x.sharedmem,
+            get_ll=_cgbgpu.get_ll,
+            fill_global=_cgbgpu.fill_global,
+            sharedmem=_cgbgpu,
             xp=cupy,
         )
 
@@ -108,9 +111,7 @@ class GBGPUCuda12xBackend(Cuda12xBackend, GBGPUBackend):
     @staticmethod
     def cuda12x_module_loader():
         try:
-            import gbgpu_backend_cuda12x.utils
-            import gbgpu_backend_cuda12x.sharedmem
-
+            import gbgpu_backend_cuda12x.cgbgpu  # Phase GBGPU.pybind.bulk
         except (ModuleNotFoundError, ImportError) as e:
             raise BackendUnavailableException(
                 "'cuda12x' backend could not be imported."
@@ -123,10 +124,11 @@ class GBGPUCuda12xBackend(Cuda12xBackend, GBGPUBackend):
                 "'cuda12x' backend requires cupy", pip_deps=["cupy-cuda12x"]
             ) from e
 
+        _cgbgpu = gbgpu_backend_cuda12x.cgbgpu.GBGPUComputationWrapGPU()
         return GBGPUBackendMethods(
-            get_ll=gbgpu_backend_cuda12x.utils.get_ll,
-            fill_global=gbgpu_backend_cuda12x.utils.fill_global,
-            sharedmem=gbgpu_backend_cuda12x.sharedmem,
+            get_ll=_cgbgpu.get_ll,
+            fill_global=_cgbgpu.fill_global,
+            sharedmem=_cgbgpu,
             xp=cupy,
         )
 

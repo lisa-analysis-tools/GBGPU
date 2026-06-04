@@ -134,32 +134,19 @@ endfunction()
 file(COPY "${LISATOOLS_CUTILS}/Detector.cu"  DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}")
 file(COPY "${LISATOOLS_CUTILS}/Detector.hpp" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}")
 file(COPY "${LISATOOLS_CUTILS}/global.hpp"   DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}")
-# I. Process gbgpu_utils_wrap.pyx into a C++ file
-add_custom_command(
-  OUTPUT "utils.cxx"
-  COMMENT "Cythonize gbgpu_utils_wrap.pyx into utils.cxx"
-  COMMAND
-    Python::Interpreter -m cython "${CMAKE_CURRENT_SOURCE_DIR}/gbgpu_utils_wrap.pyx"
-    --output-file "${CMAKE_CURRENT_BINARY_DIR}/utils.cxx" -3 -+ --module-name
-    "utils" -I "${CMAKE_CURRENT_SOURCE_DIR}"
-  DEPENDS "gbgpu_utils_wrap.pyx"
-  VERBATIM)
+# Phase GBGPU.pybind.bulk (2026-06-04): the per-module Cython binding
+# pipeline (gbgpu_utils_wrap.pyx -> utils, sharedmemgbgpu.pyx ->
+# sharedmem) is retired. Their 9 free functions now live as methods on
+# GBGPUComputationWrap inside the cgbgpu pybind11 module. The underlying
+# gbgpu_utils.cu / SharedMemoryGBGPU.cu sources fold into cgbgpu
+# directly, mirroring LAT's binding_flr.cxx + Detector.cxx layout (one
+# .so per backend wheel).
 
-add_custom_command(
-  OUTPUT "sharedmemgbgpu.cxx"
-  COMMENT "Cythonize sharedmemgbgpu.pyx into sharedmemgbgpu.cxx"
-  COMMAND
-    Python::Interpreter -m cython "${CMAKE_CURRENT_SOURCE_DIR}/sharedmemgbgpu.pyx"
-    --output-file "${CMAKE_CURRENT_BINARY_DIR}/sharedmemgbgpu.cxx" -3 -+ --module-name
-    "sharedmem" -I "${CMAKE_CURRENT_SOURCE_DIR}"
-  DEPENDS "sharedmemgbgpu.pyx"
-  VERBATIM)
-
-# II. Declare the CPU backend
+# CPU build: copy .cu sources to .cxx for the host C++ compiler.
 if(GBGPU_WITH_CPU)
   add_custom_command(
     OUTPUT "gbgpu_utils.cxx"
-    COMMENT "Copy gbgpu_utils.cu to gbgpu_utils.cxx"
+    COMMENT "Copy gbgpu_utils.cu to gbgpu_utils.cxx (for cgbgpu CPU)"
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/gbgpu_utils.cu"
             "${CMAKE_CURRENT_BINARY_DIR}/gbgpu_utils.cxx"
     DEPENDS "gbgpu_utils.cu"
@@ -167,7 +154,7 @@ if(GBGPU_WITH_CPU)
 
   add_custom_command(
     OUTPUT "Detector.cxx"
-    COMMENT "Copy Detector.cu to Detector.cxx"
+    COMMENT "Copy Detector.cu to Detector.cxx (for cgbgpu CPU)"
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/Detector.cu"
             "${CMAKE_CURRENT_BINARY_DIR}/Detector.cxx"
     DEPENDS "Detector.cu"
@@ -175,53 +162,20 @@ if(GBGPU_WITH_CPU)
 
   add_custom_command(
     OUTPUT "SharedMemoryGBGPU.cxx"
-    COMMENT "Copy SharedMemoryGBGPU.cu to SharedMemoryGBGPU.cxx"
+    COMMENT "Copy SharedMemoryGBGPU.cu to SharedMemoryGBGPU.cxx (for cgbgpu CPU)"
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/SharedMemoryGBGPU.cu"
             "${CMAKE_CURRENT_BINARY_DIR}/SharedMemoryGBGPU.cxx"
     DEPENDS "SharedMemoryGBGPU.cu"
     VERBATIM)
-
-
-  python_add_library(gbgpu_cpu_utils MODULE WITH_SOABI Detector.cxx utils.cxx gbgpu_utils.cxx)
-  apply_cpu_backend_common_options(utils)
-  # Detector.cu (downloaded from LISAanalysistools) includes gbt_global.h from
-  # gpubackendtools; make that path visible to the CPU build.
-  target_include_directories(gbgpu_cpu_utils PUBLIC ${GBT_CUTILS})
-
-  target_sources(gbgpu_cpu_utils PUBLIC FILE_SET HEADERS FILES
-  global.hpp Detector.hpp cuda_complex.hpp global.h gbgpu_utils.hh)
-
-
-  python_add_library(gbgpu_cpu_sharedmem MODULE WITH_SOABI Detector.cxx SharedMemoryGBGPU.cxx sharedmemgbgpu.cxx)
-  apply_cpu_backend_common_options(sharedmem)
-  target_include_directories(gbgpu_cpu_sharedmem PUBLIC ${GBT_CUTILS})
-  target_sources(gbgpu_cpu_sharedmem PUBLIC FILE_SET HEADERS FILES
-  global.hpp Detector.hpp cuda_complex.hpp global.h SharedMemoryGBGPU.hpp
-  common.hpp fp16_common.hpp common.hpp)
-  install(TARGETS gbgpu_cpu_sharedmem gbgpu_cpu_utils
-          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/site-packages/gbgpu)
-
-
 endif()
 
 
 # III. Declare the GPU backend
 if(GBGPU_WITH_GPU)
-  python_add_library(gbgpu_gpu_utils MODULE WITH_SOABI utils.cxx gbgpu_utils.cu)
-  apply_gpu_backend_common_options(utils)
-  target_sources(gbgpu_gpu_utils PUBLIC FILE_SET HEADERS FILES
-                                         cuda_complex.hpp global.h gbgpu_utils.hh)
-
-  
-  # Add an include directory for a specific target
-  # Find a library
-  python_add_library(gbgpu_gpu_sharedmem MODULE WITH_SOABI Detector.cu SharedMemoryGBGPU.cu sharedmemgbgpu.cxx)
-  apply_gpu_backend_common_options(sharedmem)
-  message(STATUS "CUDA ARCHS HERE: ${GBGPU_CUDA_ARCH}")
-  set_property(TARGET gbgpu_gpu_sharedmem PROPERTY CUDA_ARCHITECTURES ${GBGPU_CUDA_ARCH})
-  set_property(TARGET gbgpu_gpu_sharedmem PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-  set_property(TARGET gbgpu_gpu_sharedmem PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-  set_property(TARGET gbgpu_gpu_sharedmem PROPERTY POSITION_INDEPENDENT_CODE ON)
+  # gbgpu_gpu_utils + gbgpu_gpu_sharedmem (Cython) retired -- functions
+  # migrated to cgbgpu (see below). The cufftdx + nvidia-mathdx download
+  # logic that lived here is preserved for SharedMemoryGBGPU.cu, which
+  # we still compile into cgbgpu.
 
   file(DOWNLOAD
       "https://developer.nvidia.com/downloads/compute/cuFFTDx/redist/cuFFTDx/cuda12/nvidia-mathdx-25.06.1-cuda12.tar.gz" # The URL of the file to download
@@ -262,14 +216,6 @@ if(GBGPU_WITH_GPU)
   #find_package(cufftdx REQUIRED CONFIG)
   set(mathdx_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06/lib/cmake/mathdx")
   find_package(mathdx REQUIRED COMPONENTS cufftdx CONFIG PATHS "${CMAKE_CURRENT_SOURCE_DIR}/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06/")
-  target_sources(gbgpu_gpu_sharedmem PUBLIC FILE_SET HEADERS FILES
-  global.hpp Detector.hpp cuda_complex.hpp global.h SharedMemoryGBGPU.hpp
-  common.hpp fp16_common.hpp common.hpp)
-  target_link_libraries(gbgpu_gpu_sharedmem PUBLIC CUDA::cudart CUDA::cublas
-      CUDA::cusparse mathdx::cufftdx)
-  message(STATUS "CMAKE_INSTALL_LIBDIR HERE: ${CMAKE_INSTALL_LIBDIR}")
-  install(TARGETS gbgpu_gpu_sharedmem
-          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/site-packages/gbgpu)
 endif()
 
 
@@ -291,29 +237,54 @@ endif()
 # LISAResponseWrap, WDM*/FD*/Spline* (those are LAT's).
 
 if(GBGPU_WITH_CPU)
-  # binding_gbgpu.cxx is consumed directly by pybind11_add_module; no copy
-  # needed because the file is host C++ (pybind11 ABI; no nvcc).
-  pybind11_add_module(gbgpu_cpu_cgbgpu binding_gbgpu.cxx)
+  # cgbgpu CPU build: one .so per backend wheel containing the pybind11
+  # binding + gbgpu_utils + SharedMemoryGBGPU + LAT's Detector,
+  # mirroring LAT's `lisaanalysistools_cpu_pycppdetector` layout.
+  pybind11_add_module(gbgpu_cpu_cgbgpu
+    binding_gbgpu.cxx
+    Detector.cxx
+    gbgpu_utils.cxx
+    SharedMemoryGBGPU.cxx)
   apply_cpu_backend_common_options(cgbgpu)
   target_include_directories(gbgpu_cpu_cgbgpu PRIVATE
-    "${LISATOOLS_CUTILS}"  # ReturnPointerBase + lisatools_header_abi.hpp from LAT
+    "${LISATOOLS_CUTILS}"  # ReturnPointerBase + lisatools_header_abi.hpp + LAT Detector.hpp
     "${GBT_CUTILS}"        # gbt_global.h, pybind11_cuda_array_interface.hpp
   )
   target_sources(gbgpu_cpu_cgbgpu PUBLIC FILE_SET HEADERS FILES
-                                       binding_gbgpu.hpp)
+                                       binding_gbgpu.hpp gbgpu_utils.hh
+                                       SharedMemoryGBGPU.hpp
+                                       global.hpp Detector.hpp
+                                       cuda_complex.hpp global.h
+                                       common.hpp fp16_common.hpp)
   install(TARGETS gbgpu_cpu_cgbgpu
           LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/site-packages/gbgpu)
 endif()
 
 if(GBGPU_WITH_GPU)
-  pybind11_add_module(gbgpu_gpu_cgbgpu binding_gbgpu.cxx)
+  # cgbgpu GPU build: same layout, .cu sources compiled directly by
+  # nvcc, plus the mathdx::cufftdx link for SharedMemoryGBGPU.cu.
+  pybind11_add_module(gbgpu_gpu_cgbgpu
+    binding_gbgpu.cxx
+    "${LISATOOLS_CUTILS}/Detector.cu"
+    gbgpu_utils.cu
+    SharedMemoryGBGPU.cu)
   apply_gpu_backend_common_options(cgbgpu)
   target_include_directories(gbgpu_gpu_cgbgpu PRIVATE
     "${LISATOOLS_CUTILS}"
     "${GBT_CUTILS}"
   )
+  set_property(TARGET gbgpu_gpu_cgbgpu PROPERTY CUDA_ARCHITECTURES ${GBGPU_CUDA_ARCH})
+  set_property(TARGET gbgpu_gpu_cgbgpu PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+  set_property(TARGET gbgpu_gpu_cgbgpu PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  set_property(TARGET gbgpu_gpu_cgbgpu PROPERTY POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(gbgpu_gpu_cgbgpu PUBLIC CUDA::cudart CUDA::cublas
+      CUDA::cusparse mathdx::cufftdx)
   target_sources(gbgpu_gpu_cgbgpu PUBLIC FILE_SET HEADERS FILES
-                                       binding_gbgpu.hpp)
+                                       binding_gbgpu.hpp gbgpu_utils.hh
+                                       SharedMemoryGBGPU.hpp
+                                       global.hpp Detector.hpp
+                                       cuda_complex.hpp global.h
+                                       common.hpp fp16_common.hpp)
   install(TARGETS gbgpu_gpu_cgbgpu
           LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/site-packages/gbgpu)
 endif()

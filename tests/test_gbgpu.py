@@ -30,7 +30,6 @@ class WaveformTest(unittest.TestCase):
 
         # TODO: improve this
         force_backend = "gpu" if gpu_available else "cpu"
-        breakpoint()
         gb = GBGPU(orbits=orbits, force_backend=force_backend)
 
         dt = 15.0
@@ -165,6 +164,10 @@ class WaveformTest(unittest.TestCase):
             N=N,
             dt=dt,
             T=Tobs,
+            # GBGPU.get_ll asserts `data_length is not None` when each entry
+            # of `data`/`noise_factor` is 1D (the test passes flat
+            # data_stream_length arrays). Pass the actual length here.
+            data_length=data_stream_length,
         )
 
         self.assertFalse(np.any(np.isnan(like)))

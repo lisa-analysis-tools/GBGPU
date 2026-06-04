@@ -2730,8 +2730,11 @@ double atomicAddDouble(double *address, double val)
 #endif
 
 // Add functionality for proper summation in the kernel
+// `static inline` gives this internal linkage so it doesn't clash with
+// the identical definition in gbgpu_utils.cu when both compile into the
+// same cgbgpu .so (Phase GBGPU.pybind.bulk).
 CUDA_DEVICE
-void atomicAddComplex(cmplx *a, cmplx b)
+static inline void atomicAddComplex(cmplx *a, cmplx b)
 {
     // transform the addresses of real and imag. parts to double pointers
     double *x = (double *)a;

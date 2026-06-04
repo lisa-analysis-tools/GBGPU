@@ -75,10 +75,38 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         GBGPUParallelModule.__init__(self, force_backend=force_backend)
         self.d_d = None
         self.orbits = orbits
+        # `gpus` controls multi-GPU dispatch in get_ll / fill_global etc.
+        # `None` -> CPU mode (or single-GPU on a single-device system).
+        # A user enabling multi-GPU sets this to a list of device IDs
+        # explicitly after construction.
+        self.gpus = None
 
     @classmethod
     def supported_backends(cls):
         return cls.GPU_RECOMMENDED()
+
+    # ---- CPU/GPU dispatch helpers ----
+    # `self.gpus is None` -> CPU mode (or single-GPU on a single-device
+    # system). The helpers below let the rest of the class call
+    # cuda.runtime.setDevice / deviceSynchronize / cuda.Device(...)
+    # unconditionally without crashing on numpy.
+
+    def _xp_set_device(self, device) -> None:
+        """No-op on CPU; cuda.runtime.setDevice on GPU."""
+        if hasattr(self.xp, "cuda"):
+            self.xp.cuda.runtime.setDevice(device)
+
+    def _xp_sync(self) -> None:
+        """No-op on CPU; cuda.runtime.deviceSynchronize on GPU."""
+        if hasattr(self.xp, "cuda"):
+            self.xp.cuda.runtime.deviceSynchronize()
+
+    def _xp_device(self, device):
+        """cuda.Device context manager on GPU; nullcontext on CPU."""
+        if hasattr(self.xp, "cuda"):
+            return self.xp.cuda.Device(device)
+        import contextlib
+        return contextlib.nullcontext()
 
     @property
     def get_ll_func(self):
@@ -641,7 +669,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         if self.gpus is not None:
             # set first index gpu device to control main operations
             return_to_main_device = self.gpus[0]
-            self.xp.cuda.runtime.setDevice(return_to_main_device)
+            self._xp_set_device(return_to_main_device)
 
         self.num_bin = num_bin = params.shape[0]
 
@@ -765,27 +793,34 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         
         # if self.gpus is not None:
         do_synchronize = False
-        main_device = self.xp.cuda.runtime.getDevice()
+        main_device = self.xp.cuda.runtime.getDevice() if hasattr(self.xp, "cuda") else -1
+        # CPU mode (self.gpus is None) -> treat as a single virtual
+        # device (gpu_id = -1) so the data_splits / num_per_gpu defaults +
+        # the dispatch loop below run exactly once and skip every
+        # cupy-specific setDevice / synchronize call.
+        _gpus_iter = self.gpus if self.gpus is not None else [-1]
         if data_splits is None:
-            assert len(self.gpus) == 1
-            data_splits = self.xp.full(num_data[0], self.gpus[0])
-            
+            assert len(_gpus_iter) == 1
+            data_splits = self.xp.full(num_data[0], _gpus_iter[0])
+
         if num_per_gpu is None:
-            assert len(self.gpus) == 1
+            assert len(_gpus_iter) == 1
             num_per_gpu = int(1e15)
             # make really high so just keeps
 
         inputs_in = []
         for nnn, N_here in enumerate(unique_N):
             N_here = N_here.item()
-            for gpu_i, gpu in enumerate(self.gpus):
-                self.xp.cuda.runtime.setDevice(main_device)
+            for gpu_i, gpu in enumerate(_gpus_iter):
+                if self.gpus is not None:
+                    self._xp_set_device(main_device)
                 keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[data_index] == gpu)
                 num_split_here = keep_bool.sum().item()
                 inds_here = self.xp.arange(len(keep_bool))[keep_bool]
                 if num_split_here == 0:
-                    continue 
-                self.xp.cuda.runtime.setDevice(gpu)
+                    continue
+                if self.gpus is not None:
+                    self._xp_set_device(gpu)
                 
                 params_here = self.xp.asarray(params)[keep_bool]
                 data_index_here = (data_index[keep_bool] % num_per_gpu).astype(np.int32)
@@ -830,26 +865,26 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 
                 # for testing
                 try:
-                    self.xp.cuda.runtime.deviceSynchronize()
+                    self._xp_sync()
                     self.backend.sharedmem.SharedMemoryLikeComp_wrap(*tuple_in)
                     inputs_in.append([gpu, inds_here, tuple_in])
-                    self.xp.cuda.runtime.deviceSynchronize()
+                    self._xp_sync()
                 except ValueError:
                     breakpoint()
 
         for gpu, inds_gpu, inputs_tmp in inputs_in:
-            with self.xp.cuda.Device(gpu):
-                self.xp.cuda.runtime.deviceSynchronize()
+            with self._xp_device(gpu):
+                self._xp_sync()
 
         for gpu, inds_gpu, inputs_tmp in inputs_in:
-            with self.xp.cuda.Device(main_device):
-                self.xp.cuda.runtime.deviceSynchronize()
+            with self._xp_device(main_device):
+                self._xp_sync()
 
                 d_h[inds_gpu] = inputs_tmp[0][:]
                 h_h[inds_gpu] = inputs_tmp[1][:]
                 
-        self.xp.cuda.runtime.setDevice(main_device)
-        self.xp.cuda.runtime.deviceSynchronize()
+        self._xp_set_device(main_device)
+        self._xp_sync()
         
         
         if phase_marginalize:
@@ -907,7 +942,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         if self.gpus is not None:
             # set first index gpu device to control main operations
             return_to_main_device = self.gpus[0]
-            self.xp.cuda.runtime.setDevice(return_to_main_device)
+            self._xp_set_device(return_to_main_device)
 
         self.num_bin = num_bin = params.shape[0]
 
@@ -1032,27 +1067,34 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         
         # if self.gpus is not None:
         do_synchronize = False
-        main_device = self.xp.cuda.runtime.getDevice()
+        main_device = self.xp.cuda.runtime.getDevice() if hasattr(self.xp, "cuda") else -1
+        # CPU mode (self.gpus is None) -> treat as a single virtual
+        # device (gpu_id = -1) so the data_splits / num_per_gpu defaults +
+        # the dispatch loop below run exactly once and skip every
+        # cupy-specific setDevice / synchronize call.
+        _gpus_iter = self.gpus if self.gpus is not None else [-1]
         if data_splits is None:
-            assert len(self.gpus) == 1
-            data_splits = self.xp.full(num_data[0], self.gpus[0])
-            
+            assert len(_gpus_iter) == 1
+            data_splits = self.xp.full(num_data[0], _gpus_iter[0])
+
         if num_per_gpu is None:
-            assert len(self.gpus) == 1
+            assert len(_gpus_iter) == 1
             num_per_gpu = int(1e15)
             # make really high so just keeps
 
         inputs_in = []
         for nnn, N_here in enumerate(unique_N):
             N_here = N_here.item()
-            for gpu_i, gpu in enumerate(self.gpus):
-                self.xp.cuda.runtime.setDevice(main_device)
+            for gpu_i, gpu in enumerate(_gpus_iter):
+                if self.gpus is not None:
+                    self._xp_set_device(main_device)
                 keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[data_index] == gpu)
                 num_split_here = keep_bool.sum().item()
                 inds_here = self.xp.arange(len(keep_bool))[keep_bool]
                 if num_split_here == 0:
-                    continue 
-                self.xp.cuda.runtime.setDevice(gpu)
+                    continue
+                if self.gpus is not None:
+                    self._xp_set_device(gpu)
                 
                 params_here = self.xp.asarray(params)[keep_bool]
                 data_index_here = (data_index[keep_bool] % num_per_gpu).astype(np.int32)
@@ -1096,26 +1138,26 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 
                 # for testing
                 try:
-                    self.xp.cuda.runtime.deviceSynchronize()
+                    self._xp_sync()
                     self.backend.sharedmem.SharedMemoryFstatLikeComp_wrap(*tuple_in)
                     inputs_in.append([gpu, inds_here, tuple_in])
-                    self.xp.cuda.runtime.deviceSynchronize()
+                    self._xp_sync()
                 except ValueError:
                     breakpoint()
 
         for gpu, inds_gpu, inputs_tmp in inputs_in:
-            with self.xp.cuda.Device(gpu):
-                self.xp.cuda.runtime.deviceSynchronize()
+            with self._xp_device(gpu):
+                self._xp_sync()
 
         for gpu, inds_gpu, inputs_tmp in inputs_in:
-            with self.xp.cuda.Device(main_device):
-                self.xp.cuda.runtime.deviceSynchronize()
+            with self._xp_device(main_device):
+                self._xp_sync()
                 # TODO: change inside to double instead of cmplx?
                 M_mat[inds_gpu] = inputs_tmp[0][:].reshape(-1, 4, 4).real
                 N_arr[inds_gpu] = inputs_tmp[1][:].reshape(-1, 4).real
                 
-        self.xp.cuda.runtime.setDevice(main_device)
-        self.xp.cuda.runtime.deviceSynchronize()
+        self._xp_set_device(main_device)
+        self._xp_sync()
         
         M_mat_inv = self.xp.linalg.inv(M_mat)
 
@@ -1221,7 +1263,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         if self.gpus is not None:
             # set first index gpu device to control main operations
-            self.xp.cuda.runtime.setDevice(self.gpus[0])
+            self._xp_set_device(self.gpus[0])
 
         # get number of observation points and adjust T accordingly
         N_obs = int(T / dt)
@@ -1284,7 +1326,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         theta = np.pi / 2 - beta
 
-        gpu = self.xp.cuda.runtime.getDevice()
+        gpu = self.xp.cuda.runtime.getDevice() if hasattr(self.xp, "cuda") else -1
         do_synchronize = True
 
         # raise NotImplementedError
@@ -1468,7 +1510,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         """
         if self.gpus is not None:
             # set first index gpu device to control main operations
-            self.xp.cuda.runtime.setDevice(self.gpus[0])
+            self._xp_set_device(self.gpus[0])
 
         self.num_bin = num_bin = params.shape[0]
 
@@ -1530,7 +1572,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         if self.gpus is not None:
             do_synchronize = False
-            main_device = self.xp.cuda.runtime.getDevice()
+            main_device = self.xp.cuda.runtime.getDevice() if hasattr(self.xp, "cuda") else -1
             if data_splits is None:
                 assert len(self.gpus) == 1
                 data_splits = self.xp.full(num_templates[0], self.gpus[0])
@@ -1544,12 +1586,12 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             for nnn, N_here in enumerate(unique_N):
                 N_here = N_here.item()
                 for gpu_i, gpu in enumerate(self.gpus):
-                    self.xp.cuda.runtime.setDevice(main_device)
+                    self._xp_set_device(main_device)
                     keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[group_index] == gpu)
                     num_split_here = keep_bool.sum().item()
                     if num_split_here == 0:
                         continue 
-                    self.xp.cuda.runtime.setDevice(gpu)
+                    self._xp_set_device(gpu)
                     
                     params_here = self.xp.asarray(params)[keep_bool]
                     group_index_here = (group_index[keep_bool] % num_per_gpu).astype(np.int32)
@@ -1584,16 +1626,16 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                         
                     # for testing
                     try:
-                        self.xp.cuda.runtime.deviceSynchronize()
+                        self._xp_sync()
                         self.backend.sharedmem.SharedMemoryGenerateGlobal_wrap(*tuple_in)
                         inputs_in.append([gpu, tuple_in])
-                        self.xp.cuda.runtime.deviceSynchronize()
+                        self._xp_sync()
                     except ValueError:
                         breakpoint()
   
             for gpu, inputs_tmp in inputs_in:
                 with self.xp.cuda.Device(gpu):
-                    self.xp.cuda.runtime.deviceSynchronize()
+                    self._xp_sync()
 
             self.xp.cuda.runtime.setDevice(main_device)
             self.xp.cuda.runtime.deviceSynchronize()
@@ -1770,7 +1812,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         if self.gpus is not None:
             # set first index gpu device to control main operations
             return_to_main_device = self.gpus[0]
-            self.xp.cuda.runtime.setDevice(return_to_main_device)
+            self._xp_set_device(return_to_main_device)
 
         self.num_bin = num_bin = params_add.shape[0]
 
@@ -1897,7 +1939,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         if self.gpus is not None:
             do_synchronize = False
-            main_device = self.xp.cuda.runtime.getDevice()
+            main_device = self.xp.cuda.runtime.getDevice() if hasattr(self.xp, "cuda") else -1
             if data_splits is None:
                 assert len(self.gpus) == 1
                 data_splits = self.xp.full(num_data[0], self.gpus[0])
@@ -1911,13 +1953,13 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             for nnn, N_here in enumerate(unique_N):
                 N_here = N_here.item()
                 for gpu_i, gpu in enumerate(self.gpus):
-                    self.xp.cuda.runtime.setDevice(main_device)
+                    self._xp_set_device(main_device)
                     keep_bool = (N_groups == nnn) & (self.xp.asarray(data_splits)[data_index] == gpu)
                     num_split_here = keep_bool.sum().item()
                     inds_here = self.xp.arange(len(keep_bool))[keep_bool]
                     if num_split_here == 0:
                         continue 
-                    self.xp.cuda.runtime.setDevice(gpu)
+                    self._xp_set_device(gpu)
                     
                     params_remove_here = self.xp.asarray(params_remove)[keep_bool]
                     params_add_here = self.xp.asarray(params_add)[keep_bool]
@@ -1971,20 +2013,20 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     
                     # for testing
                     try:
-                        self.xp.cuda.runtime.deviceSynchronize()
+                        self._xp_sync()
                         self.backend.sharedmem.SharedMemorySwapLikeComp_wrap(*tuple_in)
                         inputs_in.append([gpu, inds_here, tuple_in])
-                        self.xp.cuda.runtime.deviceSynchronize()
+                        self._xp_sync()
                     except ValueError:
                         breakpoint()
   
             for gpu, inds_gpu, inputs_tmp in inputs_in:
                 with self.xp.cuda.Device(gpu):
-                    self.xp.cuda.runtime.deviceSynchronize()
+                    self._xp_sync()
 
             for gpu, inds_gpu, inputs_tmp in inputs_in:
                 with self.xp.cuda.Device(main_device):
-                    self.xp.cuda.runtime.deviceSynchronize()
+                    self._xp_sync()
 
                     d_h_remove[inds_gpu] = inputs_tmp[0][:]
                     d_h_add[inds_gpu] = inputs_tmp[1][:]

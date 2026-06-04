@@ -25,10 +25,32 @@ void gbgpu_part(py::module &m) {
     py::class_<GBGPUComputationWrap>(m, "GBGPUComputationWrapCPU")
 #endif
         .def(py::init<>())
-        // Method wrappers populated in subsequent commits as each
-        // Cython .pyx module is migrated, and at Phase 3L.7 (carve-out
-        // of GBTDIonTheFly + GBComputationGroup + gb_wdm_het_* kernels
-        // from lisa-on-gpu).
+        // gbgpu_utils.hh (migrated from gbgpu_utils_wrap.pyx)
+        .def("get_ll", &GBGPUComputationWrap::get_ll,
+             "Compute <d|h> and <h|h> per-binary.")
+        .def("fill_global", &GBGPUComputationWrap::fill_global,
+             "Sum per-binary templates into global A/E data buffers.")
+        .def("swap_ll_diff", &GBGPUComputationWrap::swap_ll_diff,
+             "Swap-likelihood per-binary differences.")
+        // SharedMemoryGBGPU.hpp (migrated from sharedmemgbgpu.pyx)
+        .def("SharedMemoryWaveComp_wrap",
+             &GBGPUComputationWrap::SharedMemoryWaveComp_wrap,
+             "Shared-memory GB waveform generation.")
+        .def("SharedMemoryLikeComp_wrap",
+             &GBGPUComputationWrap::SharedMemoryLikeComp_wrap,
+             "Shared-memory GB likelihood evaluation.")
+        .def("SharedMemorySwapLikeComp_wrap",
+             &GBGPUComputationWrap::SharedMemorySwapLikeComp_wrap,
+             "Shared-memory GB swap-likelihood evaluation.")
+        .def("SharedMemoryChiSquaredComp_wrap",
+             &GBGPUComputationWrap::SharedMemoryChiSquaredComp_wrap,
+             "Shared-memory GB chi-squared evaluation.")
+        .def("SharedMemoryGenerateGlobal_wrap",
+             &GBGPUComputationWrap::SharedMemoryGenerateGlobal_wrap,
+             "Shared-memory GB global-template generation.")
+        .def("SharedMemoryFstatLikeComp_wrap",
+             &GBGPUComputationWrap::SharedMemoryFstatLikeComp_wrap,
+             "Shared-memory GB F-statistic likelihood evaluation.")
         ;
 }
 
