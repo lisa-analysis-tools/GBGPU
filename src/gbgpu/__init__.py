@@ -28,6 +28,44 @@ try:
 except (ModuleNotFoundError, ImportError):
     _is_editable = False
 
+
+def get_include() -> str:
+    """Absolute path to GBGPU's public C++/CUDA header directory.
+
+    Downstream sprint packages and lisa-on-gpu (during the Phase 3L.7
+    transition) add this to their compiler include path so that
+
+        #include "gb_tdi_on_the_fly.hh"    // GBTDIonTheFly + GBComputationGroup
+
+    resolves against the installed wheel.
+
+    Pair with ``gpubackendtools.get_include()`` and
+    ``lisatools.get_include()`` -- a downstream typically needs all three:
+    GBT for ``gbt_global.h`` + ``cuda_complex.hpp`` + ``InterpolateDevice.hh``,
+    LAT for ``Detector.hpp`` + ``lat_chunked_het_kernels.hh`` + base
+    classes, GBGPU for the GB source-class-specific machinery
+    (``GBTDIonTheFly``, ``GBComputationGroup``, ``gb_run_wave_tdi_wrap``).
+    """
+    import os.path
+    return os.path.join(os.path.dirname(__file__), "cutils")
+
+
+def get_cmake_module_path() -> str:
+    """Absolute path to the directory containing ``GBGPUConfig.cmake``.
+
+    For downstreams that prefer ``find_package(GBGPU CONFIG)`` over the
+    Python shell-out form of :func:`get_include`. Forward-compatible:
+    ``GBGPUConfig.cmake`` ships at the cutils directory once added;
+    consumers can begin using this path before that file exists (CMake
+    just won't find the package and they fall through to the shell-out
+    form).
+
+    Returns the same directory as :func:`get_include`.
+    """
+    import os.path
+    return os.path.join(os.path.dirname(__file__), "cutils")
+
+
 from . import cutils, utils
 
 from gpubackendtools import Globals
