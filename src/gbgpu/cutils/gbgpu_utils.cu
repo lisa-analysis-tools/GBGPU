@@ -6,7 +6,8 @@
 #include "gbgpu_utils.hh"
 #include "global.h"
 #include "LISA.h"
-#include "cuda_complex.hpp"
+// cuda_complex.hpp pulled in transitively via global.h -> gbt_global.h
+// (GPUBackendTools owns the canonical copy).
 
 #define NUM_THREADS 256
 

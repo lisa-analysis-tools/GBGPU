@@ -250,11 +250,13 @@ if(GBGPU_WITH_CPU)
     "${LISATOOLS_CUTILS}"  # ReturnPointerBase + lisatools_header_abi.hpp + LAT Detector.hpp
     "${GBT_CUTILS}"        # gbt_global.h, pybind11_cuda_array_interface.hpp
   )
+  # NB: cuda_complex.hpp deliberately omitted -- pulled transitively via
+  # ${GBT_CUTILS}/gbt_global.h (GPUBackendTools owns the canonical copy).
   target_sources(gbgpu_cpu_cgbgpu PUBLIC FILE_SET HEADERS FILES
                                        binding_gbgpu.hpp gbgpu_utils.hh
                                        SharedMemoryGBGPU.hpp
                                        global.hpp Detector.hpp
-                                       cuda_complex.hpp global.h
+                                       global.h
                                        common.hpp fp16_common.hpp)
   install(TARGETS gbgpu_cpu_cgbgpu
           LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/site-packages/gbgpu)
@@ -279,11 +281,13 @@ if(GBGPU_WITH_GPU)
   set_property(TARGET gbgpu_gpu_cgbgpu PROPERTY POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(gbgpu_gpu_cgbgpu PUBLIC CUDA::cudart CUDA::cublas
       CUDA::cusparse mathdx::cufftdx)
+  # NB: cuda_complex.hpp deliberately omitted -- pulled transitively via
+  # ${GBT_CUTILS}/gbt_global.h (GPUBackendTools owns the canonical copy).
   target_sources(gbgpu_gpu_cgbgpu PUBLIC FILE_SET HEADERS FILES
                                        binding_gbgpu.hpp gbgpu_utils.hh
                                        SharedMemoryGBGPU.hpp
                                        global.hpp Detector.hpp
-                                       cuda_complex.hpp global.h
+                                       global.h
                                        common.hpp fp16_common.hpp)
   install(TARGETS gbgpu_gpu_cgbgpu
           LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/site-packages/gbgpu)

@@ -28,39 +28,27 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <complex>
-#include "cuda_complex.hpp"
 
+// gbt_global.h provides cuda_complex.hpp + the cmplx typedef +
+// CUDA_DEVICE / CUDA_KERNEL / CUDA_SHARED / gpuErrchk macro set.
+// One sprint-wide copy lives in GPUBackendTools.
+#include "gbt_global.h"
+
+// gbt_global.h spells the threadsync macro CUDA_SYNC_THREADS. This file
+// historically exposed CUDA_SYNCTHREADS (no underscore); keep the old
+// spelling as a backwards-compat alias for legacy GBGPU code.
+#ifndef CUDA_SYNCTHREADS
+#define CUDA_SYNCTHREADS CUDA_SYNC_THREADS
+#endif
+
+// gbt_global.h does not provide CUDA_CALLABLE_MEMBER (a host+device
+// decorator distinct from the device-only CUDA_DEVICE). Preserve it
+// here for the legacy GBGPU kernels.
 #ifdef __CUDACC__
 #include "cuda_runtime_api.h"
-
 #define CUDA_CALLABLE_MEMBER __host__ __device__
-#define CUDA_DEVICE __device__
-#define CUDA_KERNEL __global__
-#define CUDA_SHARED __shared__
-#define CUDA_SYNCTHREADS __syncthreads();
-
-
-/*
-Function for gpu Error checking.
-//*/
-#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-   if (code != cudaSuccess)
-   {
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
-
-
-
 #else
 #define CUDA_CALLABLE_MEMBER
-#define CUDA_DEVICE
-#define CUDA_KERNEL
-#define CUDA_SHARED
-#define CUDA_SYNCTHREADS
 #endif
 
 typedef gcmplx::complex<double> cmplx;
