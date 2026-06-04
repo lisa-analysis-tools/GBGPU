@@ -15,6 +15,13 @@ project(gbgpu VERSION ${SKBUILD_PROJECT_VERSION} LANGUAGES CXX)
 # ---- Find required dependencies ----
 find_package(Python COMPONENTS Interpreter Development.Module NumPy REQUIRED)
 
+# pybind11 is needed for the cgbgpu module added at Phase GBGPU.pybind. It is
+# declared in pyproject.toml's build-system.requires so it's installed in the
+# build env; find_package(pybind11 CONFIG) locates the CMake package it ships.
+# Mirrors LAT (LISAanalysistools/CMakeLists.txt), lisa-on-gpu, and the
+# corresponding setup just landed in BBHx.
+find_package(pybind11 CONFIG)
+
 # This line defines the install directory variables
 include(GNUInstallDirs)
 

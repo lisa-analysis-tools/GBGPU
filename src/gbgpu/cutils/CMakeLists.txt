@@ -273,6 +273,52 @@ if(GBGPU_WITH_GPU)
 endif()
 
 
+# ----------------
+# --- cgbgpu (pybind11 module skeleton) ---
+# ----------------
+#
+# Phase GBGPU.pybind (2026-06-03): mirror of the BBHx pybind skeleton
+# (BBHx had its skeleton on origin/pybind; GBGPU had no prior pybind
+# work so this is fresh against the post-Phase-3L LAT setup). The
+# pybind11 module is reserved for GB-specific wrappers (gbgpu_utils +
+# SharedMemoryGBGPU as they migrate from the existing Cython modules)
+# and the GBTDIonTheFly + GBComputationGroup + gb_wdm_het_* chunked-
+# heterodyne kernels scheduled for Phase 3L.7. The skeleton commit
+# ships an empty GBGPUComputationWrap; subsequent commits populate it.
+# The single-registrant rule is enforced via
+# static_assert(!LISATOOLS_IS_WRAPPER_OWNER) in binding_gbgpu.cxx --
+# GBGPU must NOT register OrbitsWrap_responselisa, TDIConfigWrap,
+# LISAResponseWrap, WDM*/FD*/Spline* (those are LAT's).
+
+if(GBGPU_WITH_CPU)
+  # binding_gbgpu.cxx is consumed directly by pybind11_add_module; no copy
+  # needed because the file is host C++ (pybind11 ABI; no nvcc).
+  pybind11_add_module(gbgpu_cpu_cgbgpu binding_gbgpu.cxx)
+  apply_cpu_backend_common_options(cgbgpu)
+  target_include_directories(gbgpu_cpu_cgbgpu PRIVATE
+    "${LISATOOLS_CUTILS}"  # ReturnPointerBase + lisatools_header_abi.hpp from LAT
+    "${GBT_CUTILS}"        # gbt_global.h, pybind11_cuda_array_interface.hpp
+  )
+  target_sources(gbgpu_cpu_cgbgpu PUBLIC FILE_SET HEADERS FILES
+                                       binding_gbgpu.hpp)
+  install(TARGETS gbgpu_cpu_cgbgpu
+          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/site-packages/gbgpu)
+endif()
+
+if(GBGPU_WITH_GPU)
+  pybind11_add_module(gbgpu_gpu_cgbgpu binding_gbgpu.cxx)
+  apply_gpu_backend_common_options(cgbgpu)
+  target_include_directories(gbgpu_gpu_cgbgpu PRIVATE
+    "${LISATOOLS_CUTILS}"
+    "${GBT_CUTILS}"
+  )
+  target_sources(gbgpu_gpu_cgbgpu PUBLIC FILE_SET HEADERS FILES
+                                       binding_gbgpu.hpp)
+  install(TARGETS gbgpu_gpu_cgbgpu
+          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/site-packages/gbgpu)
+endif()
+
+
 # Declare the CPU backend
 # We compile the files in a module called gbgpu_utils_cpu
 # if(GBGPU_WITH_CPU)

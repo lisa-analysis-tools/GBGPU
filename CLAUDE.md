@@ -19,6 +19,19 @@ GB-specific physics on top of it.
   `src/gbgpu/cutils/` and are gitignored — source of truth is LAT.
 - Same flow for `${GBT_CUTILS}` (gpubackendtools cutils dir, already
   in place pre-2026-06-03).
+- `src/gbgpu/cutils/binding_gbgpu.{hpp,cxx}` -- pybind11 module skeleton
+  (Phase GBGPU.pybind, 2026-06-03). Mirror of BBHx's
+  binding_bbhx.{hpp,cxx}; built fresh (no prior pybind branch on GBGPU
+  to pull forward). Consumes LAT's canonical `ReturnPointerBase` via
+  `#include "binding_flr.hpp"` and asserts
+  `static_assert(!LISATOOLS_IS_WRAPPER_OWNER, ...)` to enforce the
+  single-registrant rule. Produces a new backend module
+  `gbgpu_backend_{cpu,cudaXXx}.cgbgpu` alongside the existing Cython
+  modules (utils, sharedmem). The skeleton ships an empty
+  `GBGPUComputationWrap`; Phase 3L.7 populates it with
+  GBTDIonTheFly + GBComputationGroup + gb_wdm_het_* kernels.
+- `find_package(pybind11 CONFIG)` added to project-root `CMakeLists.txt`;
+  `pybind11` added to `pyproject.toml`'s build-system requires.
 
 **Already received from lisa-on-gpu (Phase 3F):**
 - `gbgpu.jax.sources.ucb` — `JaxUCBSource`.
