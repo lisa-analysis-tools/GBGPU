@@ -45,6 +45,36 @@ endif()
 
 message(STATUS "LISATOOLS_CUTILS location is ${LISATOOLS_CUTILS}.")
 
+# Phase 3L.7g (2026-06-04): cgbgpu now includes GBT's Interpolate.cu
+# (fit_cubic_spline_thomas + friends) because the GB chunked-het
+# pipeline relies on it. Pull in GBT's cmake_functions.cmake so we can
+# call get_lapacke() the same way lisa-on-gpu + GBT itself do.
+set(GBT_CMAKE_TOOLS "${GBT_CUTILS}/cmake_functions.cmake")
+if(NOT EXISTS "${GBT_CMAKE_TOOLS}")
+  message(FATAL_ERROR
+    "${GBT_CMAKE_TOOLS} not found -- gpubackendtools install is broken or "
+    "GBT_CUTILS detection failed.")
+endif()
+include(${GBT_CMAKE_TOOLS})
+# GBT's get_lapacke() reads GBT_LAPACKE_DETECT_WITH + GBT_LAPACKE_FETCH.
+# Both must be defined or the `if (NOT ${VAR} ...)` test inside the helper
+# fails to parse. Default both to AUTO so we pick up a system LAPACKE if
+# present, falling back to the CPM-fetched copy otherwise -- same defaults
+# lisa-on-gpu uses in its root CMakeLists.
+if(NOT DEFINED GBT_LAPACKE_DETECT_WITH)
+  set(GBT_LAPACKE_DETECT_WITH "AUTO")
+endif()
+if(NOT DEFINED GBT_LAPACKE_FETCH)
+  set(GBT_LAPACKE_FETCH "AUTO")
+endif()
+if(NOT DEFINED GBT_LAPACKE_EXTRA_LIBS)
+  set(GBT_LAPACKE_EXTRA_LIBS "")
+endif()
+if(GBGPU_WITH_CPU OR GBGPU_WITH_GPU)
+  enable_language(Fortran)
+  get_lapacke()
+endif()
+
 # Adapter to let inplace editable install work: the compiled backend will be
 # placed into the source-tree in the 'src' directory:
 # TODO: is this needed ?
@@ -191,6 +221,21 @@ if(GBGPU_WITH_CPU)
             "${CMAKE_CURRENT_BINARY_DIR}/lat_tdi_on_the_fly.cxx"
     DEPENDS "${LISATOOLS_CUTILS}/lat_tdi_on_the_fly.cu"
     VERBATIM)
+
+  # Phase 3L.7g (2026-06-04): gb_tdi_on_the_fly.cu uses
+  # fit_cubic_spline_thomas() (GBT's LAPACKE tridiagonal cubic-spline
+  # solver) for orbit-spline + signal-spline construction in the
+  # chunked-het pipeline. Compile GBT's Interpolate.cu into cgbgpu so the
+  # symbol is resolved without depending on lisa-on-gpu's tdionthefly
+  # module (which previously held it). Same copy-compile pattern as
+  # lisa-on-gpu's CMakeLists.txt uses for its own static archive.
+  add_custom_command(
+    OUTPUT "Interpolate.cxx"
+    COMMENT "Copy GBT's Interpolate.cu to Interpolate.cxx (for cgbgpu CPU)"
+    COMMAND ${CMAKE_COMMAND} -E copy "${GBT_CUTILS}/Interpolate.cu"
+            "${CMAKE_CURRENT_BINARY_DIR}/Interpolate.cxx"
+    DEPENDS "${GBT_CUTILS}/Interpolate.cu"
+    VERBATIM)
 endif()
 
 
@@ -270,12 +315,16 @@ if(GBGPU_WITH_CPU)
     gbgpu_utils.cxx
     SharedMemoryGBGPU.cxx
     gb_tdi_on_the_fly.cxx
-    lat_tdi_on_the_fly.cxx)
+    lat_tdi_on_the_fly.cxx
+    Interpolate.cxx)
   apply_cpu_backend_common_options(cgbgpu)
   target_include_directories(gbgpu_cpu_cgbgpu PRIVATE
-    "${LISATOOLS_CUTILS}"  # ReturnPointerBase + lisatools_header_abi.hpp + LAT Detector.hpp
-    "${GBT_CUTILS}"        # gbt_global.h, pybind11_cuda_array_interface.hpp
+    "${LISATOOLS_CUTILS}"        # ReturnPointerBase + lisatools_header_abi.hpp + LAT Detector.hpp
+    "${GBT_CUTILS}"              # gbt_global.h, pybind11_cuda_array_interface.hpp
+    "${GBT_LAPACKE_INCLUDE_DIR}" # lapacke.h (for Interpolate.cu's tridiagonal solver)
   )
+  target_link_libraries(gbgpu_cpu_cgbgpu PRIVATE
+    ${GBT_LAPACKE_LIBS} ${GBT_LAPACKE_EXTRA_LIBS})
   # NB: cuda_complex.hpp deliberately omitted -- pulled transitively via
   # ${GBT_CUTILS}/gbt_global.h (GPUBackendTools owns the canonical copy).
   target_sources(gbgpu_cpu_cgbgpu PUBLIC FILE_SET HEADERS FILES
@@ -300,6 +349,7 @@ if(GBGPU_WITH_GPU)
     binding_gbgpu.cxx
     "${LISATOOLS_CUTILS}/Detector.cu"
     "${LISATOOLS_CUTILS}/lat_tdi_on_the_fly.cu"
+    "${GBT_CUTILS}/Interpolate.cu"
     gbgpu_utils.cu
     SharedMemoryGBGPU.cu
     gb_tdi_on_the_fly.cu)
@@ -307,13 +357,15 @@ if(GBGPU_WITH_GPU)
   target_include_directories(gbgpu_gpu_cgbgpu PRIVATE
     "${LISATOOLS_CUTILS}"
     "${GBT_CUTILS}"
+    "${GBT_LAPACKE_INCLUDE_DIR}" # lapacke.h (for Interpolate.cu's tridiagonal solver)
   )
   set_property(TARGET gbgpu_gpu_cgbgpu PROPERTY CUDA_ARCHITECTURES ${GBGPU_CUDA_ARCH})
   set_property(TARGET gbgpu_gpu_cgbgpu PROPERTY CUDA_SEPARABLE_COMPILATION ON)
   set_property(TARGET gbgpu_gpu_cgbgpu PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   set_property(TARGET gbgpu_gpu_cgbgpu PROPERTY POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(gbgpu_gpu_cgbgpu PUBLIC CUDA::cudart CUDA::cublas
-      CUDA::cusparse mathdx::cufftdx)
+      CUDA::cusparse mathdx::cufftdx
+      ${GBT_LAPACKE_LIBS} ${GBT_LAPACKE_EXTRA_LIBS})
   # NB: cuda_complex.hpp deliberately omitted -- pulled transitively via
   # ${GBT_CUTILS}/gbt_global.h (GPUBackendTools owns the canonical copy).
   target_sources(gbgpu_gpu_cgbgpu PUBLIC FILE_SET HEADERS FILES

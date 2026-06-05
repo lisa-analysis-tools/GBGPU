@@ -32,12 +32,23 @@
                                  // SharedMemoryGenerateGlobal,
                                  // SharedMemoryFstatLikeComp
 
+// Phase 3L.7g (2026-06-04): GB TDIonTheFly + GBComputationGroup
+// arrived from lisa-on-gpu. The class declarations + kernel host wrappers
+// live in gb_tdi_on_the_fly.hh (also in this cutils dir).
+#include "gb_tdi_on_the_fly.hh"
+
 // LAT-canonical pybind11 base + array typedefs + Orbits + TDIConfig wrappers.
 // binding_flr.hpp provides ReturnPointerBase and array_type<T>; consuming TUs
 // MUST leave LISATOOLS_IS_WRAPPER_OWNER at its default (0) to satisfy the
 // per-TU static_assert (GBGPU never re-registers OrbitsWrap_responselisa et al).
 #include "lisatools_header_abi.hpp"
 #include "binding_flr.hpp"
+// Phase 3L.7g (2026-06-04): pybind11 Wrap base + dependent Wraps for the
+// new GBTDIonTheFlyWrap + GBComputationGroupWrap classes. WDMSettingsWrap +
+// FDDomainWrap + LISATDIonTheFlyWrap live in LAT (moved at Phase 3L.1-3L.6).
+#include "binding_wdm_settings.hpp"   // WDMSettingsWrap
+#include "binding_fd_domain.hpp"      // FDDomainWrap
+#include "binding_lat_spline_tdi.hpp" // LISATDIonTheFlyWrap (parent of GBTDIonTheFlyWrap)
 
 #include <string>
 #include <iostream>
@@ -48,8 +59,13 @@ namespace py = pybind11;
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
 #define GBGPUComputationWrap GBGPUComputationWrapGPU
+// Phase 3L.7g aliases: shipped from lisa-on-gpu's binding_tof.hpp.
+#define GBTDIonTheFlyWrap GBTDIonTheFlyWrapGPU
+#define GBComputationGroupWrap GBComputationGroupWrapGPU
 #else
 #define GBGPUComputationWrap GBGPUComputationWrapCPU
+#define GBTDIonTheFlyWrap GBTDIonTheFlyWrapCPU
+#define GBComputationGroupWrap GBComputationGroupWrapCPU
 #endif
 
 // Unified GBGPU pybind11 wrapper. Inherits from ReturnPointerBase so
@@ -400,6 +416,364 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             num_data, num_noise);
     }
 };
+
+// ============================================================================
+// Phase 3L.7g (2026-06-04): GB carve-out from lisa-on-gpu's binding_tof.hpp.
+//
+// `class GBTDIonTheFlyWrap` -- pybind11 wrapper around `GBTDIonTheFly`
+//   (declared in gb_tdi_on_the_fly.hh). Inherits from LAT-owned
+//   `LISATDIonTheFlyWrap` (binding_lat_spline_tdi.hpp). Methods:
+//   - `run_wave_tdi_wrap` : time-domain TDI per binary (dense rfft path).
+//   - `run_fd_wave_tdi_wrap` : sparse heterodyne FD TDI (v2 polyphase entry).
+//   - `get_buffer_size` / `get_fd_buffer_size`.
+//
+// `class GBComputationGroupWrap` -- pybind11 wrapper around
+//   `GBComputationGroup` (declared in gb_tdi_on_the_fly.hh). Hosts the
+//   FD chunked-likelihood, WDM-heterodyne chunked-likelihood, and signal-
+//   heterodyne (v2 polyphase) wraps.
+//
+// SOBBHTDIonTheFlyWrap + SOBBHComputationGroupWrap stay in lisa-on-gpu
+// until Phase 3L.8 moves them to BBHx.
+// ============================================================================
+
+class GBTDIonTheFlyWrap : public LISATDIonTheFlyWrap {
+  public:
+    GBTDIonTheFly *waveform;
+    double T;
+    double t_ref;
+
+    GBTDIonTheFlyWrap(OrbitsWrap_responselisa *orbits_, TDIConfigWrap *tdi_config_, double T_, double t_ref_): LISATDIonTheFlyWrap(orbits_, tdi_config_)
+    {
+        T = T_;
+        t_ref = t_ref_;
+        waveform = new GBTDIonTheFly(orbits_->orbits, tdi_config_->tdi_config, T_, t_ref_);
+    };
+    ~GBTDIonTheFlyWrap(){
+        delete waveform;
+    };
+
+    void run_wave_tdi_wrap(
+        array_type<std::complex<double>>tdi_channels_arr,
+        array_type<double>tdi_amp, array_type<double>tdi_phase, array_type<double>phi_ref,
+        array_type<double>params, array_type<double>t_arr, int N, int num_bin, int n_params, int nchannels
+    );
+
+    int get_buffer_size(int N){return waveform->get_gb_buffer_size(N);};
+
+    // Heterodyne FD GB on a sparse time grid. Builds the slow positive-freq
+    // signal in shared memory, FFTs it, and returns (num_bin, nchannels,
+    // N_sparse) complex doubles plus the per-source dense-bin index k_f0 and
+    // snapped carrier frequency f0_grid.
+    // tukey_alpha: scipy.signal.windows.tukey alpha applied to the slow
+    // signal before the in-place sparse FFT. Pass 0.05 (matching the dense
+    // rfft path) when chaining into the v2 polyphase signal-het consumer;
+    // 0.0 = rectangular reproduces pre-2026-06-03 behavior.
+    void run_fd_wave_tdi_wrap(
+        array_type<std::complex<double>> X_het,
+        array_type<int>    k_f0_out,
+        array_type<double> f0_grid_out,
+        array_type<double> params,
+        double t_start, double Tobs,
+        int N_sparse, int num_bin, int n_params, int nchannels,
+        double tukey_alpha);
+
+    int get_fd_buffer_size(int N_sparse, int nchannels){
+        return waveform->get_gb_fd_buffer_size(N_sparse, nchannels);
+    }
+};
+
+
+class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBase {
+  public:
+
+    // ---- FD analogs ---------------------------------------------------
+    void gb_fd_fill_global(
+        array_type<std::complex<double>> template_fill,
+        OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        FDDomainWrap *fd_wrap,
+        array_type<double> params_all, array_type<int> data_index_all,
+        array_type<double> factors_all,
+        int num_bin, int nparams, double T, double t_start, double t_ref,
+        int N_sparse, int nchannels);
+
+    void gb_fd_get_ll(
+        array_type<double> d_h_out, array_type<double> h_h_out,
+        OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        FDDomainWrap *fd_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        int num_bin, int nparams, double T, double t_start, double t_ref,
+        int N_sparse, int nchannels, int tdi_type);
+
+    void gb_fd_swap_ll(
+        array_type<double> d_h_add_out, array_type<double> d_h_remove_out,
+        array_type<double> add_add_out, array_type<double> remove_remove_out,
+        array_type<double> add_remove_out,
+        OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        FDDomainWrap *fd_wrap,
+        array_type<double> params_add_all, array_type<double> params_remove_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        int num_bin, int nparams, double T, double t_start, double t_ref,
+        int N_sparse, int nchannels, int tdi_type);
+
+    // Chain-rule parameter gradients of gb_fd_get_ll / gb_fd_swap_ll.
+    // param_eps[k] is the per-parameter central-FD step (length nparams);
+    // pass eps_k <= 0 to freeze parameter k.
+    void gb_fd_get_ll_grad(
+        array_type<double> grad_out,
+        OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        FDDomainWrap *fd_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        array_type<double> param_eps,
+        int num_bin, int nparams, double T, double t_start, double t_ref,
+        int N_sparse, int nchannels, int tdi_type);
+
+    void gb_fd_swap_ll_grad(
+        array_type<double> grad_add_out, array_type<double> grad_remove_out,
+        OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        FDDomainWrap *fd_wrap,
+        array_type<double> params_add_all, array_type<double> params_remove_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        array_type<double> param_eps_add, array_type<double> param_eps_remove,
+        int num_bin, int nparams, double T, double t_start, double t_ref,
+        int N_sparse, int nchannels, int tdi_type);
+
+    // ---- Chunked-heterodyne path (no lookup table) ----------------------
+    // Geometry arrays (chunk_t_starts, chunk_keep_lo, chunk_keep_hi,
+    // chunk_n_global_offset, wdm_window) are precomputed on the Python side
+    // by ``gb_wdm_het.compute_chunk_geometry`` / ``compute_wdm_window``.
+    // ``grid_dim`` is the CUDA launch grid size (chosen via
+    // ``chunked_het_grid_dim``); pass anything > 0 on CPU (ignored).
+    void gb_wdm_het_fill_global(
+        array_type<double> template_fill,
+        OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        WDMSettingsWrap *wdm_settings_wrap,
+        array_type<double> params_all, array_type<double> factors_all,
+        array_type<double> chunk_t_starts,
+        array_type<int> chunk_keep_lo, array_type<int> chunk_keep_hi,
+        array_type<int> chunk_n_global_offset,
+        array_type<double> wdm_window,
+        int n_chunks, int num_bin, int nparams,
+        int Nt_sub, int log2_Nt_sub,
+        int N_sparse, int log2_N_sparse,
+        int nchannels, int n_rfft_chunk,
+        double T_chunk, double dt, double T, double t_ref,
+        double tukey_alpha, int grid_dim, int N_cp_sig, int N_cp_orbit,
+        int m_band_half_width);
+
+    void gb_wdm_het_get_ll(
+        array_type<double> d_h_out, array_type<double> h_h_out,
+        OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        WDMSettingsWrap *wdm_settings_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        array_type<double> chunk_t_starts,
+        array_type<int> chunk_keep_lo, array_type<int> chunk_keep_hi,
+        array_type<int> chunk_n_global_offset,
+        array_type<double> wdm_window,
+        array_type<double> data_d, array_type<double> invC,
+        int n_chunks, int num_bin, int nparams,
+        int Nt_sub, int log2_Nt_sub,
+        int N_sparse, int log2_N_sparse,
+        int nchannels, int n_rfft_chunk,
+        double T_chunk, double dt, double T, double t_ref, int tdi_type,
+        double tukey_alpha, int grid_dim, int N_cp_sig, int N_cp_orbit,
+        array_type<int> binary_perm, array_type<int> group_starts, array_type<int> group_ends,
+        array_type<int> group_m_lo, array_type<int> group_m_hi, int n_groups,
+        int m_band_half_width);
+
+    void gb_wdm_het_swap_ll(
+        array_type<double> d_h_add_out, array_type<double> d_h_remove_out,
+        array_type<double> add_add_out, array_type<double> remove_remove_out,
+        array_type<double> add_remove_out,
+        OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        WDMSettingsWrap *wdm_settings_wrap,
+        array_type<double> params_add_all, array_type<double> params_remove_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        array_type<double> chunk_t_starts,
+        array_type<int> chunk_keep_lo, array_type<int> chunk_keep_hi,
+        array_type<int> chunk_n_global_offset,
+        array_type<double> wdm_window,
+        array_type<double> data_d, array_type<double> invC,
+        int n_chunks, int num_bin, int nparams,
+        int Nt_sub, int log2_Nt_sub,
+        int N_sparse, int log2_N_sparse,
+        int nchannels, int n_rfft_chunk,
+        double T_chunk, double dt, double T, double t_ref, int tdi_type,
+        double tukey_alpha, int grid_dim, int N_cp_sig, int N_cp_orbit,
+        array_type<int> binary_perm, array_type<int> group_starts, array_type<int> group_ends,
+        array_type<int> group_m_lo, array_type<int> group_m_hi, int n_groups,
+        array_type<int> pair_m_lo_b, array_type<int> pair_m_hi_b,
+        int m_band_half_width);
+
+    void gb_wdm_het_get_fstat_ll(
+        array_type<double> N_arr_re_out, array_type<double> N_arr_im_out,
+        array_type<double> M_mat_re_out, array_type<double> M_mat_im_out,
+        OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        WDMSettingsWrap *wdm_settings_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        array_type<double> chunk_t_starts,
+        array_type<int> chunk_keep_lo, array_type<int> chunk_keep_hi,
+        array_type<int> chunk_n_global_offset,
+        array_type<double> wdm_window,
+        array_type<double> data_d, array_type<double> invC,
+        int n_chunks, int num_bin, int nparams,
+        int Nt_sub, int log2_Nt_sub,
+        int N_sparse, int log2_N_sparse,
+        int nchannels, int n_rfft_chunk,
+        double T_chunk, double dt, double T, double t_ref, int tdi_type,
+        double tukey_alpha, int grid_dim, int m_band_half_width);
+
+    // Signal-heterodyne (v2 polyphase) -- Stage 1 (CPU-only):
+    // takes precomputed rfft(Tukey * td_cand) as input. Production will move
+    // FD generation into the kernel via a sparse-spline absolute-FD source
+    // (Stage 2 -- GBAbsoluteFD; ~256-1024 knots/year, no per-source global FD).
+    void gb_signal_het_get_ll(
+        array_type<double> d_h_out, array_type<double> h_h_out,
+        array_type<std::complex<double>> fd_rfft_all,
+        array_type<std::complex<double>> c0_sparse_all,
+        array_type<std::complex<double>> A0_all,
+        array_type<std::complex<double>> A1_all,
+        array_type<std::complex<double>> B0_all,
+        array_type<std::complex<double>> B1_all,
+        array_type<double> wdm_window,
+        array_type<int> n_sparse_local_arr,
+        array_type<double> params_cand_all,
+        array_type<double> params_ref_all,
+        array_type<int> data_index_all,
+        int num_bin, int num_data,
+        int nparams, int f0_idx, int fdot_idx,
+        int Nf, int Nt, int Nf_active, int Nt_active,
+        int Nt_layer, int N_sparse_t, int stride,
+        int ind_min_t, int ind_min_f,
+        int m_active_half_width,
+        double layer_df, double dt,
+        int nchannels, int tdi_type,
+        int n_rfft, double max_r);
+
+    // Stage 2a -- sparse-FD entry: consumes X_het (length N_sparse_fd per
+    // binary per channel) + per-binary k_f0 instead of the dense rfft.
+    // The polyphase fold iterates only the N_sparse_fd bins (the source's
+    // intrinsic spectral support around f0).
+    void gb_signal_het_get_ll_sparse(
+        array_type<double> d_h_out, array_type<double> h_h_out,
+        array_type<std::complex<double>> X_het_all,
+        array_type<int> k_f0_all,
+        array_type<std::complex<double>> c0_sparse_all,
+        array_type<std::complex<double>> A0_all,
+        array_type<std::complex<double>> A1_all,
+        array_type<std::complex<double>> B0_all,
+        array_type<std::complex<double>> B1_all,
+        array_type<double> wdm_window,
+        array_type<int> n_sparse_local_arr,
+        array_type<double> params_cand_all,
+        array_type<double> params_ref_all,
+        array_type<int> data_index_all,
+        int num_bin, int num_data,
+        int nparams, int f0_idx, int fdot_idx,
+        int Nf, int Nt, int Nf_active, int Nt_active,
+        int Nt_layer, int N_sparse_t, int stride,
+        int ind_min_t, int ind_min_f,
+        int m_active_half_width,
+        double layer_df, double dt,
+        int nchannels, int tdi_type,
+        int N_sparse_fd, double max_r);
+
+    // Stage 2b -- in-kernel sparse-FD signal-het. Fuses gb_run_fd_wave_tdi
+    // with polyphase + bin-fold using a transient buffer for X_het (no
+    // per-source FD storage in global memory). Takes a GBTDIonTheFlyWrap*
+    // and unboxes to the underlying GBTDIonTheFly pointer internally.
+    // tukey_alpha: Python pushes the same alpha used on the dense
+    // rfft(Tukey*td) side so the sparse-FD heterodyne windowing matches.
+    void gb_signal_het_get_ll_in_kernel(
+        GBTDIonTheFlyWrap *tdi_wrap,
+        array_type<double> d_h_out, array_type<double> h_h_out,
+        array_type<std::complex<double>> c0_sparse_all,
+        array_type<std::complex<double>> A0_all,
+        array_type<std::complex<double>> A1_all,
+        array_type<std::complex<double>> B0_all,
+        array_type<std::complex<double>> B1_all,
+        array_type<double> wdm_window,
+        array_type<int> n_sparse_local_arr,
+        array_type<double> params_cand_all,
+        array_type<double> params_ref_all,
+        array_type<int> data_index_all,
+        int num_bin, int num_data,
+        int nparams, int f0_idx, int fdot_idx,
+        int Nf, int Nt, int Nf_active, int Nt_active,
+        int Nt_layer, int N_sparse_t, int stride,
+        int ind_min_t, int ind_min_f,
+        int m_active_half_width,
+        double layer_df, double dt,
+        double T_obs, double t_start,
+        int nchannels, int tdi_type,
+        int N_sparse_fd, double tukey_alpha, double max_r);
+
+    // Signal-het fill_global. Reuses Stage 2b's FD + polyphase machinery to
+    // build r at sparse n, then linear-interpolates r to the dense WDM
+    // time grid, re-rotates the carrier, multiplies by the stored full
+    // c0_dense_complex on the active band, takes Re, and scatters into the
+    // (num_data, nchannels, Nf, Nt) template_fill buffer. factors_all
+    // scales each binary's contribution; data_index_all routes each binary
+    // to a template slab. tukey_alpha is required, no default -- pass the
+    // value used to window the dense rfft on the analysis side.
+    void gb_signal_het_fill_global_in_kernel(
+        GBTDIonTheFlyWrap *tdi_wrap,
+        array_type<double> template_fill,
+        array_type<std::complex<double>> c0_sparse_all,
+        array_type<std::complex<double>> c0_dense_complex_all,
+        array_type<double> wdm_window,
+        array_type<int> n_sparse_local_arr,
+        array_type<double> params_cand_all,
+        array_type<double> params_ref_all,
+        array_type<double> factors_all,
+        array_type<int> data_index_all,
+        int num_bin, int num_data,
+        int nparams, int f0_idx, int fdot_idx,
+        int Nf, int Nt, int Nf_active, int Nt_active,
+        int Nt_layer, int N_sparse_t, int stride,
+        int ind_min_t, int ind_min_f,
+        int m_active_half_width,
+        double layer_df, double dt,
+        double T_obs, double t_start,
+        int nchannels,
+        int N_sparse_fd, double tukey_alpha, double max_r);
+
+    // Signal-het central-difference gradient of logL = d_h - 0.5*h_h. Per
+    // binary, performs 1 central + 2*nparams perturbed get_ll_in_kernel
+    // evaluations. grad_out is (num_bin, nparams); d_h_central /
+    // h_h_central are (num_bin,) and report the central evaluation so the
+    // caller gets logL alongside the gradient in one pass. param_eps[k] <=
+    // 0 freezes dimension k.
+    void gb_signal_het_get_ll_grad_in_kernel(
+        GBTDIonTheFlyWrap *tdi_wrap,
+        array_type<double> grad_out,
+        array_type<double> d_h_central, array_type<double> h_h_central,
+        array_type<std::complex<double>> c0_sparse_all,
+        array_type<std::complex<double>> A0_all,
+        array_type<std::complex<double>> A1_all,
+        array_type<std::complex<double>> B0_all,
+        array_type<std::complex<double>> B1_all,
+        array_type<double> wdm_window,
+        array_type<int> n_sparse_local_arr,
+        array_type<double> params_cand_all,
+        array_type<double> params_ref_all,
+        array_type<int> data_index_all,
+        array_type<double> param_eps,
+        int num_bin, int num_data,
+        int nparams, int f0_idx, int fdot_idx,
+        int Nf, int Nt, int Nf_active, int Nt_active,
+        int Nt_layer, int N_sparse_t, int stride,
+        int ind_min_t, int ind_min_f,
+        int m_active_half_width,
+        double layer_df, double dt,
+        double T_obs, double t_start,
+        int nchannels, int tdi_type,
+        int N_sparse_fd, double tukey_alpha, double max_r);
+};
+
 
 // Module entry called from PYBIND11_MODULE(cgbgpu, m) in binding_gbgpu.cxx.
 void gbgpu_part(py::module &m);
