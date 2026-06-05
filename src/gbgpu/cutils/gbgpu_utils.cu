@@ -11,10 +11,15 @@
 
 #define NUM_THREADS 256
 
-// Add functionality for proper summation in the kernel
+// Add functionality for proper summation in the kernel.
+// `static inline` gives this internal linkage so it doesn't clash with
+// the identical definition in SharedMemoryGBGPU.cu when both compile
+// into the same cgbgpu .so under CUDA_SEPARABLE_COMPILATION (nvlink
+// otherwise errors with "Multiple definition of '_Z15atomicAddDoublePdd'").
+// Same pattern already used for `atomicAddComplex` below.
 #ifdef __CUDACC__
 CUDA_DEVICE
-double atomicAddDouble(double *address, double val)
+static inline double atomicAddDouble(double *address, double val)
 {
     unsigned long long *address_as_ull =
         (unsigned long long *)address;
