@@ -15,8 +15,17 @@ import numpy as np
 from lisatools.detector import EqualArmlengthOrbits, Orbits
 from lisatools.domains import WDMSettings
 from lisatools.response.directresponse import ecliptic_to_icrs
-from lisatools.response.parallelbase import FastLISAResponseParallelModule
 from lisatools.response.tdiconfig import TDIConfig
+
+# Phase 3L.7k (2026-06-04): GBWDMComputations / GBFDComputations
+# dispatch through gbgpu's own ParallelModule (prefix gbgpu_) instead
+# of fastlisaresponse / lisatools because they need the GB-specific
+# Wraps (GBTDIonTheFlyWrap, GBComputationGroupWrap) that only the
+# gbgpu_<flavor> composed backend carries. The historical
+# `FastLISAResponseParallelModule` name is kept as an alias inside this
+# file so the existing `class GBWDMComputations(FastLISAResponseParallelModule)`
+# usage below works without further edits.
+from .parallelbase import GBGPUParallelModule as FastLISAResponseParallelModule
 
 from .wdm_het import (
     USE_RECOMMENDED_TUKEY,
@@ -243,7 +252,7 @@ class GBWDMComputations(FastLISAResponseParallelModule):
         # GPU_RECOMMENDED_WITH_JAX appends 'jax' to the CPU/GPU options
         # so this class can dispatch to the pure JAX backend in
         # fastlisaresponse.jax via force_backend='jax'.
-        return ["fastlisaresponse_" + _tmp for _tmp in cls.GPU_RECOMMENDED_WITH_JAX()]
+        return ["gbgpu_" + _tmp for _tmp in cls.GPU_RECOMMENDED_WITH_JAX()]
 
     # ------------------------------------------------------------------
     # Backend dispatch helpers
@@ -364,7 +373,7 @@ class GBWDMComputations(FastLISAResponseParallelModule):
 
         # JAX backend's wrap mutates host (numpy) buffers since jnp
         # arrays are immutable.
-        if self.backend.name == "fastlisaresponse_jax":
+        if self.backend.name == "gbgpu_jax":
             d_h_out = np.zeros(num_bin)
             h_h_out = np.zeros(num_bin)
         else:
@@ -455,7 +464,7 @@ class GBWDMComputations(FastLISAResponseParallelModule):
                 p_tmp[:, -2] = lam
                 p_tmp[:, -1] = beta
 
-        if self.backend.name == "fastlisaresponse_jax":
+        if self.backend.name == "gbgpu_jax":
             d_h_a = np.zeros(num_bin); d_h_r = np.zeros(num_bin)
             aa    = np.zeros(num_bin); rr    = np.zeros(num_bin)
             ar    = np.zeros(num_bin)
@@ -583,7 +592,7 @@ class GBWDMComputations(FastLISAResponseParallelModule):
         else:
             groups = self._empty_groups(num_bin)
 
-        if self.backend.name == "fastlisaresponse_jax":
+        if self.backend.name == "gbgpu_jax":
             grad_out = np.zeros(num_bin * nparams, dtype=np.float64)
         else:
             grad_out = self.xp.zeros(num_bin * nparams, dtype=self.xp.float64)
@@ -662,7 +671,7 @@ class GBWDMComputations(FastLISAResponseParallelModule):
         else:
             groups = self._empty_swap_groups(num_bin)
 
-        if self.backend.name == "fastlisaresponse_jax":
+        if self.backend.name == "gbgpu_jax":
             grad_add_out    = np.zeros(num_bin * nparams, dtype=np.float64)
             grad_remove_out = np.zeros(num_bin * nparams, dtype=np.float64)
         else:
@@ -736,7 +745,7 @@ class GBWDMComputations(FastLISAResponseParallelModule):
             grid_dim: CUDA launch grid size (use 0 to default to
                 ``n_chunks``).
         """
-        if self.backend.name == "fastlisaresponse_jax":
+        if self.backend.name == "gbgpu_jax":
             assert isinstance(templates, np.ndarray), (
                 "On the JAX backend, ``templates`` must be a numpy "
                 "ndarray (not jnp.ndarray). The kernel writes back to "
@@ -864,7 +873,7 @@ class GBWDMComputations(FastLISAResponseParallelModule):
             params_tmp[:, -1] = beta
 
         # Outputs (kernel writes both re + im; we drop im since WDM is real).
-        if self.backend.name == "fastlisaresponse_jax":
+        if self.backend.name == "gbgpu_jax":
             N_re = np.zeros((num_bin, 4))
             N_im = np.zeros((num_bin, 4))
             M_re = np.zeros((num_bin, 10))
@@ -1054,7 +1063,7 @@ class GBFDComputations(FastLISAResponseParallelModule):
 
     @classmethod
     def supported_backends(cls):
-        return ["fastlisaresponse_" + _t for _t in cls.GPU_RECOMMENDED()]
+        return ["gbgpu_" + _t for _t in cls.GPU_RECOMMENDED()]
 
     def _prep_params(self, params, convert_to_ra_dec):
         p = self.xp.asarray(self.xp.atleast_2d(params)).copy()

@@ -69,13 +69,24 @@ def get_cmake_module_path() -> str:
 from . import cutils, utils
 
 from gpubackendtools import Globals
-from .cutils import GBGPUCpuBackend, GBGPUCuda11xBackend, GBGPUCuda12xBackend
+from .cutils import (
+    GBGPUCpuBackend,
+    GBGPUCuda11xBackend,
+    GBGPUCuda12xBackend,
+    GBGPUCuda13xBackend,
+)
 
 
+# Phase 3L.7k (2026-06-04): GBGPU's backends now compose LAT's
+# LISAToolsBackend surface with GB-specific Wraps. The previous
+# fastlisaresponse_<flavor> backend family (lisa-on-gpu) is being
+# retired and consumers can use these directly via
+# ``gbgpu.get_backend(...)``.
 add_backends = {
     "gbgpu_cpu": GBGPUCpuBackend,
     "gbgpu_cuda11x": GBGPUCuda11xBackend,
     "gbgpu_cuda12x": GBGPUCuda12xBackend,
+    "gbgpu_cuda13x": GBGPUCuda13xBackend,
 }
 
 Globals().backends_manager.add_backends(add_backends)
