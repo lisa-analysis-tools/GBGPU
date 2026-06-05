@@ -7,7 +7,6 @@
 #include "binding_gbgpu.hpp"
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
-#include "pybind11_cuda_array_interface.hpp"
 #endif
 
 // Single-registrant rule: this TU must not be marked as the wrapper owner.
@@ -748,13 +747,13 @@ void GBComputationGroupWrap::gb_signal_het_get_ll_grad_in_kernel(
 }
 
 
-void gbgpu_part(py::module &m) {
+void gbgpu_part(nb::module_ &m) {
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
-    py::class_<GBGPUComputationWrap>(m, "GBGPUComputationWrapGPU")
+    nb::class_<GBGPUComputationWrap>(m, "GBGPUComputationWrapGPU")
 #else
-    py::class_<GBGPUComputationWrap>(m, "GBGPUComputationWrapCPU")
+    nb::class_<GBGPUComputationWrap>(m, "GBGPUComputationWrapCPU")
 #endif
-        .def(py::init<>())
+        .def(nb::init<>())
         // gbgpu_utils.hh (migrated from gbgpu_utils_wrap.pyx)
         .def("get_ll", &GBGPUComputationWrap::get_ll,
              "Compute <d|h> and <h|h> per-binary.")
@@ -791,44 +790,44 @@ void gbgpu_part(py::module &m) {
     // ========================================================================
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
-    py::class_<GBTDIonTheFlyWrap>(m, "GBTDIonTheFlyWrapGPU")
+    nb::class_<GBTDIonTheFlyWrap>(m, "GBTDIonTheFlyWrapGPU")
 #else
-    py::class_<GBTDIonTheFlyWrap>(m, "GBTDIonTheFlyWrapCPU")
+    nb::class_<GBTDIonTheFlyWrap>(m, "GBTDIonTheFlyWrapCPU")
 #endif
-    .def(py::init<OrbitsWrap_responselisa *, TDIConfigWrap *, double, double>(),
-         py::arg("orbits"), py::arg("tdi_config"), py::arg("Tobs"), py::arg("t_ref"))
+    .def(nb::init<OrbitsWrap_responselisa *, TDIConfigWrap *, double, double>(),
+         nb::arg("orbits"), nb::arg("tdi_config"), nb::arg("Tobs"), nb::arg("t_ref"))
     .def("run_wave_tdi_wrap", &GBTDIonTheFlyWrap::run_wave_tdi_wrap, "Preform TDI combinations.")
     .def("run_fd_wave_tdi_wrap", &GBTDIonTheFlyWrap::run_fd_wave_tdi_wrap,
          "Heterodyne FD GB TDI on a sparse time grid. tukey_alpha applies a "
          "scipy.signal.windows.tukey(N_sparse, alpha) taper to the slow "
          "signal before the in-place FFT; pass the same alpha used on the "
          "dense rfft(Tukey*td) side so the two FD paths agree.",
-         py::arg("X_het"), py::arg("k_f0_out"), py::arg("f0_grid_out"),
-         py::arg("params"), py::arg("t_start"), py::arg("Tobs"),
-         py::arg("N_sparse"), py::arg("num_bin"), py::arg("n_params"),
-         py::arg("nchannels"), py::arg("tukey_alpha") = 0.0)
+         nb::arg("X_het"), nb::arg("k_f0_out"), nb::arg("f0_grid_out"),
+         nb::arg("params"), nb::arg("t_start"), nb::arg("Tobs"),
+         nb::arg("N_sparse"), nb::arg("num_bin"), nb::arg("n_params"),
+         nb::arg("nchannels"), nb::arg("tukey_alpha") = 0.0)
     .def("get_buffer_size", &GBTDIonTheFlyWrap::get_buffer_size, "Get needed buffer size.")
     .def("get_fd_buffer_size", &GBTDIonTheFlyWrap::get_fd_buffer_size,
          "Get shared-memory size for the heterodyne FD kernel.")
-    .def_readwrite("orbits", &GBTDIonTheFlyWrap::orbits)
-    .def_readwrite("tdi_config", &GBTDIonTheFlyWrap::tdi_config)
+    .def_rw("orbits", &GBTDIonTheFlyWrap::orbits)
+    .def_rw("tdi_config", &GBTDIonTheFlyWrap::tdi_config)
     ;
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
-    py::class_<GBTDIonTheFly>(m, "GBTDIonTheFlyGPU")
+    nb::class_<GBTDIonTheFly>(m, "GBTDIonTheFlyGPU")
 #else
-    py::class_<GBTDIonTheFly>(m, "GBTDIonTheFlyCPU")
+    nb::class_<GBTDIonTheFly>(m, "GBTDIonTheFlyCPU")
 #endif
-    .def(py::init<Orbits *, TDIConfig*, double, double>(),
-         py::arg("orbits"), py::arg("tdi_config"), py::arg("Tobs"), py::arg("t_ref"))
+    .def(nb::init<Orbits *, TDIConfig*, double, double>(),
+         nb::arg("orbits"), nb::arg("tdi_config"), nb::arg("Tobs"), nb::arg("t_ref"))
     ;
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
-    py::class_<GBComputationGroupWrap>(m, "GBComputationGroupWrapGPU")
+    nb::class_<GBComputationGroupWrap>(m, "GBComputationGroupWrapGPU")
 #else
-    py::class_<GBComputationGroupWrap>(m, "GBComputationGroupWrapCPU")
+    nb::class_<GBComputationGroupWrap>(m, "GBComputationGroupWrapCPU")
 #endif
-    .def(py::init<>())
+    .def(nb::init<>())
     .def("gb_fd_fill_global", &GBComputationGroupWrap::gb_fd_fill_global,
          "FD analog of gb_wdm_fill_global: scatter per-source heterodyne FD onto a "
          "global rfft-grid template (cmplx, shape (num_data, nchannels, n_rfft)).")
@@ -914,7 +913,7 @@ void gbgpu_part(py::module &m) {
 }
 
 
-PYBIND11_MODULE(cgbgpu, m) {
+NB_MODULE(cgbgpu, m) {
     m.doc() = "GBGPU pybind11 backend. Hosts the GB-specific waveform + "
               "utils wrappers (gbgpu_utils / SharedMemoryGBGPU) plus the "
               "GBTDIonTheFly + GBComputationGroup machinery carved out of "

@@ -309,7 +309,7 @@ if(GBGPU_WITH_CPU)
   # cgbgpu CPU build: one .so per backend wheel containing the pybind11
   # binding + gbgpu_utils + SharedMemoryGBGPU + LAT's Detector +
   # (Phase 3L.7d) GBTDIonTheFly bodies + LAT's LISATDIonTheFly typeinfo.
-  pybind11_add_module(gbgpu_cpu_cgbgpu
+  nanobind_add_module(gbgpu_cpu_cgbgpu
     binding_gbgpu.cxx
     Detector.cxx
     gbgpu_utils.cxx
@@ -345,7 +345,7 @@ if(GBGPU_WITH_GPU)
   # so the LISATDIonTheFly virtual-class typeinfo lives in cgbgpu's
   # .so (same pattern as lisa-on-gpu's tdionthefly module since
   # Phase 3L.5).
-  pybind11_add_module(gbgpu_gpu_cgbgpu
+  nanobind_add_module(gbgpu_gpu_cgbgpu
     binding_gbgpu.cxx
     "${LISATOOLS_CUTILS}/Detector.cu"
     "${LISATOOLS_CUTILS}/lat_tdi_on_the_fly.cu"

@@ -52,10 +52,11 @@
 
 #include <string>
 #include <iostream>
-#include <pybind11/pybind11.h>
-#include <pybind11/numpy.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
+#include <nanobind/stl/string.h>
 
-namespace py = pybind11;
+namespace nb = nanobind;
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
 #define GBGPUComputationWrap GBGPUComputationWrapGPU
@@ -775,7 +776,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
 };
 
 
-// Module entry called from PYBIND11_MODULE(cgbgpu, m) in binding_gbgpu.cxx.
-void gbgpu_part(py::module &m);
+// Module entry called from NB_MODULE(cgbgpu, m) in binding_gbgpu.cxx.
+void gbgpu_part(nb::module_ &m);
 
 #endif // __BINDING_GBGPU_HPP__
