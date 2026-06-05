@@ -302,8 +302,8 @@ endif()
 # ships an empty GBGPUComputationWrap; subsequent commits populate it.
 # The single-registrant rule is enforced via
 # static_assert(!LISATOOLS_IS_WRAPPER_OWNER) in binding_gbgpu.cxx --
-# GBGPU must NOT register OrbitsWrap_responselisa, TDIConfigWrap,
-# LISAResponseWrap, WDM*/FD*/Spline* (those are LAT's).
+# GBGPU must NOT register OrbitsWrap, TDIConfigWrap, LISAResponseWrap,
+# WDM*/FD*/Spline* (those are LAT's).
 
 if(GBGPU_WITH_CPU)
   # cgbgpu CPU build: one .so per backend wheel containing the pybind11

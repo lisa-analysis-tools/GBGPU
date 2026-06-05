@@ -9,7 +9,7 @@
 // Phase-3L LAT setup.
 //
 // LAT is the sole pybind11 registrant of the shared wrapper family
-// (OrbitsWrap_responselisa, TDIConfigWrap, LISAResponseWrap, the
+// (OrbitsWrap, TDIConfigWrap, LISAResponseWrap, the
 // LISATDIonTheFly base, and FD/WDM/Spline Wraps). This TU consumes
 // those via `#include "binding_flr.hpp"`. The single-registrant rule
 // is enforced via `static_assert(!LISATOOLS_IS_WRAPPER_OWNER, ...)` in
@@ -40,7 +40,7 @@
 // LAT-canonical pybind11 base + array typedefs + Orbits + TDIConfig wrappers.
 // binding_flr.hpp provides ReturnPointerBase and array_type<T>; consuming TUs
 // MUST leave LISATOOLS_IS_WRAPPER_OWNER at its default (0) to satisfy the
-// per-TU static_assert (GBGPU never re-registers OrbitsWrap_responselisa et al).
+// per-TU static_assert (GBGPU never re-registers OrbitsWrap et al).
 #include "lisatools_header_abi.hpp"
 #include "binding_flr.hpp"
 // Phase 3L.7g (2026-06-04): pybind11 Wrap base + dependent Wraps for the
@@ -443,7 +443,7 @@ class GBTDIonTheFlyWrap : public LISATDIonTheFlyWrap {
     double T;
     double t_ref;
 
-    GBTDIonTheFlyWrap(OrbitsWrap_responselisa *orbits_, TDIConfigWrap *tdi_config_, double T_, double t_ref_): LISATDIonTheFlyWrap(orbits_, tdi_config_)
+    GBTDIonTheFlyWrap(OrbitsWrap *orbits_, TDIConfigWrap *tdi_config_, double T_, double t_ref_): LISATDIonTheFlyWrap(orbits_, tdi_config_)
     {
         T = T_;
         t_ref = t_ref_;
@@ -490,7 +490,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
     // ---- FD analogs ---------------------------------------------------
     void gb_fd_fill_global(
         array_type<std::complex<double>> template_fill,
-        OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        OrbitsWrap* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
         FDDomainWrap *fd_wrap,
         array_type<double> params_all, array_type<int> data_index_all,
         array_type<double> factors_all,
@@ -499,7 +499,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
 
     void gb_fd_get_ll(
         array_type<double> d_h_out, array_type<double> h_h_out,
-        OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        OrbitsWrap* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
         FDDomainWrap *fd_wrap,
         array_type<double> params_all,
         array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -510,7 +510,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<double> d_h_add_out, array_type<double> d_h_remove_out,
         array_type<double> add_add_out, array_type<double> remove_remove_out,
         array_type<double> add_remove_out,
-        OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        OrbitsWrap* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
         FDDomainWrap *fd_wrap,
         array_type<double> params_add_all, array_type<double> params_remove_all,
         array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -522,7 +522,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
     // pass eps_k <= 0 to freeze parameter k.
     void gb_fd_get_ll_grad(
         array_type<double> grad_out,
-        OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        OrbitsWrap* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
         FDDomainWrap *fd_wrap,
         array_type<double> params_all,
         array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -532,7 +532,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
 
     void gb_fd_swap_ll_grad(
         array_type<double> grad_add_out, array_type<double> grad_remove_out,
-        OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        OrbitsWrap* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
         FDDomainWrap *fd_wrap,
         array_type<double> params_add_all, array_type<double> params_remove_all,
         array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -548,7 +548,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
     // ``chunked_het_grid_dim``); pass anything > 0 on CPU (ignored).
     void gb_wdm_het_fill_global(
         array_type<double> template_fill,
-        OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
         WDMSettingsWrap *wdm_settings_wrap,
         array_type<double> params_all, array_type<double> factors_all,
         array_type<double> chunk_t_starts,
@@ -565,7 +565,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
 
     void gb_wdm_het_get_ll(
         array_type<double> d_h_out, array_type<double> h_h_out,
-        OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
         WDMSettingsWrap *wdm_settings_wrap,
         array_type<double> params_all,
         array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -588,7 +588,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<double> d_h_add_out, array_type<double> d_h_remove_out,
         array_type<double> add_add_out, array_type<double> remove_remove_out,
         array_type<double> add_remove_out,
-        OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
         WDMSettingsWrap *wdm_settings_wrap,
         array_type<double> params_add_all, array_type<double> params_remove_all,
         array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -611,7 +611,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
     void gb_wdm_het_get_fstat_ll(
         array_type<double> N_arr_re_out, array_type<double> N_arr_im_out,
         array_type<double> M_mat_re_out, array_type<double> M_mat_im_out,
-        OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
         WDMSettingsWrap *wdm_settings_wrap,
         array_type<double> params_all,
         array_type<int> data_index_all, array_type<int> noise_index_all,

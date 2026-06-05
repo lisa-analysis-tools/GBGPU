@@ -69,9 +69,8 @@ class GBGPUBackend(LISAToolsBackend):
     Inherits :class:`lisatools.cutils.LISAToolsBackend` so concrete
     GBGPU backends expose every LAT native symbol (OrbitsWrap,
     TDIConfigWrap, WDM/FD/Spline wraps, TDITypeDict) plus the
-    GB-specific Wraps. Consumer code can do
-    ``self.backend.OrbitsWrap_responselisa`` and
-    ``self.backend.GBTDIonTheFlyWrap`` on the same object.
+    GB-specific Wraps. Consumer code can do ``self.backend.OrbitsWrap``
+    and ``self.backend.GBTDIonTheFlyWrap`` on the same object.
     """
 
     GBTDIonTheFlyWrap: object
@@ -111,7 +110,6 @@ def _lat_methods_from_pycppdetector(_lat_pd, *, gpu: bool, xp):
         "FDSplineTDIWaveformWrap": getattr(_lat_pd, f"FDSplineTDIWaveformWrap{suffix}"),
         "LISAResponseWrap": getattr(_lat_pd, f"LISAResponseWrap{suffix}"),
         "LISAResponse": getattr(_lat_pd, f"LISAResponse{suffix}"),
-        "OrbitsWrap_responselisa": getattr(_lat_pd, f"OrbitsWrap{suffix}_responselisa"),
         "TDIConfigWrap": getattr(_lat_pd, f"TDIConfigWrap{suffix}"),
         "TDIConfig": getattr(_lat_pd, f"TDIConfig{suffix}"),
         "CubicSplineWrap_responselisa": getattr(_lat_pd, f"CubicSplineWrap{suffix}_responselisa"),

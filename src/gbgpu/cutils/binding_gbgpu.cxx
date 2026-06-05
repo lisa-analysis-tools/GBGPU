@@ -78,7 +78,7 @@ void GBTDIonTheFlyWrap::run_fd_wave_tdi_wrap(
 
 void GBComputationGroupWrap::gb_fd_fill_global(
     array_type<std::complex<double>> template_fill,
-    OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+    OrbitsWrap* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
     FDDomainWrap *fd_wrap,
     array_type<double> params_all, array_type<int> data_index_all,
     array_type<double> factors_all,
@@ -99,7 +99,7 @@ void GBComputationGroupWrap::gb_fd_fill_global(
 
 void GBComputationGroupWrap::gb_fd_get_ll(
     array_type<double> d_h_out, array_type<double> h_h_out,
-    OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+    OrbitsWrap* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
     FDDomainWrap *fd_wrap,
     array_type<double> params_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -120,7 +120,7 @@ void GBComputationGroupWrap::gb_fd_swap_ll(
     array_type<double> d_h_add_out, array_type<double> d_h_remove_out,
     array_type<double> add_add_out, array_type<double> remove_remove_out,
     array_type<double> add_remove_out,
-    OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+    OrbitsWrap* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
     FDDomainWrap *fd_wrap,
     array_type<double> params_add_all, array_type<double> params_remove_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -143,7 +143,7 @@ void GBComputationGroupWrap::gb_fd_swap_ll(
 
 void GBComputationGroupWrap::gb_fd_get_ll_grad(
     array_type<double> grad_out,
-    OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+    OrbitsWrap* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
     FDDomainWrap *fd_wrap,
     array_type<double> params_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -163,7 +163,7 @@ void GBComputationGroupWrap::gb_fd_get_ll_grad(
 
 void GBComputationGroupWrap::gb_fd_swap_ll_grad(
     array_type<double> grad_add_out, array_type<double> grad_remove_out,
-    OrbitsWrap_responselisa* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+    OrbitsWrap* orbits_wrap, TDIConfigWrap *tdi_config_wrap,
     FDDomainWrap *fd_wrap,
     array_type<double> params_add_all, array_type<double> params_remove_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -194,7 +194,7 @@ void GBComputationGroupWrap::gb_fd_swap_ll_grad(
 
 void GBComputationGroupWrap::gb_wdm_het_fill_global(
     array_type<double> template_fill,
-    OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+    OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
     WDMSettingsWrap *wdm_settings_wrap,
     array_type<double> params_all, array_type<double> factors_all,
     array_type<double> chunk_t_starts,
@@ -233,7 +233,7 @@ void GBComputationGroupWrap::gb_wdm_het_fill_global(
 
 void GBComputationGroupWrap::gb_wdm_het_get_ll(
     array_type<double> d_h_out, array_type<double> h_h_out,
-    OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+    OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
     WDMSettingsWrap *wdm_settings_wrap,
     array_type<double> params_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -294,7 +294,7 @@ void GBComputationGroupWrap::gb_wdm_het_swap_ll(
     array_type<double> d_h_add_out, array_type<double> d_h_remove_out,
     array_type<double> add_add_out, array_type<double> remove_remove_out,
     array_type<double> add_remove_out,
-    OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+    OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
     WDMSettingsWrap *wdm_settings_wrap,
     array_type<double> params_add_all, array_type<double> params_remove_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -362,7 +362,7 @@ void GBComputationGroupWrap::gb_wdm_het_swap_ll(
 void GBComputationGroupWrap::gb_wdm_het_get_fstat_ll(
     array_type<double> N_arr_re_out, array_type<double> N_arr_im_out,
     array_type<double> M_mat_re_out, array_type<double> M_mat_im_out,
-    OrbitsWrap_responselisa *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+    OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
     WDMSettingsWrap *wdm_settings_wrap,
     array_type<double> params_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
@@ -794,7 +794,7 @@ void gbgpu_part(nb::module_ &m) {
 #else
     nb::class_<GBTDIonTheFlyWrap>(m, "GBTDIonTheFlyWrapCPU")
 #endif
-    .def(nb::init<OrbitsWrap_responselisa *, TDIConfigWrap *, double, double>(),
+    .def(nb::init<OrbitsWrap *, TDIConfigWrap *, double, double>(),
          nb::arg("orbits"), nb::arg("tdi_config"), nb::arg("Tobs"), nb::arg("t_ref"))
     .def("run_wave_tdi_wrap", &GBTDIonTheFlyWrap::run_wave_tdi_wrap, "Preform TDI combinations.")
     .def("run_fd_wave_tdi_wrap", &GBTDIonTheFlyWrap::run_fd_wave_tdi_wrap,
