@@ -1488,3 +1488,144 @@ void GBComputationGroup::gb_fd_swap_ll_grad_wrap(
     delete[] scratch;
 #endif
 }
+
+
+// ============================================================================
+// Phase 3L.7f.3 (2026-06-04): GB chunked-WDM-heterodyne wrap methods.
+// Carved from lisa-on-gpu's TDIonTheFly.cu:6727-6854.
+//
+// Each method instantiates LAT's templated
+// `wdm_het_*_impl<SourceT>(...)` (defined in
+// `lisatools/cutils/lat_chunked_het_kernels.hh`, Phase 3L.7a slice 3)
+// against `<GBTDIonTheFly>` and dispatches through the Python-facing
+// GBComputationGroup surface.
+// ============================================================================
+
+// ---- GB-flavored wrappers --------------------------------------------------
+void GBComputationGroup::gb_wdm_het_fill_global_wrap(
+    double *template_fill, Orbits *orbits, TDIConfig *tdi_config,
+    WDMSettings *wdm_settings,
+    double *params_all, double *factors_all,
+    double *chunk_t_starts, int *chunk_keep_lo, int *chunk_keep_hi,
+    int *chunk_n_global_offset, double *wdm_window,
+    int n_chunks, int num_bin, int nparams,
+    int Nt_sub, int log2_Nt_sub,
+    int N_sparse, int log2_N_sparse,
+    int nchannels, int n_rfft_chunk,
+    double T_chunk, double dt, double T, double t_ref,
+    double tukey_alpha, int grid_dim, int N_cp_sig, int N_cp_orbit,
+    int m_band_half_width)
+{
+    wdm_het_fill_global_impl<GBTDIonTheFly>(
+        template_fill, orbits, tdi_config,
+        wdm_settings,
+        params_all, factors_all,
+        chunk_t_starts, chunk_keep_lo, chunk_keep_hi, chunk_n_global_offset,
+        wdm_window, n_chunks, num_bin, nparams,
+        Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
+        nchannels, n_rfft_chunk, T_chunk, dt, T, t_ref, tukey_alpha,
+        grid_dim, N_cp_sig, N_cp_orbit, m_band_half_width);
+}
+
+void GBComputationGroup::gb_wdm_het_get_ll_wrap(
+    double *d_h_out, double *h_h_out, Orbits *orbits, TDIConfig *tdi_config,
+    WDMSettings *wdm_settings,
+    double *params_all, int *data_index_all, int *noise_index_all,
+    double *chunk_t_starts, int *chunk_keep_lo, int *chunk_keep_hi,
+    int *chunk_n_global_offset, double *wdm_window,
+    double *data_d, double *invC,
+    int n_chunks, int num_bin, int nparams,
+    int Nt_sub, int log2_Nt_sub,
+    int N_sparse, int log2_N_sparse,
+    int nchannels, int n_rfft_chunk,
+    double T_chunk, double dt, double T, double t_ref, int tdi_type,
+    double tukey_alpha, int grid_dim, int N_cp_sig, int N_cp_orbit,
+    int *binary_perm, int *group_starts, int *group_ends,
+    int *group_m_lo, int *group_m_hi, int n_groups,
+    int m_band_half_width)
+{
+    wdm_het_get_ll_impl<GBTDIonTheFly>(
+        d_h_out, h_h_out, orbits, tdi_config,
+        wdm_settings,
+        params_all,
+        data_index_all, noise_index_all,
+        chunk_t_starts, chunk_keep_lo, chunk_keep_hi, chunk_n_global_offset,
+        wdm_window, data_d, invC, n_chunks, num_bin, nparams,
+        Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
+        nchannels, n_rfft_chunk,
+        T_chunk, dt, T, t_ref, tdi_type, tukey_alpha,
+        grid_dim, N_cp_sig, N_cp_orbit,
+        binary_perm, group_starts, group_ends,
+        group_m_lo, group_m_hi, n_groups, m_band_half_width);
+}
+
+void GBComputationGroup::gb_wdm_het_swap_ll_wrap(
+    double *d_h_add_out, double *d_h_remove_out,
+    double *add_add_out, double *remove_remove_out, double *add_remove_out,
+    Orbits *orbits, TDIConfig *tdi_config,
+    WDMSettings *wdm_settings,
+    double *params_add_all, double *params_remove_all,
+    int *data_index_all, int *noise_index_all,
+    double *chunk_t_starts, int *chunk_keep_lo, int *chunk_keep_hi,
+    int *chunk_n_global_offset, double *wdm_window,
+    double *data_d, double *invC,
+    int n_chunks, int num_bin, int nparams,
+    int Nt_sub, int log2_Nt_sub,
+    int N_sparse, int log2_N_sparse,
+    int nchannels, int n_rfft_chunk,
+    double T_chunk, double dt, double T, double t_ref, int tdi_type,
+    double tukey_alpha, int grid_dim, int N_cp_sig, int N_cp_orbit,
+    int *binary_perm, int *group_starts, int *group_ends,
+    int *group_m_lo, int *group_m_hi, int n_groups,
+    int *pair_m_lo_b, int *pair_m_hi_b,
+    int m_band_half_width)
+{
+    wdm_het_swap_ll_impl<GBTDIonTheFly>(
+        d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
+        orbits, tdi_config,
+        wdm_settings,
+        params_add_all, params_remove_all,
+        data_index_all, noise_index_all,
+        chunk_t_starts, chunk_keep_lo, chunk_keep_hi, chunk_n_global_offset,
+        wdm_window, data_d, invC, n_chunks, num_bin, nparams,
+        Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
+        nchannels, n_rfft_chunk,
+        T_chunk, dt, T, t_ref, tdi_type, tukey_alpha,
+        grid_dim, N_cp_sig, N_cp_orbit,
+        binary_perm, group_starts, group_ends,
+        group_m_lo, group_m_hi, n_groups,
+        pair_m_lo_b, pair_m_hi_b, m_band_half_width);
+}
+
+
+void GBComputationGroup::gb_wdm_het_get_fstat_ll_wrap(
+    double *N_arr_re_out, double *N_arr_im_out,
+    double *M_mat_re_out, double *M_mat_im_out,
+    Orbits *orbits, TDIConfig *tdi_config,
+    WDMSettings *wdm_settings,
+    double *params_all,
+    int *data_index_all, int *noise_index_all,
+    double *chunk_t_starts, int *chunk_keep_lo, int *chunk_keep_hi,
+    int *chunk_n_global_offset,
+    double *wdm_window,
+    double *data_d, double *invC,
+    int n_chunks, int num_bin, int nparams,
+    int Nt_sub, int log2_Nt_sub,
+    int N_sparse, int log2_N_sparse,
+    int nchannels, int n_rfft_chunk,
+    double T_chunk, double dt, double T, double t_ref, int tdi_type,
+    double tukey_alpha,
+    int grid_dim, int m_band_half_width)
+{
+    wdm_het_get_fstat_ll_impl<GBTDIonTheFly>(
+        N_arr_re_out, N_arr_im_out, M_mat_re_out, M_mat_im_out,
+        orbits, tdi_config, wdm_settings,
+        params_all, data_index_all, noise_index_all,
+        chunk_t_starts, chunk_keep_lo, chunk_keep_hi, chunk_n_global_offset,
+        wdm_window, data_d, invC,
+        n_chunks, num_bin, nparams,
+        Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
+        nchannels, n_rfft_chunk,
+        T_chunk, dt, T, t_ref, tdi_type, tukey_alpha,
+        grid_dim, m_band_half_width);
+}
