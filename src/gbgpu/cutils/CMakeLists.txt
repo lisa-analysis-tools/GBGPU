@@ -115,6 +115,18 @@ function(apply_gpu_backend_common_options libname)
   target_include_directories(${target_name} PRIVATE ${Python_NumPy_INCLUDE_DIR})
   target_compile_definitions(${target_name}
                              PRIVATE NPY_NO_DEPRECATED_API=NPY_1_9_API_VERSION)
+  # __CUDA_COMPILATION__ is the sprint-wide CPU/GPU class-name alias toggle
+  # (see lat_tdi_on_the_fly.hh / gb_tdi_on_the_fly.hh / binding_gbgpu.hpp).
+  # Without it, .cxx TUs in the GPU build (binding_gbgpu.cxx etc.) compile
+  # against the CPU-suffixed class names (GBTDIonTheFlyCPU,
+  # LISATDIonTheFlyCPU, ...) and the .so fails to load with
+  # ``undefined symbol: _ZTV16GBTDIonTheFlyCPU`` -- the CPU vtable is
+  # never emitted in the GPU build because the .cu sources DO get
+  # __CUDACC__ from nvcc and alias to *GPU instead. PUBLIC so the define
+  # propagates to every TU compiled as part of this target. Mirrors what
+  # GBT's canonical apply_gpu_backend_common_options does in
+  # cmake_functions.cmake (the local override below was missing this).
+  target_compile_definitions(${target_name} PUBLIC __CUDA_COMPILATION__)
   target_link_libraries(${target_name} PUBLIC CUDA::cudart CUDA::cublas
                                               CUDA::cusparse)
   set_property(TARGET ${target_name} PROPERTY CUDA_ARCHITECTURES
