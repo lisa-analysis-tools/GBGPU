@@ -11,6 +11,7 @@
    
 .. toctree::
    :maxdepth: 4
-   :caption: Tutorial:
+   :caption: Tutorials:
 
    GBGPU_tutorial
+   fast_likelihood_tutorial

@@ -40,6 +40,14 @@ shutil.copy(
     "GBGPU_tutorial.ipynb",
 )
 
+# Fast-likelihood (chunked-het + signal-het) tutorial; new at the sprint
+# 2026 reorg tutorial pass. Walks through GBWDMComputations end-to-end +
+# the signal-het accuracy degradation diagnostic.
+shutil.copy(
+    "../../examples/fast_likelihood_tutorial.ipynb",
+    "fast_likelihood_tutorial.ipynb",
+)
+
 
 # -- General configuration ---------------------------------------------------
 
