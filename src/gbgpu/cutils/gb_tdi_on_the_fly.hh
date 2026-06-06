@@ -47,7 +47,7 @@
 #include "lat_tdi_on_the_fly.hh"      // LISATDIonTheFly base + OrbitsSplineCache
 #include "lat_chunked_het_kernels.hh" // wdm_het_*_impl<SourceT> + helpers
 #include "gbt_global.h"               // cmplx + CUDA_DEVICE etc.
-
+#include <vector>
 
 // CPU/GPU class-name aliasing -- one rule, both layers.
 //

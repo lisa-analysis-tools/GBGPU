@@ -28,7 +28,7 @@
 // Python process.
 
 #include "gb_tdi_on_the_fly.hh"  // GBTDIonTheFly class + LAT/GBT/LISATDIonTheFly machinery
-
+#include <vector>
 
 // `N_PARAMS_MAX` is the upper bound on per-source parameter count
 // used by the shared-memory layout calculations below. Same value
