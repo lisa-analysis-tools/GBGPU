@@ -174,7 +174,18 @@ void gb_run_wave_tdi_wrap(GBTDIonTheFly *tdi_on_fly, cmplx *tdi_channels_arr,
     gpuErrchk(cudaMemcpy(d_gb_here, gb_here, sizeof(GBTDIonTheFly), cudaMemcpyHostToDevice));
 
     int buffer_length = tdi_on_fly->get_gb_buffer_size(N);
-    printf("%d\n", buffer_length);
+    // ``get_gb_buffer_size(N)`` can return >48 KB (the default per-block
+    // dynamic-shared-mem cap). The other CUDA launchers in this file
+    // (gb_fd_get_ll_kernel, gb_fd_fill_global_kernel, and the chunked-het
+    // family in lat_chunked_het_kernels.hh) all opt into the higher cap
+    // via cudaFuncSetAttribute before launching; this one was missing
+    // it, which produced ``GPUassert: invalid argument`` at the
+    // post-launch cudaGetLastError() check (line 183) for any N that
+    // pushed the buffer above the default cap. Cluster CUDA report
+    // 2026-06-06: N gave buffer_length = 475136 bytes.
+    gpuErrchk(cudaFuncSetAttribute(
+        gb_run_wave_tdi_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, buffer_length));
     gb_run_wave_tdi_kernel<<<num_bin, NUM_THREADS_HERE, buffer_length>>>(
         d_gb_here, buffer_length, tdi_channels_arr, tdi_amp, tdi_phase, phi_ref,
         params, t_arr, N, num_bin, n_params, nchannels);
