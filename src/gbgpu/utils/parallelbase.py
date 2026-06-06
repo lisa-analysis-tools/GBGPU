@@ -1,15 +1,15 @@
-from typing import Optional, Sequence, TypeVar, Union
-import types
-from .. import get_first_backend
-
 from gpubackendtools import ParallelModuleBase
 
 
 class GBGPUParallelModule(ParallelModuleBase):
-    def __init__(self, force_backend=None):
-        if force_backend is None:
-            breakpoint()
-            force_backend = get_first_backend(self.CPU_RECOMMENDED)
+    """ParallelModuleBase variant that resolves ``force_backend`` strings
+    through the ``gbgpu`` backend family (``gbgpu_cpu`` / ``gbgpu_cuda12x``
+    / ``gbgpu_jax`` / ...). Mirrors the LAT pattern in
+    ``lisatools.response.parallelbase.FastLISAResponseParallelModule``.
+    """
 
-        force_backend_in = ('gbgpu', force_backend) if isinstance(force_backend, str) else force_backend
+    def __init__(self, force_backend=None):
+        force_backend_in = (
+            ("gbgpu", force_backend) if isinstance(force_backend, str) else force_backend
+        )
         super().__init__(force_backend_in)
