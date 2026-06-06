@@ -616,7 +616,7 @@ class SOBBHComputationGroupWrapJAX(GBComputationGroupWrapJAX):
       ``SOBBHTDIonTheFly``).
     * The kernel methods are exposed under the ``sobbh_wdm_het_*``
       names that match the C++ ``SOBBHComputationGroupWrap`` and that
-      :class:`fastlisaresponse.gbcomps.SOBBHWDMComputations` dispatches
+      :class:`bbhx.sobbhcomps.SOBBHWDMComputations` dispatches
       to. The bodies are aliased to the corresponding ``gb_wdm_het_*``
       methods on the parent class -- the per-binary parameter count
       (11 instead of 9) and the ``f_low`` carrier index (5 instead of
