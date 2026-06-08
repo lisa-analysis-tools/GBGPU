@@ -28,6 +28,7 @@
 // Python process.
 
 #include "gb_tdi_on_the_fly.hh"  // GBTDIonTheFly class + LAT/GBT/LISATDIonTheFly machinery
+#include <stdexcept>
 #include <vector>
 
 // `N_PARAMS_MAX` is the upper bound on per-source parameter count
@@ -1840,9 +1841,11 @@ void GBComputationGroup::gb_signal_het_get_ll_wrap(
 #ifdef __CUDACC__
     // GPU port deferred. CPU branch fully wired below; matches the pattern
     // of gb_fd_swap_ll_grad_wrap (header comment line 861-862).
-    std::fprintf(stderr, "[gb_signal_het_get_ll_wrap] GPU branch TODO -- "
-                         "use CPU backend (force_backend=\"cpu\")\n");
-    return;
+    throw std::runtime_error(
+        "[gb_signal_het_get_ll_wrap] GPU implementation is a TODO -- the v2 signal-het CUDA "
+        "kernels are not implemented yet. Construct the Python class with "
+        "force_backend=\"cpu\" until then. (Silent zero-return previously "
+        "masqueraded as a successful call -- see the audit at GBGPU 2026-06-06.)");
 #endif
 
     const int M = 2 * m_active_half_width + 1;
@@ -2058,9 +2061,11 @@ void GBComputationGroup::gb_signal_het_get_ll_sparse_wrap(
     (void) params_ref_all; (void) fdot_idx; (void) num_data; (void) Nt_active;
 
 #ifdef __CUDACC__
-    std::fprintf(stderr, "[gb_signal_het_get_ll_sparse_wrap] GPU branch TODO -- "
-                         "use CPU backend (force_backend=\"cpu\")\n");
-    return;
+    throw std::runtime_error(
+        "[gb_signal_het_get_ll_sparse_wrap] GPU implementation is a TODO -- the v2 signal-het CUDA "
+        "kernels are not implemented yet. Construct the Python class with "
+        "force_backend=\"cpu\" until then. (Silent zero-return previously "
+        "masqueraded as a successful call -- see the audit at GBGPU 2026-06-06.)");
 #endif
 
     const int M = 2 * m_active_half_width + 1;
@@ -2290,9 +2295,11 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
     int     N_sparse_fd, double tukey_alpha, double max_r)
 {
 #ifdef __CUDACC__
-    std::fprintf(stderr, "[gb_signal_het_get_ll_in_kernel_wrap] GPU branch "
-                         "TODO -- use CPU backend (force_backend=\"cpu\")\n");
-    return;
+    throw std::runtime_error(
+        "[gb_signal_het_get_ll_in_kernel_wrap] GPU implementation is a TODO -- the v2 signal-het CUDA "
+        "kernels are not implemented yet. Construct the Python class with "
+        "force_backend=\"cpu\" until then. (Silent zero-return previously "
+        "masqueraded as a successful call -- see the audit at GBGPU 2026-06-06.)");
 #endif
 
     std::vector<cmplx>  X_het_raw((size_t) num_bin * nchannels * N_sparse_fd);
@@ -2401,9 +2408,11 @@ void GBComputationGroup::gb_signal_het_fill_global_sparse_wrap(
     (void) num_data;
 
 #ifdef __CUDACC__
-    std::fprintf(stderr, "[gb_signal_het_fill_global_sparse_wrap] GPU branch "
-                         "TODO -- use CPU backend (force_backend=\"cpu\")\n");
-    return;
+    throw std::runtime_error(
+        "[gb_signal_het_fill_global_sparse_wrap] GPU implementation is a TODO -- the v2 signal-het CUDA "
+        "kernels are not implemented yet. Construct the Python class with "
+        "force_backend=\"cpu\" until then. (Silent zero-return previously "
+        "masqueraded as a successful call -- see the audit at GBGPU 2026-06-06.)");
 #endif
 
     const int M = 2 * m_active_half_width + 1;
@@ -2619,9 +2628,11 @@ void GBComputationGroup::gb_signal_het_fill_global_in_kernel_wrap(
     int     N_sparse_fd, double tukey_alpha, double max_r)
 {
 #ifdef __CUDACC__
-    std::fprintf(stderr, "[gb_signal_het_fill_global_in_kernel_wrap] GPU branch "
-                         "TODO -- use CPU backend (force_backend=\"cpu\")\n");
-    return;
+    throw std::runtime_error(
+        "[gb_signal_het_fill_global_in_kernel_wrap] GPU implementation is a TODO -- the v2 signal-het CUDA "
+        "kernels are not implemented yet. Construct the Python class with "
+        "force_backend=\"cpu\" until then. (Silent zero-return previously "
+        "masqueraded as a successful call -- see the audit at GBGPU 2026-06-06.)");
 #endif
 
     std::vector<cmplx>  X_het_raw((size_t) num_bin * nchannels * N_sparse_fd);
@@ -2707,9 +2718,11 @@ void GBComputationGroup::gb_signal_het_get_ll_grad_in_kernel_wrap(
     int     N_sparse_fd, double tukey_alpha, double max_r)
 {
 #ifdef __CUDACC__
-    std::fprintf(stderr, "[gb_signal_het_get_ll_grad_in_kernel_wrap] GPU branch "
-                         "TODO -- use CPU backend (force_backend=\"cpu\")\n");
-    return;
+    throw std::runtime_error(
+        "[gb_signal_het_get_ll_grad_in_kernel_wrap] GPU implementation is a TODO -- the v2 signal-het CUDA "
+        "kernels are not implemented yet. Construct the Python class with "
+        "force_backend=\"cpu\" until then. (Silent zero-return previously "
+        "masqueraded as a successful call -- see the audit at GBGPU 2026-06-06.)");
 #endif
 
     std::vector<double> params_priv((size_t) nparams);
