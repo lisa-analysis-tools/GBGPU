@@ -17,9 +17,8 @@ class GBGPUParallelModule(ParallelModuleBase):
     _BACKEND_PREFIX = "gbgpu"
 
     def __init__(self, force_backend=None):
-        force_backend_in = (
-            (self._BACKEND_PREFIX, force_backend)
-            if isinstance(force_backend, str)
-            else force_backend
-        )
-        super().__init__(force_backend_in)
+        if isinstance(force_backend, str) and not force_backend.startswith(
+            self._BACKEND_PREFIX + "_"
+        ):
+            force_backend = (self._BACKEND_PREFIX, force_backend)
+        super().__init__(force_backend)
