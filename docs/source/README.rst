@@ -19,13 +19,12 @@ methods to combine waveforms into global fitting templates.
 The code is CPU/GPU agnostic. CUDA and NVIDIA GPUs are required to run
 these codes for GPUs.
 
-See the
-`documentation <https://mikekatz04.github.io/GBGPU/html/index.html>`__
-for more details. This code was designed for
+See the `documentation <https://lisa-analysis-tools.github.io/GBGPU/>`__ for more
+details. This code was designed for
 `arXiv:2205.03461 <https://arxiv.org/abs/2205.03461>`__. If you use any
 part of this code, please cite
 `arXiv:2205.03461 <https://arxiv.org/abs/2205.03461>`__, its `Zenodo
-page <https://zenodo.org/record/6500434#.YmpofxNBzlw>`__,
+page <https://zenodo.org/records/16999246>`__,
 `arXiv:0704.1808 <https://arxiv.org/abs/0704.1808>`__, and
 `arXiv:1806.00500 <https://arxiv.org/abs/1806.00500>`__.
 
@@ -103,7 +102,7 @@ To install from source:
 
 ::
 
-   git clone https://github.com/mikekatz04/GBGPU.git
+   git clone https://github.com/lisa-analysis-tools/GBGPU.git
    cd GBGPU
 
 4) Run install. Make sure CUDA is on your PATH.
@@ -132,7 +131,7 @@ Versioning
 
 We use `SemVer <http://semver.org/>`__ for versioning. For the versions
 available, see the `tags on this
-repository <https://github.com/mikekatz04/GBGPU/tags>`__.
+repository <https://github.com/lisa-analysis-tools/GBGPU/tags>`__.
 
 Current Version: 1.2.2
 
@@ -155,4 +154,5 @@ License
 -------
 
 This project is licensed under the Apache License - see the
-`LICENSE <LICENSE>`__ file for details.
+`LICENSE <https://github.com/lisa-analysis-tools/GBGPU/blob/master/LICENSE>`__
+file for details.

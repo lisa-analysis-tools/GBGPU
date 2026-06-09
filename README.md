@@ -6,7 +6,7 @@ The current version of the code is very closely related to the implementation of
 
 The code is CPU/GPU agnostic. CUDA and NVIDIA GPUs are required to run these codes for GPUs.
 
-See the [documentation](https://mikekatz04.github.io/GBGPU/) for more details. This code was designed for [arXiv:2205.03461](https://arxiv.org/abs/2205.03461). If you use any part of this code, please cite [arXiv:2205.03461](https://arxiv.org/abs/2205.03461), its [Zenodo page](https://zenodo.org/records/16999246), [arXiv:0704.1808](https://arxiv.org/abs/0704.1808), and [arXiv:1806.00500](https://arxiv.org/abs/1806.00500). 
+See the [documentation](https://lisa-analysis-tools.github.io/GBGPU/) for more details. This code was designed for [arXiv:2205.03461](https://arxiv.org/abs/2205.03461). If you use any part of this code, please cite [arXiv:2205.03461](https://arxiv.org/abs/2205.03461), its [Zenodo page](https://zenodo.org/records/16999246), [arXiv:0704.1808](https://arxiv.org/abs/0704.1808), and [arXiv:1806.00500](https://arxiv.org/abs/1806.00500). 
 
 ## Getting Started
 
@@ -58,7 +58,7 @@ pip install cupy-cuda92
 3) Clone the repository.
 
 ```
-git clone https://github.com/mikekatz04/GBGPU.git
+git clone https://github.com/lisa-analysis-tools/GBGPU.git
 cd GBGPU
 ```
 
@@ -81,7 +81,7 @@ python -m unittest discover
 
 ## Versioning
 
-We use [SemVer](http://semver.org/) for versioning. For the versions available, see the [tags on this repository](https://github.com/mikekatz04/GBGPU/tags).
+We use [SemVer](http://semver.org/) for versioning. For the versions available, see the [tags on this repository](https://github.com/lisa-analysis-tools/GBGPU/tags).
 
 Current Version: 1.2.2
 
@@ -100,4 +100,4 @@ Current Version: 1.2.2
 
 ## License
 
-This project is licensed under the Apache License - see the [LICENSE](https://github.com/mikekatz04/GBGPU/blob/master/LICENSE) file for details.
+This project is licensed under the Apache License - see the [LICENSE](https://github.com/lisa-analysis-tools/GBGPU/blob/master/LICENSE) file for details.

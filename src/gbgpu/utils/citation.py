@@ -34,7 +34,7 @@ robson_triple = """
 zenodo = """
 @software{michael_l_katz_2022_6500434,
   author       = {Michael L. Katz},
-  title        = {mikekatz04/GBGPU: First official public release!},
+  title        = {lisa-analysis-tools/GBGPU: First official public release!},
   month        = apr,
   year         = 2022,
   publisher    = {Zenodo},
