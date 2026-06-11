@@ -16,13 +16,17 @@
 #   * SOBBH-specific code  -> BBHx
 #   * Shared GB <-> SOBBH  -> LISAanalysistools (lisatools)
 from copy import deepcopy
+from typing import Optional
 
 import numpy as np
 
 from lisatools.chunked_het import WDMComputationsBase
 from lisatools.detector import EqualArmlengthOrbits, Orbits
 from lisatools.domains import WDMSettings
-from lisatools.response.directresponse import ecliptic_to_icrs
+from lisatools.response.directresponse import (
+    ecliptic_to_icrs,
+    warn_deprecated_frame_conversion,
+)
 from lisatools.response.tdiconfig import TDIConfig
 
 # Phase 3L.7k (2026-06-04): GBFDComputations (the FD chunked-heterodyne
@@ -178,13 +182,16 @@ class GBFDComputations(FastLISAResponseParallelModule):
     def _prep_params(self, params, convert_to_ra_dec):
         p = self.xp.asarray(self.xp.atleast_2d(params)).copy()
         if convert_to_ra_dec:
+            # Deprecated legacy path: sky coords are consumed in the
+            # orbits frame directly (matching the TDI-on-the-fly handling).
+            warn_deprecated_frame_conversion()
             lam = p[:, -2].copy(); beta = p[:, -1].copy()
             lam, beta = ecliptic_to_icrs(lam, beta)
             p[:, -2] = lam; p[:, -1] = beta
         return p
 
     def get_ll_fd(self, params, data_index=None, noise_index=None,
-                  convert_to_ra_dec: bool = True):
+                  convert_to_ra_dec: Optional[bool] = None):
         p = self._prep_params(params, convert_to_ra_dec)
         num_bin = p.shape[0]
         d_h_out = self.xp.zeros(num_bin)
@@ -213,7 +220,7 @@ class GBFDComputations(FastLISAResponseParallelModule):
 
     def get_swap_ll_fd(self, params_add, params_remove,
                        data_index=None, noise_index=None,
-                       convert_to_ra_dec: bool = True):
+                       convert_to_ra_dec: Optional[bool] = None):
         pa = self._prep_params(params_add, convert_to_ra_dec)
         pr = self._prep_params(params_remove, convert_to_ra_dec)
         num_bin = pa.shape[0]
@@ -246,7 +253,7 @@ class GBFDComputations(FastLISAResponseParallelModule):
         return like_add, like_rem, d_h_a, d_h_r, aa, rr, ar
 
     def fill_global(self, params, templates, data_index=None, factors=None,
-                    convert_to_ra_dec: bool = True):
+                    convert_to_ra_dec: Optional[bool] = None):
         p = self._prep_params(params, convert_to_ra_dec)
         num_bin = p.shape[0]
         if templates.ndim != 3 or templates.shape[1:] != (
@@ -331,7 +338,7 @@ class GBFDComputations(FastLISAResponseParallelModule):
                        param_scales=None,
                        param_eps_relative=1.0e-6,
                        data_index=None, noise_index=None,
-                       convert_to_ra_dec: bool = True):
+                       convert_to_ra_dec: Optional[bool] = None):
         """Chain-rule gradient of :meth:`get_ll_fd`.
 
         See :meth:`GBWDMComputations.get_ll_grad_wdm` for the meaning of
@@ -383,7 +390,7 @@ class GBFDComputations(FastLISAResponseParallelModule):
                             param_scales_add=None, param_scales_remove=None,
                             param_eps_relative=1.0e-6,
                             data_index=None, noise_index=None,
-                            convert_to_ra_dec: bool = True):
+                            convert_to_ra_dec: Optional[bool] = None):
         """Chain-rule gradient of :meth:`get_swap_ll_fd`.
 
         Returns ``(grad_add, grad_remove)``, the per-binary derivatives of

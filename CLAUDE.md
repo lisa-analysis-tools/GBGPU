@@ -65,9 +65,9 @@ These import generic infrastructure absolutely from `lisatools.jax.{response,wdm
   (mm5 ≈ 1.6e-9 median, ~130× faster than v1 dense path).
 
 **Single-registrant rule (sprint-wide)**: GBGPU's binding TUs MUST NOT
-register `OrbitsWrap`, `LISAResponseWrap`, `TDIConfigWrap`,
-`OrbitsWrap_responselisa`, or `CubicSplineWrap_responselisa`. Those are
-owned by LAT's `pycppdetector`. When GBGPU receives its tdionthefly
+register `OrbitsWrap`, `LISAResponseWrap`, `TDIConfigWrap`, or
+`CubicSplineWrap`. The first three are owned by LAT's `pycppdetector`;
+`CubicSplineWrap` is owned by GBT's `interp` module (2026-06-10). When GBGPU receives its tdionthefly
 module, add `#include "lisatools_header_abi.hpp"` +
 `static_assert(!LISATOOLS_IS_WRAPPER_OWNER, ...)` to its binding source
 (see `lisa-on-gpu/src/fastlisaresponse/cutils/binding_tof.cxx` for the

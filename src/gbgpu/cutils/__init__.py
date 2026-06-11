@@ -95,7 +95,7 @@ class GBGPUBackend(LISAToolsBackend):
 
 # --- module-loader helper ------------------------------------------------
 
-def _lat_methods_from_pycppdetector(_lat_pd, *, gpu: bool, xp):
+def _lat_methods_from_pycppdetector(_lat_pd, _gbt_interp, *, gpu: bool, xp):
     """Build a LAT methods dict from a `lisatools_backend_*.pycppdetector` module.
 
     Pulled out so each GBGPU loader (cpu/cuda11x/cuda12x/cuda13x) can
@@ -112,7 +112,9 @@ def _lat_methods_from_pycppdetector(_lat_pd, *, gpu: bool, xp):
         "LISAResponse": getattr(_lat_pd, f"LISAResponse{suffix}"),
         "TDIConfigWrap": getattr(_lat_pd, f"TDIConfigWrap{suffix}"),
         "TDIConfig": getattr(_lat_pd, f"TDIConfig{suffix}"),
-        "CubicSplineWrap_responselisa": getattr(_lat_pd, f"CubicSplineWrap{suffix}_responselisa"),
+        # GBT is the single registrant for CubicSplineWrap (same pattern
+        # as this package consuming LAT's OrbitsWrap).
+        "CubicSplineWrap": getattr(_gbt_interp, f"CubicSplineWrap{suffix}"),
         "WDMSettingsWrap": getattr(_lat_pd, f"WDMSettingsWrap{suffix}"),
         "WDMDomainWrap": getattr(_lat_pd, f"WDMDomainWrap{suffix}"),
         "FDDomainWrap": getattr(_lat_pd, f"FDDomainWrap{suffix}"),
@@ -151,6 +153,7 @@ class GBGPUCpuBackend(CpuBackend, GBGPUBackend):
     @staticmethod
     def cpu_methods_loader() -> GBGPUBackendMethods:
         try:
+            import gbt_backend_cpu.interp
             import gbgpu_backend_cpu.cgbgpu
             import lisatools_backend_cpu.pycppdetector
         except (ModuleNotFoundError, ImportError) as e:
@@ -159,7 +162,7 @@ class GBGPUCpuBackend(CpuBackend, GBGPUBackend):
         numpy = GBGPUCpuBackend.check_numpy()
         return GBGPUBackendMethods(
             **_lat_methods_from_pycppdetector(
-                lisatools_backend_cpu.pycppdetector, gpu=False, xp=numpy
+                lisatools_backend_cpu.pycppdetector, gbt_backend_cpu.interp, gpu=False, xp=numpy
             ),
             **_gb_methods_from_cgbgpu(gbgpu_backend_cpu.cgbgpu, gpu=False),
         )
@@ -175,6 +178,7 @@ def _make_cuda_loader(flavor):
             import importlib
 
             gb_mod = importlib.import_module(f"{gb_mod_name}.cgbgpu")
+            gbt_mod = importlib.import_module(f"gbt_backend_{flavor}.interp")
             lat_mod = importlib.import_module(f"{lat_mod_name}.pycppdetector")
         except (ModuleNotFoundError, ImportError) as e:
             raise BackendUnavailableException(
@@ -190,7 +194,7 @@ def _make_cuda_loader(flavor):
             ) from e
 
         return GBGPUBackendMethods(
-            **_lat_methods_from_pycppdetector(lat_mod, gpu=True, xp=cupy),
+            **_lat_methods_from_pycppdetector(lat_mod, gbt_mod, gpu=True, xp=cupy),
             **_gb_methods_from_cgbgpu(gb_mod, gpu=True),
         )
 
