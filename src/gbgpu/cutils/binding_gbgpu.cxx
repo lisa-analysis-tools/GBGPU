@@ -780,6 +780,9 @@ void gbgpu_part(nb::module_ &m) {
         .def("SharedMemoryFstatLikeComp_wrap",
              &GBGPUComputationWrap::SharedMemoryFstatLikeComp_wrap,
              "Shared-memory GB F-statistic likelihood evaluation.")
+        .def("SharedMemoryInfoMatComp_wrap",
+             &GBGPUComputationWrap::SharedMemoryInfoMatComp_wrap,
+             "Shared-memory GB Fisher/information-matrix evaluation (mojito).")
         ;
 
     // ========================================================================

@@ -36,7 +36,12 @@ void SharedMemoryWaveComp(
     double dt,
     int N, 
     int num_bin_all, 
-    int tdi_channel_setup
+    int tdi_channel_setup,
+    double* Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
 
 typedef struct InputInfoTag{
@@ -57,7 +62,7 @@ typedef struct InputInfoTag{
     cmplx *d_h;
     cmplx *h_h;
     cmplx *data_arr;
-    double *noise; // invC
+    cmplx *noise; // invC
     int *data_index;
     int *noise_index;
     int start_freq_ind;
@@ -116,13 +121,25 @@ typedef struct InputInfoTag{
     cmplx* M_mat;
     cmplx* N_arr;
     int *start_inds_out;
+    double *Ps;
+    double L_arm;
+    bool tdi2;
+    int window_type;
+    double window_alpha;
+    double* info_mat;
+    cmplx* d_dh_workspace;
+    int* inds;
+    double* eps_scaled; 
+    double eps_orig;
+    int num_derivs;
+    bool easy_central_difference;
 } InputInfo; 
 
 void SharedMemoryLikeComp(
     cmplx* d_h,
     cmplx* h_h,
     cmplx* data,
-    double* noise,
+    cmplx* noise,
     int* data_index,
     int* noise_index,
     double* amp, 
@@ -144,7 +161,12 @@ void SharedMemoryLikeComp(
     int device,
     bool do_synchronize,
     int num_data,
-    int num_noise
+    int num_noise,
+    double* Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
 
 
@@ -155,7 +177,7 @@ void SharedMemorySwapLikeComp(
     cmplx* add_add,
     cmplx* add_remove,
     cmplx* data,
-    double* noise,
+    cmplx* noise,
     int* data_index,
     int* noise_index,
     double* amp_add, 
@@ -186,14 +208,19 @@ void SharedMemorySwapLikeComp(
     int device,
     bool do_synchronize,
     int num_data,
-    int num_noise
+    int num_noise,
+    double* Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
 
 void SharedMemoryChiSquaredComp(
     cmplx *h1_h1,
     cmplx *h2_h2,
     cmplx *h1_h2,
-    double *noise,
+    cmplx *noise,
     int *noise_index,
     double *amp,
     double *f0,
@@ -214,7 +241,12 @@ void SharedMemoryChiSquaredComp(
     int device,
     bool do_synchronize,
     int num_data, 
-    int num_noise
+    int num_noise,
+    double* Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
 
 
@@ -239,7 +271,12 @@ void SharedMemoryGenerateGlobal(
     int data_length,
     int tdi_channel_setup,
     int device,
-    bool do_synchronize
+    bool do_synchronize,
+    double* Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
 
 
@@ -247,7 +284,7 @@ void SharedMemoryFstatLikeComp(
     cmplx *M_mat,
     cmplx *N_arr,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *f0,
@@ -265,7 +302,50 @@ void SharedMemoryFstatLikeComp(
     int device,
     bool do_synchronize,
     int num_data,
-    int num_noise
+    int num_noise,
+    double* Ps, 
+    double L_arm,
+    bool tdi2,
+    int window_type = 0,
+    double window_alpha = 0.0
 );
+
+
+void SharedMemoryInfoMatComp(
+    double* info_mat,
+    cmplx* d_dh_workspace,
+    cmplx* noise,
+    int* noise_index,
+    int* inds,
+    double* amp, 
+    double* f0, 
+    double* fdot0, 
+    double* fddot0, 
+    double* phi0, 
+    double* iota,
+    double* psi, 
+    double* lam,
+    double* theta,
+    double* eps_scaled, 
+    double eps_orig, 
+    double T, 
+    double dt,
+    int N,
+    int num_bin_all,
+    int num_derivs,
+    int* start_freq_inds,
+    int data_length,
+    int tdi_channel_setup,
+    int device,
+    bool do_synchronize,
+    int num_noise,
+    double* Ps,
+    double L_arm,
+    bool tdi2,
+    bool easy_central_difference,
+    int window_type = 0,
+    double window_alpha = 0.0
+);
+
 
 #endif // __SHAREDMEMORY_GBGPU_HPP__

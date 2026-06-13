@@ -4,7 +4,14 @@ import warnings
 
 from lisatools.utils.constants import *
 
-from lisatools.sensitivity import get_sensitivity
+try:
+    from lisatools import sensitivity as tdi
+
+    tdi_available = True
+
+except (ModuleNotFoundError, ImportError) as e:
+    tdi_available = False
+    warnings.warn("tdi module not found. No sensitivity information will be included.")
 
 try:
     from cupy.cuda.runtime import setDevice
@@ -231,34 +238,42 @@ def get_N(amp, f0, Tobs, oversample=1):
     # adjust based on the frequency of the source
     N[f0 >= 0.1] = 1024 * mult[f0 >= 0.1]
     N[(f0 >= 0.03) & (f0 < 0.1)] = 512 * mult[(f0 >= 0.03) & (f0 < 0.1)]
-    N[(f0 >= 0.01) & (f0 < 0.3)] = 256 * mult[(f0 >= 0.01) & (f0 < 0.3)]
+    N[(f0 >= 0.01) & (f0 < 0.03)] = 256 * mult[(f0 >= 0.01) & (f0 < 0.03)]
     N[(f0 >= 0.001) & (f0 < 0.01)] = 64 * mult[(f0 >= 0.001) & (f0 < 0.01)]
 
     # if a sensitivity curve is available, verify the SNR is not too high
     # if it is, needs more points
-    fstar = C_SI / (lisaL * 2 * PI)
-    fonfs = f0 / fstar
+    if tdi_available:
+        fonfs = f0 / fstar
 
-    SnX = np.sqrt(get_sensitivity(f0, sens_fn="X1TDISens"))
+        SnX = np.sqrt(tdi.X1TDISens.get_Sn(f0))
 
-    #  calculate michelson noise
-    Sm = SnX / (4.0 * np.sin(fonfs) * np.sin(fonfs))
+        #  calculate michelson noise
+        Sm = SnX / (4.0 * np.sin(fonfs) * np.sin(fonfs))
 
-    Acut = amp * np.sqrt(Tobs / Sm)
+        Acut = amp * np.sqrt(Tobs / Sm)
 
-    M = (2.0 ** (np.log(Acut) / np.log(2.0) + 1.0)).astype(int)
+        exponent = np.ceil(np.log(Acut) / np.log(2.0) + 1)
+        M = np.round(2.0 ** exponent).astype(int)
 
-    M = M * (M > N) + N * (M < N)
-    N = M * (M > N) + N * (M < N)
-
-    M[M > 8192] = 8192
-
-    N = M
-
+        N = np.maximum(M, N)
+    else:
+        warnings.warn(
+            "Sensitivity information not available. The number of points in the waveform "
+            "will not be determined by the signal strength."
+        )
+        
     # adjust with oversample
-    N_out = (N * oversample).astype(int)
+    N_out = (N * oversample).astype(np.int32)
 
-    return N_out
+    # cuda implementation relies on Nmax=2048
+    Nmax = 2048
+    N_out = np.minimum(N_out, Nmax)
+
+    if np.any(N_out) == 0:
+        breakpoint()
+
+    return N_out    
 
 
 def cuda_set_device(dev):

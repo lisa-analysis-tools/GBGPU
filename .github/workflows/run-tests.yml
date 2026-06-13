@@ -38,10 +38,13 @@ jobs:
           which cmake
           cmake --version
           python -m pip install -v .
-      - name: Install coverage
+      - name: Run tests alone without coverage.
         run: |
-          python -m pip install coverage[toml]
-      - name: Run module tests & show coverage results
-        run: |
-          coverage run --source=gbgpu -m unittest discover
-          coverage report -m
+          python -m unittest tests/test*
+      # - name: Install coverage
+      #   run: |
+      #     python -m pip install coverage[toml]
+      # - name: Run module tests & show coverage results
+      #   run: |
+      #     coverage run --source=gbgpu -m unittest discover
+      #     coverage report -m

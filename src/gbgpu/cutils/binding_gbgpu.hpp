@@ -194,7 +194,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<double> phi0, array_type<double> iota,
         array_type<double> psi, array_type<double> lam,
         array_type<double> theta,
-        double T, double dt, int N, int num_bin_all, int tdi_channel_setup)
+        double T, double dt, int N, int num_bin_all, int tdi_channel_setup,
+        array_type<double> Ps, double L_arm, bool tdi2,
+        int window_type, double window_alpha)
     {
         SharedMemoryWaveComp(
             (cmplx*) return_pointer(tdi_out,        "tdi_out"),
@@ -208,14 +210,16 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             return_pointer(psi,    "psi"),
             return_pointer(lam,    "lam"),
             return_pointer(theta,  "theta"),
-            T, dt, N, num_bin_all, tdi_channel_setup);
+            T, dt, N, num_bin_all, tdi_channel_setup,
+            return_pointer(Ps, "Ps"), L_arm, tdi2,
+            window_type, window_alpha);
     }
 
     void SharedMemoryLikeComp_wrap(
         array_type<std::complex<double>> d_h,
         array_type<std::complex<double>> h_h,
         array_type<std::complex<double>> data,
-        array_type<double> noise,
+        array_type<std::complex<double>> noise,
         array_type<int> data_index, array_type<int> noise_index,
         array_type<double> amp, array_type<double> f0,
         array_type<double> fdot0, array_type<double> fddot0,
@@ -226,13 +230,15 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<int> start_freq_inds,
         int data_length, int tdi_channel_setup,
         int device, bool do_synchronize,
-        int num_data, int num_noise)
+        int num_data, int num_noise,
+        array_type<double> Ps, double L_arm, bool tdi2,
+        int window_type, double window_alpha)
     {
         SharedMemoryLikeComp(
             (cmplx*) return_pointer(d_h,  "d_h"),
             (cmplx*) return_pointer(h_h,  "h_h"),
             (cmplx*) return_pointer(data, "data"),
-            return_pointer(noise,        "noise"),
+            (cmplx*) return_pointer(noise,        "noise"),
             return_pointer(data_index,   "data_index"),
             return_pointer(noise_index,  "noise_index"),
             return_pointer(amp,    "amp"),
@@ -248,7 +254,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             return_pointer(start_freq_inds, "start_freq_inds"),
             data_length, tdi_channel_setup,
             device, do_synchronize,
-            num_data, num_noise);
+            num_data, num_noise,
+            return_pointer(Ps, "Ps"), L_arm, tdi2,
+            window_type, window_alpha);
     }
 
     void SharedMemorySwapLikeComp_wrap(
@@ -258,7 +266,7 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<std::complex<double>> add_add,
         array_type<std::complex<double>> add_remove,
         array_type<std::complex<double>> data,
-        array_type<double> noise,
+        array_type<std::complex<double>> noise,
         array_type<int> data_index, array_type<int> noise_index,
         array_type<double> amp_add, array_type<double> f0_add,
         array_type<double> fdot0_add, array_type<double> fddot0_add,
@@ -274,7 +282,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<int> start_freq_inds,
         int data_length, int tdi_channel_setup,
         int device, bool do_synchronize,
-        int num_data, int num_noise)
+        int num_data, int num_noise,
+        array_type<double> Ps, double L_arm, bool tdi2,
+        int window_type, double window_alpha)
     {
         SharedMemorySwapLikeComp(
             (cmplx*) return_pointer(d_h_remove,    "d_h_remove"),
@@ -283,7 +293,7 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             (cmplx*) return_pointer(add_add,       "add_add"),
             (cmplx*) return_pointer(add_remove,    "add_remove"),
             (cmplx*) return_pointer(data,          "data"),
-            return_pointer(noise,        "noise"),
+            (cmplx*) return_pointer(noise,        "noise"),
             return_pointer(data_index,   "data_index"),
             return_pointer(noise_index,  "noise_index"),
             return_pointer(amp_add,    "amp_add"),
@@ -308,14 +318,16 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             return_pointer(start_freq_inds, "start_freq_inds"),
             data_length, tdi_channel_setup,
             device, do_synchronize,
-            num_data, num_noise);
+            num_data, num_noise,
+            return_pointer(Ps, "Ps"), L_arm, tdi2,
+            window_type, window_alpha);
     }
 
     void SharedMemoryChiSquaredComp_wrap(
         array_type<std::complex<double>> h1_h1,
         array_type<std::complex<double>> h2_h2,
         array_type<std::complex<double>> h1_h2,
-        array_type<double> noise,
+        array_type<std::complex<double>> noise,
         array_type<int> noise_index,
         array_type<double> amp, array_type<double> f0,
         array_type<double> fdot0, array_type<double> fddot0,
@@ -326,13 +338,15 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<int> start_freq_inds,
         int data_length, int tdi_channel_setup,
         int device, bool do_synchronize,
-        int num_data, int num_noise)
+        int num_data, int num_noise,
+        array_type<double> Ps, double L_arm, bool tdi2,
+        int window_type, double window_alpha)
     {
         SharedMemoryChiSquaredComp(
             (cmplx*) return_pointer(h1_h1, "h1_h1"),
             (cmplx*) return_pointer(h2_h2, "h2_h2"),
             (cmplx*) return_pointer(h1_h2, "h1_h2"),
-            return_pointer(noise,        "noise"),
+            (cmplx*) return_pointer(noise,        "noise"),
             return_pointer(noise_index,  "noise_index"),
             return_pointer(amp,    "amp"),
             return_pointer(f0,     "f0"),
@@ -347,7 +361,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             return_pointer(start_freq_inds, "start_freq_inds"),
             data_length, tdi_channel_setup,
             device, do_synchronize,
-            num_data, num_noise);
+            num_data, num_noise,
+            return_pointer(Ps, "Ps"), L_arm, tdi2,
+            window_type, window_alpha);
     }
 
     void SharedMemoryGenerateGlobal_wrap(
@@ -362,7 +378,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         double T, double dt, int N, int num_bin_all,
         array_type<int> start_freq_inds,
         int data_length, int tdi_channel_setup,
-        int device, bool do_synchronize)
+        int device, bool do_synchronize,
+        array_type<double> Ps, double L_arm, bool tdi2,
+        int window_type, double window_alpha)
     {
         SharedMemoryGenerateGlobal(
             (cmplx*) return_pointer(data, "data"),
@@ -380,14 +398,16 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             T, dt, N, num_bin_all,
             return_pointer(start_freq_inds, "start_freq_inds"),
             data_length, tdi_channel_setup,
-            device, do_synchronize);
+            device, do_synchronize,
+            return_pointer(Ps, "Ps"), L_arm, tdi2,
+            window_type, window_alpha);
     }
 
     void SharedMemoryFstatLikeComp_wrap(
         array_type<std::complex<double>> M_mat,
         array_type<std::complex<double>> N_arr,
         array_type<std::complex<double>> data,
-        array_type<double> noise,
+        array_type<std::complex<double>> noise,
         array_type<int> data_index, array_type<int> noise_index,
         array_type<double> f0, array_type<double> fdot0,
         array_type<double> fddot0,
@@ -396,13 +416,15 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<int> start_freq_inds,
         int data_length, int tdi_channel_setup,
         int device, bool do_synchronize,
-        int num_data, int num_noise)
+        int num_data, int num_noise,
+        array_type<double> Ps, double L_arm, bool tdi2,
+        int window_type, double window_alpha)
     {
         SharedMemoryFstatLikeComp(
             (cmplx*) return_pointer(M_mat, "M_mat"),
             (cmplx*) return_pointer(N_arr, "N_arr"),
             (cmplx*) return_pointer(data,  "data"),
-            return_pointer(noise,        "noise"),
+            (cmplx*) return_pointer(noise,        "noise"),
             return_pointer(data_index,   "data_index"),
             return_pointer(noise_index,  "noise_index"),
             return_pointer(f0,     "f0"),
@@ -414,7 +436,61 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             return_pointer(start_freq_inds, "start_freq_inds"),
             data_length, tdi_channel_setup,
             device, do_synchronize,
-            num_data, num_noise);
+            num_data, num_noise,
+            return_pointer(Ps, "Ps"), L_arm, tdi2,
+            window_type, window_alpha);
+    }
+
+    // mojito (2026-06 merge): Fisher / information-matrix kernel. Re-expressed
+    // as nanobind from the mojito branch's sharedmemgbgpu.pyx
+    // SharedMemoryInfoMatComp_wrap (the .pyx was retired at the nanobind
+    // migration). Mirrors GBGPU.information_matrix's tuple_in ordering.
+    void SharedMemoryInfoMatComp_wrap(
+        array_type<double> info_mat,
+        array_type<std::complex<double>> d_dh_workspace,
+        array_type<std::complex<double>> noise,
+        array_type<int> noise_index,
+        array_type<int> inds,
+        array_type<double> amp, array_type<double> f0,
+        array_type<double> fdot0, array_type<double> fddot0,
+        array_type<double> phi0, array_type<double> iota,
+        array_type<double> psi, array_type<double> lam,
+        array_type<double> theta,
+        array_type<double> eps_scaled,
+        double eps_orig, double T, double dt, int N,
+        int num_bin_all, int num_derivs,
+        array_type<int> start_freq_inds,
+        int data_length, int tdi_channel_setup,
+        int device, bool do_synchronize,
+        int num_noise,
+        array_type<double> Ps, double L_arm, bool tdi2,
+        bool easy_central_difference,
+        int window_type, double window_alpha)
+    {
+        SharedMemoryInfoMatComp(
+            return_pointer(info_mat,                "info_mat"),
+            (cmplx*) return_pointer(d_dh_workspace, "d_dh_workspace"),
+            (cmplx*) return_pointer(noise,          "noise"),
+            return_pointer(noise_index,  "noise_index"),
+            return_pointer(inds,         "inds"),
+            return_pointer(amp,    "amp"),
+            return_pointer(f0,     "f0"),
+            return_pointer(fdot0,  "fdot0"),
+            return_pointer(fddot0, "fddot0"),
+            return_pointer(phi0,   "phi0"),
+            return_pointer(iota,   "iota"),
+            return_pointer(psi,    "psi"),
+            return_pointer(lam,    "lam"),
+            return_pointer(theta,  "theta"),
+            return_pointer(eps_scaled, "eps_scaled"),
+            eps_orig, T, dt, N, num_bin_all, num_derivs,
+            return_pointer(start_freq_inds, "start_freq_inds"),
+            data_length, tdi_channel_setup,
+            device, do_synchronize,
+            num_noise,
+            return_pointer(Ps, "Ps"), L_arm, tdi2,
+            easy_central_difference,
+            window_type, window_alpha);
     }
 };
 

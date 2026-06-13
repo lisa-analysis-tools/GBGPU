@@ -125,6 +125,13 @@ def _lat_methods_from_pycppdetector(_lat_pd, _gbt_interp, *, gpu: bool, xp):
         "WDMSettingsWrap": getattr(_lat_pd, f"WDMSettingsWrap{suffix}"),
         "WDMDomainWrap": getattr(_lat_pd, f"WDMDomainWrap{suffix}"),
         "FDDomainWrap": getattr(_lat_pd, f"FDDomainWrap{suffix}"),
+        # stft_tof merge (2026-06): LAT's LISAToolsBackendMethods now carries
+        # the STFT/FD domain wraps (STFTDomainWrap, FDDomainForStftWrap,
+        # STFTFresnelWrap) as required fields; mirror them here so the GBGPU
+        # backend composition supplies them.
+        "STFTDomainWrap": getattr(_lat_pd, f"STFTDomainWrap{suffix}"),
+        "FDDomainForStftWrap": getattr(_lat_pd, f"FDDomainForStftWrap{suffix}"),
+        "STFTFresnelWrap": getattr(_lat_pd, f"STFTFresnelWrap{suffix}"),
         "TDITypeDict": {"XYZ": _lat_pd.TDI_XYZ, "AET": _lat_pd.TDI_AET, "AE": _lat_pd.TDI_AE},
         "xp": xp,
     }

@@ -22,11 +22,10 @@ authors = [
 ]
 readme = "README.md"
 
-requires-python = ">= 3.9"
+requires-python = ">= 3.12"
 
 dependencies = [
   "lisaanalysistools>=1.0.17",
-  "exceptiongroup; python_version<'3.11'", # To access ExceptionGroup with Python 3.9 and 3.10
   "h5py",
   "matplotlib",
   "gpubackendtools",

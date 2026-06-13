@@ -23,9 +23,6 @@
 
 // # TODO: remove this
 CUDA_CALLABLE_MEMBER double Clight = 299792458.0;
-CUDA_CALLABLE_MEMBER double AU = 149597870700.0;
-CUDA_CALLABLE_MEMBER double SQ3 = 1.73205080757;
-CUDA_CALLABLE_MEMBER double lambda0 = 0.000000;
 using namespace std;
 
 // Recursive FFT function
@@ -58,45 +55,6 @@ vector<cmplx> fft(const vector<cmplx>& x) {
         y[i + N / 2] = q[i] - w * r[i];
     }
     return y;
-}
-
-CUDA_DEVICE
-void spacecraft(double P1[3], double P2[3], double P3[3], double t)
-{
-    // """Compute space craft positions as a function of time"""
-    // # kappa and lambda are constants determined in the Constants.h file
-
-    // # angular quantities defining orbit
-    double alpha = 2.0 * M_PI * fm * t + kappa;
-
-    double beta1 = 0.0 + lambda0;
-    double beta2 = 2.0 * M_PI / 3.0 + lambda0;
-    double beta3 = 4.0 * M_PI / 3.0 + lambda0;
-
-    double sa = sin(alpha);
-    double ca = cos(alpha);
-
-    // spacecraft 1
-    double sb = sin(beta1);
-    double cb = cos(beta1);
-
-    P1[0] = AU * ca + AU * ec * (sa * ca * sb - (1.0 + sa * sa) * cb);
-    P1[1] = AU * sa + AU * ec * (sa * ca * cb - (1.0 + ca * ca) * sb);
-    P1[2] = -SQ3 * AU * ec * (ca * cb + sa * sb);
-
-    // spacecraft 2
-    sb = sin(beta2);
-    cb = cos(beta2);
-    P2[0] = AU * ca + AU * ec * (sa * ca * sb - (1.0 + sa * sa) * cb);
-    P2[1] = AU * sa + AU * ec * (sa * ca * cb - (1.0 + ca * ca) * sb);
-    P2[2] = -SQ3 * AU * ec * (ca * cb + sa * sb);
-
-    // spacecraft 3
-    sb = sin(beta3);
-    cb = cos(beta3);
-    P3[0] = AU * ca + AU * ec * (sa * ca * sb - (1.0 + sa * sa) * cb);
-    P3[1] = AU * sa + AU * ec * (sa * ca * cb - (1.0 + ca * ca) * sb);
-    P3[2] = -SQ3 * AU * ec * (ca * cb + sa * sb);
 }
 
 CUDA_DEVICE
@@ -148,6 +106,48 @@ __inline__ void AET_from_XYZ_swap(cmplx *X_in, cmplx *Y_in, cmplx *Z_in)
     *Z_in = (X + Y + Z) / sqrt(3.0);
 }
 
+CUDA_DEVICE
+__inline__ double get_window_val(int i, int N, int window_type, double alpha)
+{
+    if (window_type == 0 || alpha <= 0.0 || N <= 1) return 1.0;
+    
+    if (window_type == 1) // Tukey
+    {
+        double r = (2.0 * i) / (alpha * (N - 1));
+        double l1 = rint((alpha * (N - 1)) / 2.0);
+        double l2 = rint((N - 1) * (1.0 - alpha / 2.0));
+        
+        if (i < l1) {
+            return 0.5 * (1.0 + cos(M_PI * (r - 1.0)));
+        } else if (i < l2) {
+            return 1.0;
+        } else {
+            return 0.5 * (1.0 + cos(M_PI * (r - 2.0 / alpha + 1.0)));
+        }
+    }
+    else if (window_type == 2) // Planck
+    {
+        double epsilon = alpha;
+        double n1 = epsilon * (N - 1);
+        double n2 = (1.0 - epsilon) * (N - 1);
+        
+        if (i < n1) {
+            double z1 = epsilon * (N - 1) / ((double)i + 1e-15) + epsilon * (N - 1) / ((double)i - epsilon * (N - 1) + 1e-15);
+            if (z1 > 700.0) z1 = 700.0;
+            if (z1 < -700.0) z1 = -700.0;
+            return 1.0 / (1.0 + exp(z1));
+        } else if (i <= n2) {
+            return 1.0;
+        } else {
+            double z2 = epsilon * (N - 1) / ((N - 1) - (double)i + 1e-15) + epsilon * (N - 1) / ((N - 1) - (double)i - epsilon * (N - 1) + 1e-15);
+            if (z2 > 700.0) z2 = 700.0;
+            if (z2 < -700.0) z2 = -700.0;
+            return 1.0 / (1.0 + exp(z2));
+        }
+    }
+    return 1.0;
+}
+
 #ifdef __CUDACC__
 template <class FFT>
  
@@ -169,10 +169,16 @@ void build_single_waveform(
     double dt,
     int N,
     int bin_i,
-    int tdi_channel_setup)
+    int tdi_channel_setup, 
+    double *Ps, 
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha) 
 {
 
     using complex_type = cmplx;
+    double f_star = Clight / (L_arm * 2.0 * M_PI);
 
     double eplus[9] = {0.};
     double ecross[9] = {0.};
@@ -272,7 +278,18 @@ void build_single_waveform(
     for (int i = start1; i < N; i += incr1)
     {
         t = i * delta_t_slow;
-        spacecraft(P1, P2, P3, t);
+        
+        P1[0] = Ps[0 * N * 3 + i * 3 + 0];
+        P1[1] = Ps[0 * N * 3 + i * 3 + 1];
+        P1[2] = Ps[0 * N * 3 + i * 3 + 2];
+
+        P2[0] = Ps[1 * N * 3 + i * 3 + 0];
+        P2[1] = Ps[1 * N * 3 + i * 3 + 1];
+        P2[2] = Ps[1 * N * 3 + i * 3 + 2];
+
+        P3[0] = Ps[2 * N * 3 + i * 3 + 0];
+        P3[1] = Ps[2 * N * 3 + i * 3 + 1];
+        P3[2] = Ps[2 * N * 3 + i * 3 + 2];
 
 // reset sum terms
 #pragma unroll
@@ -291,10 +308,10 @@ void build_single_waveform(
 #pragma unroll
         for (int j = 0; j < 3; j += 1)
         {
-            r12[j] = (P2[j] - P1[j]) / Larm;
-            r13[j] = (P3[j] - P1[j]) / Larm;
+            r12[j] = (P2[j] - P1[j]) / L_arm;
+            r13[j] = (P3[j] - P1[j]) / L_arm;
             r31[j] = -r13[j];
-            r23[j] = (P3[j] - P2[j]) / Larm;
+            r23[j] = (P3[j] - P2[j]) / L_arm;
 
             kdotr[0] += k[j] * r12[j];
             kdotr[1] += k[j] * r23[j];
@@ -317,7 +334,7 @@ void build_single_waveform(
             xi_tmp = t - kdotP[j];
             xi[j] = xi_tmp;
             fi = (f0 + fdot0 * xi_tmp + 1 / 2.0 * fddot0 * (xi_tmp * xi_tmp));
-            fonfs[j] = fi / fstar;
+            fonfs[j] = fi / f_star;
         }
 
 #pragma unroll
@@ -370,10 +387,12 @@ void build_single_waveform(
 
         f = (f0 + fdot0 * t + 1 / 2.0 * fddot0 * (t * t));
 
-        omL = f / fstar;
+        omL = f / f_star;
         SomL = sin(omL);
         fctr = gcmplx::exp(-I * omL);
         fctr2 = 4.0 * omL * SomL * fctr / amp;
+
+        double w_val = get_window_val(i, N, window_type, window_alpha);
 
         // order is (12, 23, 31, 21, 32, 13)
 
@@ -382,16 +401,16 @@ void build_single_waveform(
 
         // tmp_X = sin(2. * M_PI * f0 * t) + I * cos(2. * M_PI * f0 * t);
         // tmp2_X = complex_type {tmp_X.real(), tmp_X.imag()};
-        X[i] = tmp_X;
+        X[i] = tmp_X * w_val;
 
         tmp_Y = fctr2 * ((Gs[4] - Gs[0] + (Gs[1] - Gs[3]) * fctr));
         // tmp2_Y = complex_type {tmp_Y.real(), tmp_Y.imag()};
-        Y[i] = tmp_Y;
+        Y[i] = tmp_Y * w_val;
 
         tmp_Z = fctr2 * ((Gs[5] - Gs[1] + (Gs[2] - Gs[4]) * fctr));
         // tmp_Z = sin(2. * M_PI * f0 * t) + I * cos(2. * M_PI * f0 * t);
         // tmp2_Z = complex_type {tmp_Z.real(), tmp_Z.imag()};
-        Z[i] = tmp_Z;
+        Z[i] = tmp_Z * w_val;
     }
 
     CUDA_SYNCTHREADS;
@@ -434,12 +453,12 @@ void build_single_waveform(
     int N_over_2 = N / 2;
     fctr3 = 0.5 * T / (double)N;
 
-    // if (tdi2)
-    //{
-    //     omegaL = 2. * M_PI * f0_out * (Larm / Clight);
-    //     tdi2_factor = 2.0 * I * sin(2. * omegaL) * exp(-2. * I * omegaL);
-    //     fctr3 *= tdi2_factor;
-    // }
+    if (tdi2)
+    {
+        omegaL = 2. * M_PI * f0 * (L_arm / Clight);
+        tdi2_factor = 2.0 * I * sin(2. * omegaL) * exp(-2. * I * omegaL);
+        fctr3 *= tdi2_factor;
+    }
 
     // fftshift in numpy and multiply by fctr3
     for (int i = start1; i < N_over_2; i += incr1)
@@ -504,7 +523,12 @@ void get_waveform(
     double dt,
     int N,
     int num_bin_all,
-    int tdi_channel_setup)
+    int tdi_channel_setup,
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -553,7 +577,12 @@ void get_waveform(
             dt,
             N,
             bin_i,
-            tdi_channel_setup);
+            tdi_channel_setup,
+            Ps,
+            L_arm,
+            tdi2,
+            window_type,
+            window_alpha);
 
         start_inds_out[bin_i] = start_ind;
         
@@ -632,7 +661,12 @@ void get_waveform_wrap(InputInfo inputs)
         inputs.dt,
         inputs.N,
         inputs.num_bin_all,
-        inputs.tdi_channel_setup);
+        inputs.tdi_channel_setup,
+        inputs.Ps,
+        inputs.L_arm,
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     CUDA_CHECK_AND_EXIT(cudaDeviceSynchronize());
 
@@ -668,7 +702,12 @@ void SharedMemoryWaveComp(
     double dt,
     int N,
     int num_bin_all, 
-    int tdi_channel_setup)
+    int tdi_channel_setup, 
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -688,6 +727,11 @@ void SharedMemoryWaveComp(
     inputs.N = N;
     inputs.num_bin_all = num_bin_all;
     inputs.tdi_channel_setup = tdi_channel_setup;
+    inputs.Ps = Ps;
+    inputs.L_arm = L_arm;
+    inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -740,7 +784,12 @@ void SharedMemoryWaveComp(
         inputs.dt,
         inputs.N,
         inputs.num_bin_all,
-        inputs.tdi_channel_setup);
+        inputs.tdi_channel_setup,
+        inputs.Ps,
+        inputs.L_arm,
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 #endif
 }
 
@@ -764,7 +813,7 @@ void add_inner_product_contribution(
     int i_2, //
     int array_type_1,
     int array_type_2,
-    double *noise,
+    cmplx *noise, // noise CSD is complex for its off-diagonal elements in frequency domain
     int noise_ind,
     int noise_i,
     int data_ind, // ignored if array types are both templates
@@ -774,153 +823,99 @@ void add_inner_product_contribution(
     int num_data,
     int num_noise
 )
-{
-    int nchannels = 3;
-    double multi_factor = 1.0;
-    cmplx h1_i, h2_i;
-    double n;
-    int noise_ind_now, data_ind_now, template_ind_now;
-    if (tdi_channel_setup == TDI_CHANNEL_SETUP_AE) nchannels = 2;
+{   
+    int nchannels = (tdi_channel_setup == TDI_CHANNEL_SETUP_AE) ? 2 : 3;
+
+    // Local registers to optimize and bound global memory fetches
+    cmplx h1_v[3] = {0.0, 0.0, 0.0};
+    cmplx h2_v[3] = {0.0, 0.0, 0.0};
+    bool valid = true;
+
+    // int nchannels = 3;
+    // double multi_factor = 1.0;
+    // cmplx h1_i, h2_i;
+    // double n;
+    // if (tdi_channel_setup == TDI_CHANNEL_SETUP_AE) nchannels = 2;
+    
+    // gather values for all channels
+    for (int chan = 0; chan < nchannels; chan += 1)
+    {
+        if (array_type_1 == ARRAY_TYPE_DATA)
+        {  
+            int data_ind_now = (data_ind * nchannels + chan) * data_length + i_1;
+            if ((data_ind_now >= nchannels * data_length * num_data) || (i_1 > data_length) || (i_1 < 0))
+            {
+                printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_1, data_length);
+            }
+            else h1_v[chan] = h1[data_ind_now];
+        }
+        else
+        {
+            int template_ind_now = chan * N + i_1;
+            if ((template_ind_now >= nchannels * N) || (i_1 > N))
+            {
+                printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, nchannels * N, i_1, N);
+            }
+            else h1_v[chan] = h1[template_ind_now];
+        }
+
+        if (array_type_2 == ARRAY_TYPE_DATA)
+        {
+            int data_ind_now = (data_ind * nchannels + chan) * data_length + i_2;
+            if ((data_ind_now >= nchannels * data_length * num_data) || (i_2 > data_length))
+            {
+                printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_2, data_length);
+            }
+            else h2_v[chan] = h2[data_ind_now];
+        }
+        else
+        {
+            int template_ind_now = chan * N + i_2;
+            if ((template_ind_now >= nchannels * N) || (i_2 > N))
+            {
+                printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, nchannels * N, i_2, N);
+            }
+            else h2_v[chan] = h2[template_ind_now];
+        }
+    }
+
 
     if ((tdi_channel_setup == TDI_CHANNEL_SETUP_AE) || (tdi_channel_setup == TDI_CHANNEL_SETUP_AET))
     {
         for (int chan = 0; chan < nchannels; chan += 1)
         {
-            noise_ind_now = (noise_ind * nchannels + chan) * data_length + noise_i;
-            
-            if ((noise_ind_now >= nchannels * data_length * num_noise) | (noise_i > data_length))
+            int noise_ind_now = (noise_ind * nchannels + chan) * data_length + noise_i;
+            if ((noise_ind_now >= nchannels * data_length * num_noise) || (noise_i > data_length))
             {
                 printf("Above full noise range.%d, %d, %d, %d\n", noise_ind_now, nchannels * data_length * num_noise, noise_i, data_length);
                 continue;
             }
-            n = noise[noise_ind_now];
+            
+            cmplx n = noise[noise_ind_now];
 
-            if (array_type_1 == ARRAY_TYPE_DATA)
-            {
-                data_ind_now = (data_ind * nchannels + chan) * data_length + i_1;
-                if ((data_ind_now >= nchannels * data_length * num_data) | (i_1 > data_length))
-                {
-                    printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_1, data_length);
-                    continue;
-                }
-                h1_i = h1[data_ind_now];
-            }
-            else
-            {
-                template_ind_now = chan * N + i_1;
-                if ((template_ind_now >= nchannels * N) | (i_1 > N))
-                {
-                    printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, nchannels * N, i_1, N);
-                    continue;
-                }
-                h1_i = h1[template_ind_now];
-            }
-
-            if (array_type_2 == ARRAY_TYPE_DATA)
-            {
-                data_ind_now = (data_ind * nchannels + chan) * data_length + i_2;
-                if ((data_ind_now >= nchannels * data_length * num_data) | (i_2 > data_length))
-                {
-                    printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_1, data_length);
-                    continue;
-                }
-                h2_i = h2[data_ind_now];
-            }
-            else
-            {
-                template_ind_now = chan * N + i_2;
-                if ((template_ind_now >= nchannels * N) | (i_2 > N))
-                {
-                    printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, nchannels * N, i_2, N);
-                    continue;
-                }
-                h2_i = h2[template_ind_now];
-            }
-
-            *contrib_h1_h1 += (gcmplx::conj(h1_i) * h1_i * n); // n is invC
-            *contrib_h2_h2 += (gcmplx::conj(h2_i) * h2_i * n); // n is invC
-            *contrib_h1_h2 += (gcmplx::conj(h1_i) * h2_i * n); // n is invC
+            *contrib_h1_h1 += (gcmplx::conj(h1_v[chan]) * h1_v[chan] * n);
+            *contrib_h2_h2 += (gcmplx::conj(h2_v[chan]) * h2_v[chan] * n);
+            *contrib_h1_h2 += (gcmplx::conj(h1_v[chan]) * h2_v[chan] * n);
         }
     }
     else
     {
-        for (int chan_1 = 0; chan_1 < 3; chan_1 += 1)
+        for (int chan_1 = 0; chan_1 < nchannels; chan_1 += 1)
         {
-            for (int chan_2 = 0; chan_2 <= chan_1; chan_2 += 1)
+            for (int chan_2 = 0; chan_2 < nchannels; chan_2 += 1)
             {
-                
-                // nchannels has to be 3 here
-                if (array_type_1 == ARRAY_TYPE_DATA)
+                int noise_ind_now = ((noise_ind * nchannels + chan_1) * nchannels + chan_2) * data_length + noise_i;
+                if ((noise_ind_now >= nchannels * nchannels * data_length * num_noise) || (noise_i > data_length))
                 {
-                    data_ind_now = (data_ind * nchannels + chan_1) * data_length + i_1;
-                    if ((data_ind_now >= nchannels * data_length * num_data) | (i_1 > data_length))
-                    {
-                        printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_1, data_length);
-                        continue;
-                    }
-                    h1_i = h1[data_ind_now];
-                }
-                else
-                {
-                    template_ind_now = chan_1 * N + i_1;
-                    if ((template_ind_now >= nchannels * N) | (i_1 > N))
-                    {
-                        printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, N * nchannels, i_1, N);
-                        continue;
-                    }
-                    h1_i = h1[template_ind_now];
-                }
-
-                if (array_type_2 == ARRAY_TYPE_DATA)
-                {
-                    data_ind_now = (data_ind * nchannels + chan_2) * data_length + i_2;
-                    if ((data_ind_now >= nchannels * data_length * num_data) | (i_2 > data_length))
-                    {
-                        printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_2, data_length);
-                        continue;
-                    }
-                    h2_i = h2[data_ind_now];
-                }
-                else
-                {
-                    template_ind_now = chan_2 * N + i_2;
-                    if ((template_ind_now >= nchannels * N) | (i_2 > N))
-                    {
-                        printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, N * nchannels, i_2, N);
-                        continue;
-                    }
-                    h2_i = h2[template_ind_now];
-                }
-
-                noise_ind_now = ((noise_ind * 3 + chan_1) * 3 + chan_2) * data_length + noise_i;
-                if ((noise_ind_now >= nchannels * nchannels * data_length * num_noise) | (noise_i > data_length))
-                {
-                    printf("Above full noise range.%d, %d, %d, %d\n", noise_ind_now, nchannels * data_length * num_noise, noise_i, data_length);
+                    printf("Above full noise range.%d, %d, %d, %d\n", noise_ind_now, nchannels * nchannels * data_length * num_noise, noise_i, data_length);
                     continue;
                 }
-                n = noise[noise_ind_now];
+                
+                cmplx n = noise[noise_ind_now]; 
 
-                if (chan_1 == chan_2)
-                {
-                    // multi_factor lets us skip off-diagonal double counting need
-                    *contrib_h1_h1 += (gcmplx::conj(h1_i) * h1_i * n); // n is invC
-                    *contrib_h2_h2 += (gcmplx::conj(h2_i) * h2_i * n); // n is invC
-                    *contrib_h1_h2 += (gcmplx::conj(h1_i) * h2_i * n); // n is invC
-                }
-                else
-                {
-                    // multi_factor lets us skip off-diagonal double counting need
-                    // takes care of X.conj() * Y and Y.conj() * X in XY contributions.
-                    *contrib_h1_h1 += ((gcmplx::conj(h1_i) * h1_i * n) + (gcmplx::conj(h1_i) * h1_i * n)); // n is invC
-                    *contrib_h2_h2 += ((gcmplx::conj(h2_i) * h2_i * n) + (gcmplx::conj(h2_i) * h2_i * n)); // n is invC
-                    *contrib_h1_h2 += ((gcmplx::conj(h1_i) * h2_i * n) + (gcmplx::conj(h2_i) * h1_i * n)); // n is invC
-                }
-
-                // TODO: check
-                // multi_factor lets us skip off-diagonal double counting need
-                // *contrib_h1_h1 += (gcmplx::conj(h1_i) * h1_i * n); // n is invC
-                // *contrib_h2_h2 += (gcmplx::conj(h2_i) * h2_i * n); // n is invC
-                // *contrib_h1_h2 += (gcmplx::conj(h1_i) * h2_i * n); // n is invC
+                *contrib_h1_h1 += (gcmplx::conj(h1_v[chan_1]) * h1_v[chan_2] * n);
+                *contrib_h2_h2 += (gcmplx::conj(h2_v[chan_1]) * h2_v[chan_2] * n);
+                *contrib_h1_h2 += (gcmplx::conj(h1_v[chan_1]) * h2_v[chan_2] * n);
             }
         }
     }
@@ -934,7 +929,7 @@ void get_ll(
     cmplx *d_h,
     cmplx *h_h,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *amp,
@@ -954,7 +949,12 @@ void get_ll(
     int data_length,
     int tdi_channel_setup,
     int num_data, 
-    int num_noise)
+    int num_noise,
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -994,7 +994,6 @@ void get_ll(
     // example::io<FFT>::load_to_smem(this_block_data, shared_mem);
 
     cmplx d, h;
-    double n;
     int start_freq_ind;
 
 #ifdef __CUDACC__
@@ -1031,7 +1030,12 @@ void get_ll(
             dt,
             N,
             bin_i,
-            tdi_channel_setup);
+            tdi_channel_setup,
+            Ps,
+            L_arm,
+            tdi2,
+            window_type,
+            window_alpha);
 
         CUDA_SYNCTHREADS;
         tmp1 = 0.0;
@@ -1158,7 +1162,12 @@ void get_ll_wrap(InputInfo inputs)
         inputs.data_length,
         inputs.tdi_channel_setup, 
         inputs.num_data,
-        inputs.num_noise);
+        inputs.num_noise,
+        inputs.Ps,
+        inputs.L_arm,
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     if (inputs.do_synchronize)
@@ -1186,7 +1195,7 @@ void SharedMemoryLikeComp(
     cmplx *d_h,
     cmplx *h_h,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *amp,
@@ -1208,7 +1217,12 @@ void SharedMemoryLikeComp(
     int device,
     bool do_synchronize,
     int num_data,
-    int num_noise)
+    int num_noise,
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -1238,6 +1252,11 @@ void SharedMemoryLikeComp(
     inputs.do_synchronize = do_synchronize;
     inputs.num_data = num_data;
     inputs.num_noise = num_noise;
+    inputs.Ps = Ps;
+    inputs.L_arm = L_arm;
+    inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -1295,7 +1314,12 @@ void SharedMemoryLikeComp(
         inputs.data_length,
         inputs.tdi_channel_setup, 
         inputs.num_data,
-        inputs.num_noise);
+        inputs.num_noise,
+        inputs.Ps,
+        inputs.L_arm,
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
 #endif
     // const unsigned int arch = example::get_cuda_device_arch();
@@ -1322,7 +1346,7 @@ void get_swap_ll_diff(
     cmplx *add_add,
     cmplx *add_remove,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *amp_add,
@@ -1351,7 +1375,12 @@ void get_swap_ll_diff(
     int data_length,
     int tdi_channel_setup,
     int num_data,
-    int num_noise)
+    int num_noise, 
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -1411,15 +1440,11 @@ void get_swap_ll_diff(
     bool is_add_lower;
     int total_i_vals;
 
-    cmplx h_A, h_E, h_A_add, h_E_add, h_A_remove, h_E_remove;
     int real_ind, real_ind_add, real_ind_remove;
 
     int jj = 0;
     int j = 0;
     // example::io<FFT>::load_to_smem(this_block_data, shared_mem);
-
-    cmplx d_A, d_E;
-    double n_A, n_E;
 
 #ifdef __CUDACC__
     int start1 = blockIdx.x;
@@ -1461,7 +1486,12 @@ void get_swap_ll_diff(
             dt,
             N,
             bin_i,
-            tdi_channel_setup);
+            tdi_channel_setup,
+            Ps,
+            L_arm,
+            tdi2,
+            window_type,
+            window_alpha);
         CUDA_SYNCTHREADS;
 #ifdef __CUDACC__
         build_single_waveform<FFT>(
@@ -1483,7 +1513,12 @@ void get_swap_ll_diff(
             dt,
             N,
             bin_i,
-            tdi_channel_setup);
+            tdi_channel_setup,
+            Ps,
+            L_arm,
+            tdi2,
+            window_type,
+            window_alpha);
         CUDA_SYNCTHREADS;
 
         // subtract start_freq_ind to find index into subarray
@@ -1907,7 +1942,12 @@ void get_swap_ll_diff_wrap(InputInfo inputs)
         inputs.data_length,
         inputs.tdi_channel_setup,
         inputs.num_data,
-        inputs.num_noise);
+        inputs.num_noise,
+        inputs.Ps,
+        inputs.L_arm,
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     if (inputs.do_synchronize)
@@ -1938,7 +1978,7 @@ void SharedMemorySwapLikeComp(
     cmplx *add_add,
     cmplx *add_remove,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *amp_add,
@@ -1969,7 +2009,12 @@ void SharedMemorySwapLikeComp(
     int device,
     bool do_synchronize,
     int num_data,
-    int num_noise)
+    int num_noise,
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -2011,6 +2056,11 @@ void SharedMemorySwapLikeComp(
     inputs.do_synchronize = do_synchronize;
     inputs.num_data = num_data;
     inputs.num_noise = num_noise;
+    inputs.Ps = Ps;
+    inputs.L_arm = L_arm;
+    inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -2080,7 +2130,12 @@ void SharedMemorySwapLikeComp(
         inputs.data_length,
         inputs.tdi_channel_setup,
         inputs.num_data,
-        inputs.num_noise);
+        inputs.num_noise,
+        inputs.Ps,
+        inputs.L_arm,
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
 #endif
     // const unsigned int arch = example::get_cuda_device_arch();
@@ -2103,7 +2158,7 @@ void get_chi_squared(
     cmplx *h1_h1,
     cmplx *h2_h2,
     cmplx *h1_h2,
-    double *noise,
+    cmplx *noise,
     int *noise_index,
     double *amp,
     double *f0,
@@ -2122,7 +2177,12 @@ void get_chi_squared(
     int data_length,
     int tdi_channel_setup,
     int num_data, 
-    int num_noise)
+    int num_noise,
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -2179,7 +2239,6 @@ void get_chi_squared(
     cmplx _ignore_this = 0.0;
     cmplx _ignore_this_2 = 0.0;
     // example::io<FFT>::load_to_smem(this_block_data, shared_mem);
-    double n;
 #ifdef __CUDACC__
     int start1 = blockIdx.x;
     int incr1 = gridDim.x;
@@ -2226,7 +2285,12 @@ void get_chi_squared(
                 T,
                 dt,
                 N,
-                bin_i, tdi_channel_setup);
+                bin_i, tdi_channel_setup,
+                Ps,
+                L_arm,
+                tdi2,
+                window_type,
+                window_alpha);
             CUDA_SYNCTHREADS;
 #ifdef __CUDACC__
             build_single_waveform<FFT>(
@@ -2247,7 +2311,12 @@ void get_chi_squared(
                 T,
                 dt,
                 N,
-                bin_i, tdi_channel_setup);
+                bin_i, tdi_channel_setup,
+                Ps,
+                L_arm,
+                tdi2,
+                window_type,
+                window_alpha);
             CUDA_SYNCTHREADS;
 
             // subtract start_freq_ind to find index into subarray
@@ -2556,7 +2625,12 @@ void get_chi_squared_wrap(InputInfo inputs)
         inputs.data_length,
         inputs.tdi_channel_setup,
         inputs.num_data, 
-        inputs.num_noise);
+        inputs.num_noise, 
+        inputs.Ps,
+        inputs.L_arm,
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     if (inputs.do_synchronize)
@@ -2584,7 +2658,7 @@ void SharedMemoryChiSquaredComp(
     cmplx *h1_h1,
     cmplx *h2_h2,
     cmplx *h1_h2,
-    double *noise,
+    cmplx *noise,
     int *noise_index,
     double *amp,
     double *f0,
@@ -2605,7 +2679,12 @@ void SharedMemoryChiSquaredComp(
     int device,
     bool do_synchronize,
     int num_data, 
-    int num_noise)
+    int num_noise,
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -2635,6 +2714,11 @@ void SharedMemoryChiSquaredComp(
     inputs.do_synchronize = do_synchronize;
     inputs.num_data = num_data;
     inputs.num_noise = num_noise;
+    inputs.Ps = Ps;
+    inputs.L_arm = L_arm;
+    inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -2691,7 +2775,12 @@ void SharedMemoryChiSquaredComp(
         inputs.data_length,
         inputs.tdi_channel_setup,
         inputs.num_data, 
-        inputs.num_noise);
+        inputs.num_noise,
+        inputs.Ps,
+        inputs.L_arm, 
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 #endif
     // const unsigned int arch = example::get_cuda_device_arch();
     // simple_block_fft<800>(x);
@@ -2780,7 +2869,12 @@ void generate_global_template(
     int num_bin_all,
     int *start_freq_inds,
     int data_length,
-    int tdi_channel_setup)
+    int tdi_channel_setup,
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -2848,7 +2942,12 @@ void generate_global_template(
             dt,
             N,
             bin_i,
-            tdi_channel_setup);
+            tdi_channel_setup,
+            Ps,
+            L_arm, 
+            tdi2,
+            window_type,
+            window_alpha);
 
         CUDA_SYNCTHREADS;
 #ifdef __CUDACC__
@@ -2940,7 +3039,12 @@ void generate_global_template_wrap(InputInfo inputs)
         inputs.num_bin_all,
         inputs.start_freq_inds,
         inputs.data_length,
-        inputs.tdi_channel_setup);
+        inputs.tdi_channel_setup,
+        inputs.Ps,
+        inputs.L_arm,
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     if (inputs.do_synchronize)
@@ -2985,7 +3089,12 @@ void SharedMemoryGenerateGlobal(
     int data_length,
     int tdi_channel_setup,
     int device,
-    bool do_synchronize)
+    bool do_synchronize,
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -3010,6 +3119,11 @@ void SharedMemoryGenerateGlobal(
     inputs.device = device;
     inputs.do_synchronize = do_synchronize;
     inputs.tdi_channel_setup = tdi_channel_setup;
+    inputs.Ps = Ps;
+    inputs.L_arm = L_arm;
+    inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -3062,7 +3176,12 @@ void SharedMemoryGenerateGlobal(
         inputs.num_bin_all,
         inputs.start_freq_inds,
         inputs.data_length,
-        inputs.tdi_channel_setup);
+        inputs.tdi_channel_setup,
+        inputs.Ps,
+        inputs.L_arm,
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
 #endif
     // const unsigned int arch = example::get_cuda_device_arch();
@@ -3087,7 +3206,7 @@ void get_fstat_ll(
     cmplx *M_mat,
     cmplx *N_arr,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *f0,
@@ -3103,7 +3222,12 @@ void get_fstat_ll(
     int data_length,
     int tdi_channel_setup,
     int num_data, 
-    int num_noise)
+    int num_noise, 
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
     using complex_type = cmplx;
 
@@ -3146,7 +3270,6 @@ void get_fstat_ll(
     // example::io<FFT>::load_to_smem(this_block_data, shared_mem);
 
     cmplx d, h;
-    double n;
     int start_freq_ind;
 
     double iota_arr[4] = {M_PI / 2.0, M_PI / 2.0, M_PI / 2.0, M_PI / 2.0};
@@ -3199,7 +3322,12 @@ void get_fstat_ll(
                 dt,
                 N,
                 bin_i,
-                tdi_channel_setup
+                tdi_channel_setup,
+                Ps,
+                L_arm,
+                tdi2,
+                window_type,
+                window_alpha
             );
             CUDA_SYNCTHREADS;
         }
@@ -3223,19 +3351,16 @@ void get_fstat_ll(
             for (int i = start2; i < N; i += incr2)
             {
                 jj = i + start_ind - start_freq_ind;
-                for (int chan = 0; chan < nchannels; chan += 1)
-                {
-                    
-                    add_inner_product_contribution(
-                        &tmp2, &_ignore_this, &_ignore_this_2, 
-                        data, &wave[(ii * 3 * N) + chan * N], 
-                        jj, i, 
-                        ARRAY_TYPE_DATA, ARRAY_TYPE_TEMPLATE,
-                        noise, noise_ind, jj,
-                        data_ind, tdi_channel_setup, data_length, N,
-                        num_data, num_noise
-                    );
-                }
+               
+                add_inner_product_contribution(
+                    &tmp2, &_ignore_this, &_ignore_this_2, 
+                    data, &wave[ii * 3 * N], 
+                    jj, i, 
+                    ARRAY_TYPE_DATA, ARRAY_TYPE_TEMPLATE,
+                    noise, noise_ind, jj,
+                    data_ind, tdi_channel_setup, data_length, N,
+                    num_data, num_noise
+                );
             }
             CUDA_SYNCTHREADS;
             N_temp[tid] = tmp2;
@@ -3267,18 +3392,16 @@ void get_fstat_ll(
                 for (int i = start2; i < N; i += incr2)
                 {
                     jj = i + start_ind - start_freq_ind;
-                    for (int chan = 0; chan < nchannels; chan += 1)
-                    {
-                        add_inner_product_contribution(
-                            &tmp1, &_ignore_this, &_ignore_this_2, 
-                            &wave[(ii * 3 * N) + chan * N], &wave[(kk * 3 * N) + chan * N], 
-                            i, i,
-                            ARRAY_TYPE_TEMPLATE, ARRAY_TYPE_TEMPLATE,
-                            noise, noise_ind, jj,
-                            data_ind, tdi_channel_setup, data_length, N,
-                            num_data, num_noise
-                        );
-                    }
+
+                    add_inner_product_contribution(
+                        &tmp1, &_ignore_this, &_ignore_this_2, 
+                        &wave[ii * 3 * N], &wave[kk * 3 * N], 
+                        i, i,
+                        ARRAY_TYPE_TEMPLATE, ARRAY_TYPE_TEMPLATE,
+                        noise, noise_ind, jj,
+                        data_ind, tdi_channel_setup, data_length, N,
+                        num_data, num_noise
+                    );
                 }
                 
                 M_temp[tid] = tmp1;
@@ -3374,7 +3497,12 @@ void get_fstat_ll_wrap(InputInfo inputs)
         inputs.data_length,
         inputs.tdi_channel_setup, 
         inputs.num_data,
-        inputs.num_noise);
+        inputs.num_noise,
+        inputs.Ps,
+        inputs.L_arm,
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
     if (inputs.do_synchronize)
@@ -3402,7 +3530,7 @@ void SharedMemoryFstatLikeComp(
     cmplx *M_mat,
     cmplx *N_arr,
     cmplx *data,
-    double *noise,
+    cmplx *noise,
     int *data_index,
     int *noise_index,
     double *f0,
@@ -3420,7 +3548,12 @@ void SharedMemoryFstatLikeComp(
     int device,
     bool do_synchronize,
     int num_data,
-    int num_noise)
+    int num_noise,
+    double *Ps,
+    double L_arm,
+    bool tdi2,
+    int window_type,
+    double window_alpha)
 {
 
     InputInfo inputs;
@@ -3446,6 +3579,11 @@ void SharedMemoryFstatLikeComp(
     inputs.do_synchronize = do_synchronize;
     inputs.num_data = num_data;
     inputs.num_noise = num_noise;
+    inputs.Ps = Ps;
+    inputs.L_arm = L_arm;
+    inputs.tdi2 = tdi2;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
 
 #ifdef __CUDACC__
     switch (N)
@@ -3500,11 +3638,320 @@ void SharedMemoryFstatLikeComp(
         inputs.data_length,
         inputs.tdi_channel_setup, 
         inputs.num_data,
-        inputs.num_noise);
+        inputs.num_noise,
+        inputs.Ps,
+        inputs.L_arm,
+        inputs.tdi2,
+        inputs.window_type,
+        inputs.window_alpha);
 
 #endif
     // const unsigned int arch = example::get_cuda_device_arch();
     // simple_block_fft<800>(x);
+}
+
+
+#ifdef __CUDACC__
+template <class FFT>
+__launch_bounds__(FFT::max_threads_per_block) __global__ 
+void get_info_dh_kernel(
+    cmplx* d_dh,
+    double* amp, 
+    double* f0, 
+    double* fdot0, 
+    double* fddot0, 
+    double* phi0,
+    double* iota, 
+    double* psi,
+    double* lam, 
+    double* theta,
+    int* inds, 
+    double* eps_scaled, 
+    double eps_orig, 
+    bool easy_central_difference,
+    double T, 
+    double dt, 
+    int N, 
+    int num_bin_all, 
+    int num_derivs,
+    int tdi_channel_setup, 
+    double* Ps, 
+    double L_arm, 
+    bool tdi2,
+    int window_type, 
+    double window_alpha
+) {
+    int bin_i = blockIdx.x;
+    int deriv_i = blockIdx.y;
+    if (bin_i >= num_bin_all || deriv_i >= num_derivs) return;
+
+    int ind = inds[deriv_i];
+    cmplx* my_dh = &d_dh[(bin_i * num_derivs + deriv_i) * 3 * N];
+
+    double step = eps_scaled[bin_i * num_derivs + deriv_i];
+
+    extern __shared__ unsigned char shared_mem[];
+    cmplx* wave = (cmplx*)shared_mem;
+
+    unsigned int start_ind = 0;
+
+    for (int i = threadIdx.x; i < 3 * N; i += blockDim.x) {
+        my_dh[i] = 0.0;
+    }
+    CUDA_SYNCTHREADS;
+
+    auto build_and_add = [&](double coef, double step_mult) {
+        double p_amp = amp[bin_i];
+        double p_f0 = f0[bin_i];
+        double p_fdot0 = fdot0[bin_i];
+        double p_fddot0 = fddot0[bin_i];
+        double p_phi0 = phi0[bin_i];
+        double p_iota = iota[bin_i];
+        double p_psi = psi[bin_i];
+        double p_lam = lam[bin_i];
+        double p_theta = theta[bin_i];
+
+        double mod_eps = step_mult * step * eps_orig;
+        if (ind == 0) p_amp += mod_eps;
+        else if (ind == 1) p_f0 += mod_eps;
+        else if (ind == 2) p_fdot0 += mod_eps;
+        else if (ind == 3) p_fddot0 += mod_eps;
+        else if (ind == 4) p_phi0 += mod_eps;
+        else if (ind == 5) p_iota += mod_eps;
+        else if (ind == 6) p_psi += mod_eps;
+        else if (ind == 7) p_lam += mod_eps;
+        else if (ind == 8) p_theta += mod_eps;
+
+        build_single_waveform<FFT>(
+            wave, &start_ind,
+            p_amp, p_f0, p_fdot0, p_fddot0, p_phi0, p_iota, p_psi, p_lam, p_theta,
+            T, dt, N, bin_i, tdi_channel_setup, Ps, L_arm, tdi2, window_type, window_alpha
+        );
+        CUDA_SYNCTHREADS;
+
+        for (int i = threadIdx.x; i < 3 * N; i += blockDim.x) {
+            my_dh[i] += coef * wave[i];
+        }
+        CUDA_SYNCTHREADS;
+    };
+    // double abs_step = fabs(step);
+    if (easy_central_difference) {
+
+        build_and_add(1.0 / (2.0 * eps_orig), 1.0);
+        build_and_add(-1.0 / (2.0 * eps_orig), -1.0);
+    } else {
+        build_and_add(-1.0 / (12.0 * eps_orig), 2.0);
+        build_and_add(1.0 / (12.0 * eps_orig), -2.0);
+        build_and_add(8.0 / (12.0 * eps_orig), 1.0);
+        build_and_add(-8.0 / (12.0 * eps_orig), -1.0);
+    }
+}
+
+template <class FFT>
+__launch_bounds__(FFT::max_threads_per_block) __global__ 
+void get_info_inner_kernel(
+    double* info_mat, cmplx* d_dh,
+    cmplx* noise, int* noise_index, int* start_freq_inds,
+    double T, int N, int num_bin_all, int num_derivs,
+    int data_length, int tdi_channel_setup
+) {
+    int bin_i = blockIdx.x;
+    if (bin_i >= num_bin_all) return;
+
+    extern __shared__ double sdata_info[]; 
+
+    int nchannels = (tdi_channel_setup == TDI_CHANNEL_SETUP_AE) ? 2 : 3;
+    double df = 1.0 / T;
+    int noise_ind = noise_index[bin_i];
+    int start_freq_ind = start_freq_inds[bin_i];
+
+    int tid = threadIdx.x;
+
+    for (int d1 = 0; d1 < num_derivs; d1++) {
+        for (int d2 = d1; d2 < num_derivs; d2++) {
+            cmplx* dh1 = &d_dh[(bin_i * num_derivs + d1) * 3 * N];
+            cmplx* dh2 = &d_dh[(bin_i * num_derivs + d2) * 3 * N];
+
+            double sum = 0.0;
+            for (int i = tid; i < N; i += blockDim.x) {
+                int jj = start_freq_ind + i;
+                if (jj < 0 || jj >= data_length) continue; 
+
+                if (tdi_channel_setup == TDI_CHANNEL_SETUP_XYZ) {
+                    for (int c1 = 0; c1 < 3; c1++) {
+                        for (int c2 = 0; c2 < 3; c2++) {
+                            int noise_idx = ((noise_ind * 3 + c1) * 3 + c2) * data_length + jj;
+                            cmplx n = noise[noise_idx];
+                            cmplx v1 = dh1[c1 * N + i];
+                            cmplx v2 = dh2[c2 * N + i];
+                            sum += (gcmplx::conj(v1) * n * v2).real();
+                        }
+                    }
+                } else {
+                    for (int c1 = 0; c1 < nchannels; c1++) {
+                        int noise_idx = (noise_ind * nchannels + c1) * data_length + jj;
+                        cmplx n = noise[noise_idx];
+                        cmplx v1 = dh1[c1 * N + i];
+                        cmplx v2 = dh2[c1 * N + i];
+                        sum += (gcmplx::conj(v1) * n * v2).real();
+                    }
+                }
+            }
+
+            sdata_info[tid] = sum;
+            CUDA_SYNCTHREADS;
+
+            for (unsigned int s = 1; s < blockDim.x; s *= 2) {
+                if (tid % (2 * s) == 0) {
+                    sdata_info[tid] += sdata_info[tid + s];
+                }
+                CUDA_SYNCTHREADS;
+            }
+
+            if (tid == 0) {
+                double final_val = 4.0 * df * sdata_info[0];
+                info_mat[(bin_i * num_derivs + d1) * num_derivs + d2] = final_val;
+                if (d1 != d2) {
+                    info_mat[(bin_i * num_derivs + d2) * num_derivs + d1] = final_val;
+                }
+            }
+            CUDA_SYNCTHREADS;
+        }
+    }
+}
+
+template <unsigned int Arch, unsigned int N>
+void get_info_mat_wrap(InputInfo inputs) {
+    using namespace cufftdx;
+    if (inputs.device >= 0) {
+        CUDA_CHECK_AND_EXIT(cudaSetDevice(inputs.device));
+    }
+
+    using FFT = decltype(Block() + Size<N>() + Type<fft_type::c2c>() + Direction<fft_direction::forward>() +
+                         Precision<double>() + ElementsPerThread<8>() + FFTsPerBlock<1>() + SM<Arch>());
+
+    auto size_bytes = FFT::ffts_per_block * cufftdx::size_of<FFT>::value * sizeof(cmplx);
+    auto shared_memory_size = std::max((unsigned int)FFT::shared_memory_size, (unsigned int)(3 * N * sizeof(cmplx)));
+
+    CUDA_CHECK_AND_EXIT(cudaFuncSetAttribute(get_info_dh_kernel<FFT>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_memory_size));
+
+    dim3 grid1(inputs.num_bin_all, inputs.num_derivs);
+    get_info_dh_kernel<FFT><<<grid1, FFT::block_dim, shared_memory_size>>>(
+        inputs.d_dh_workspace,
+        inputs.amp, inputs.f0, inputs.fdot0, inputs.fddot0, inputs.phi0,
+        inputs.iota, inputs.psi, inputs.lam, inputs.theta,
+        inputs.inds, inputs.eps_scaled, inputs.eps_orig, inputs.easy_central_difference,
+        inputs.T, inputs.dt, inputs.N, inputs.num_bin_all, inputs.num_derivs,
+        inputs.tdi_channel_setup, inputs.Ps, inputs.L_arm, inputs.tdi2,
+        inputs.window_type, inputs.window_alpha
+    );
+    CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
+
+    dim3 grid2(inputs.num_bin_all);
+    size_t smem_reduce = FFT::block_dim.x * sizeof(double);
+    CUDA_CHECK_AND_EXIT(cudaFuncSetAttribute(get_info_inner_kernel<FFT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_reduce));
+
+    get_info_inner_kernel<FFT><<<grid2, FFT::block_dim, smem_reduce>>>(
+        inputs.info_mat, inputs.d_dh_workspace, inputs.noise, inputs.noise_index, inputs.start_freq_inds,
+        inputs.T, inputs.N, inputs.num_bin_all, inputs.num_derivs,
+        inputs.data_length, inputs.tdi_channel_setup
+    );
+    CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
+
+    if (inputs.do_synchronize) {
+        CUDA_CHECK_AND_EXIT(cudaDeviceSynchronize());
+    }
+}
+
+template <unsigned int Arch, unsigned int N>
+struct get_info_mat_wrap_functor {
+    void operator()(InputInfo inputs) { return get_info_mat_wrap<Arch, N>(inputs); }
+};
+#endif
+
+void SharedMemoryInfoMatComp(
+    double* info_mat,
+    cmplx* d_dh_workspace,
+    cmplx* noise,
+    int* noise_index,
+    int* inds,
+    double* amp, 
+    double* f0, 
+    double* fdot0, 
+    double* fddot0, 
+    double* phi0, 
+    double* iota,
+    double* psi, 
+    double* lam,
+    double* theta,
+    double* eps_scaled, 
+    double eps_orig,
+    double T, 
+    double dt,
+    int N,
+    int num_bin_all,
+    int num_derivs,
+    int* start_freq_inds,
+    int data_length,
+    int tdi_channel_setup,
+    int device,
+    bool do_synchronize,
+    int num_noise,
+    double* Ps,
+    double L_arm,
+    bool tdi2,
+    bool easy_central_difference,
+    int window_type,
+    double window_alpha
+) {
+    InputInfo inputs;
+    inputs.info_mat = info_mat;
+    inputs.d_dh_workspace = d_dh_workspace;
+    inputs.noise = noise;
+    inputs.noise_index = noise_index;
+    inputs.inds = inds;
+    inputs.amp = amp;
+    inputs.f0 = f0;
+    inputs.fdot0 = fdot0;
+    inputs.fddot0 = fddot0;
+    inputs.phi0 = phi0;
+    inputs.iota = iota;
+    inputs.psi = psi;
+    inputs.lam = lam;
+    inputs.theta = theta;
+    inputs.eps_scaled = eps_scaled;
+    inputs.eps_orig = eps_orig;
+    inputs.T = T;
+    inputs.dt = dt;
+    inputs.N = N;
+    inputs.num_bin_all = num_bin_all;
+    inputs.num_derivs = num_derivs;
+    inputs.start_freq_inds = start_freq_inds;
+    inputs.data_length = data_length;
+    inputs.tdi_channel_setup = tdi_channel_setup;
+    inputs.device = device;
+    inputs.do_synchronize = do_synchronize;
+    inputs.num_noise = num_noise;
+    inputs.Ps = Ps;
+    inputs.L_arm = L_arm;
+    inputs.tdi2 = tdi2;
+    inputs.easy_central_difference = easy_central_difference;
+    inputs.window_type = window_type;
+    inputs.window_alpha = window_alpha;
+
+#ifdef __CUDACC__
+    switch (N) {
+    case 32:   example::sm_runner<get_info_mat_wrap_functor, 32>(inputs);   return;
+    case 64:   example::sm_runner<get_info_mat_wrap_functor, 64>(inputs);   return;
+    case 128:  example::sm_runner<get_info_mat_wrap_functor, 128>(inputs);  return;
+    case 256:  example::sm_runner<get_info_mat_wrap_functor, 256>(inputs);  return;
+    case 512:  example::sm_runner<get_info_mat_wrap_functor, 512>(inputs);  return;
+    case 1024: example::sm_runner<get_info_mat_wrap_functor, 1024>(inputs); return;
+    case 2048: example::sm_runner<get_info_mat_wrap_functor, 2048>(inputs); return;
+    default:
+        throw std::invalid_argument("N must be a multiple of 2 between 32 and 2048.");
+    }
+#endif
 }
 
 //////////////////
