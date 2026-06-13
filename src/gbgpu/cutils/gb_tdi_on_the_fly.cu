@@ -1526,7 +1526,7 @@ void GBComputationGroup::gb_wdm_het_fill_global_wrap(
     int nchannels, int n_rfft_chunk,
     double T_chunk, double dt, double T, double t_ref,
     double tukey_alpha, int grid_dim, int N_cp_sig, int N_cp_orbit,
-    int m_band_half_width)
+    int m_band_half_width, bool active_band)
 {
     wdm_het_fill_global_impl<GBTDIonTheFly>(
         template_fill, orbits, tdi_config,
@@ -1536,7 +1536,7 @@ void GBComputationGroup::gb_wdm_het_fill_global_wrap(
         wdm_window, n_chunks, num_bin, nparams,
         Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
         nchannels, n_rfft_chunk, T_chunk, dt, T, t_ref, tukey_alpha,
-        grid_dim, N_cp_sig, N_cp_orbit, m_band_half_width);
+        grid_dim, N_cp_sig, N_cp_orbit, m_band_half_width, active_band);
 }
 
 void GBComputationGroup::gb_wdm_het_get_ll_wrap(

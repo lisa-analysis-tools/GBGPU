@@ -207,13 +207,21 @@ void GBComputationGroupWrap::gb_wdm_het_fill_global(
     int nchannels, int n_rfft_chunk,
     double T_chunk, double dt, double T, double t_ref,
     double tukey_alpha, int grid_dim, int N_cp_sig, int N_cp_orbit,
-    int m_band_half_width)
+    int m_band_half_width, bool active_band)
 {
     const int Nf = wdm_settings_wrap->wdm_settings->Nf;
     const int Nt = wdm_settings_wrap->wdm_settings->Nt;
+    // active_band selects the template_fill layout: false -> dense parent grid
+    // (nchannels, Nf, Nt); true -> active-band (nchannels, Nf_active, Nt_active),
+    // mirroring WDMDomain so a settings-path AnalysisContainer buffer is
+    // written/subtracted directly. Check the length matching the chosen layout.
+    const size_t templ_len = active_band
+        ? (size_t) nchannels * wdm_settings_wrap->wdm_settings->Nf_active
+                             * wdm_settings_wrap->wdm_settings->Nt_active
+        : (size_t) nchannels * Nf * Nt;
     gb_wdm_het_fill_global_wrap(
         return_pointer_and_check_length(template_fill, "template_fill",
-                                        (size_t) nchannels * Nf * Nt, 1),
+                                        templ_len, 1),
         orbits_wrap->orbits, tdi_config_wrap->tdi_config,
         wdm_settings_wrap->wdm_settings,
         return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
@@ -228,7 +236,7 @@ void GBComputationGroupWrap::gb_wdm_het_fill_global(
         N_sparse, log2_N_sparse,
         nchannels, n_rfft_chunk,
         T_chunk, dt, T, t_ref, tukey_alpha, grid_dim, N_cp_sig, N_cp_orbit,
-        m_band_half_width);
+        m_band_half_width, active_band);
 }
 
 void GBComputationGroupWrap::gb_wdm_het_get_ll(
