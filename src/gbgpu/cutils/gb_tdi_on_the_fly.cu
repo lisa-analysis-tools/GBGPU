@@ -2045,6 +2045,7 @@ void GBComputationGroup::gb_signal_het_get_ll_sparse_wrap(
     cmplx  *c0_sparse_all,
     cmplx  *A0_all, cmplx *A1_all,
     cmplx  *B0_all, cmplx *B1_all,
+    cmplx  *B0nc_all, cmplx *B1nc_all,
     double *wdm_window, int *n_sparse_local_arr,
     double *params_cand_all, double *params_ref_all,
     int    *data_index_all,
@@ -2056,8 +2057,14 @@ void GBComputationGroup::gb_signal_het_get_ll_sparse_wrap(
     int     m_active_half_width,
     double  layer_df, double dt,
     int     nchannels, int tdi_type,
-    int     N_sparse_fd, double max_r)
+    int     N_sparse_fd, double max_r, int project_real)
 {
+    // project_real != 0: compute the REAL WDM likelihood. <d|h> is exact via the
+    // repacked A0/A1 coefficients (no kernel change here -- the same 0.5*Re(A0*r)
+    // gives the real value). <h|h> adds the NONCONJ blocks B0nc/B1nc so that
+    // 0.5*Re(B0*conj(rc)rc2 + B0nc*rc*rc2 + ...) is the real projection (drops the
+    // dr^2 term -> standard linear-r budget off-reference). project_real == 0
+    // reproduces the legacy (complex/Hermitian) behaviour and ignores B0nc/B1nc.
     (void) params_ref_all; (void) fdot_idx; (void) num_data; (void) Nt_active;
 
 #ifdef __CUDACC__
@@ -2233,6 +2240,14 @@ void GBComputationGroup::gb_signal_het_get_ll_sparse_wrap(
                         const cmplx r_outer = gcmplx::conj(r_c) * r_c2;
                         const cmplx cross_drr = gcmplx::conj(r_c) * dr_c2 + gcmplx::conj(dr_c) * r_c2;
                         h_h_raw += b0 * r_outer + b1 * cross_drr;
+                        if (project_real) {
+                            const cmplx b0nc = B0nc_all[(((size_t) data_idx * nchannels + c) * nchannels + c2) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
+                            const cmplx b1nc = B1nc_all[(((size_t) data_idx * nchannels + c) * nchannels + c2) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
+                            // nonconj pairing r_c*r_c2 (NOT conj) -> with the conj
+                            // term, 0.5*Re(...) is the real WDM projection.
+                            h_h_raw += b0nc * (r_c * r_c2)
+                                     + b1nc * (r_c * dr_c2 + dr_c * r_c2);
+                        }
                     }
                 }
         } else {
@@ -2246,6 +2261,11 @@ void GBComputationGroup::gb_signal_het_get_ll_sparse_wrap(
                     const double rsq = (gcmplx::conj(r) * r).real();
                     const cmplx cross_drr = gcmplx::conj(r) * dr + gcmplx::conj(dr) * r;
                     h_h_raw += b0 * rsq + b1 * cross_drr;
+                    if (project_real) {
+                        const cmplx b0nc = B0nc_all[((size_t) data_idx * nchannels + c) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
+                        const cmplx b1nc = B1nc_all[((size_t) data_idx * nchannels + c) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
+                        h_h_raw += b0nc * (r * r) + b1nc * (r * dr + dr * r);
+                    }
                 }
             }
         }
@@ -2278,6 +2298,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
     cmplx  *c0_sparse_all,
     cmplx  *A0_all, cmplx *A1_all,
     cmplx  *B0_all, cmplx *B1_all,
+    cmplx  *B0nc_all, cmplx *B1nc_all,
     double *wdm_window,
     int    *n_sparse_local_arr,
     double *params_cand_all,
@@ -2292,7 +2313,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
     double  layer_df, double dt,
     double  T_obs, double t_start,
     int     nchannels, int tdi_type,
-    int     N_sparse_fd, double tukey_alpha, double max_r)
+    int     N_sparse_fd, double tukey_alpha, double max_r, int project_real)
 {
 #ifdef __CUDACC__
     throw std::runtime_error(
@@ -2348,6 +2369,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
         X_het.data(), k_f0_buf.data(),
         c0_sparse_all,
         A0_all, A1_all, B0_all, B1_all,
+        B0nc_all, B1nc_all,
         wdm_window, n_sparse_local_arr,
         params_cand_all, params_ref_all, data_index_all,
         num_bin, num_data,
@@ -2358,7 +2380,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
         m_active_half_width,
         layer_df, dt,
         nchannels, tdi_type,
-        N_sparse_fd, max_r);
+        N_sparse_fd, max_r, project_real);
 }
 
 
@@ -2743,6 +2765,7 @@ void GBComputationGroup::gb_signal_het_get_ll_grad_in_kernel_wrap(
             &d_h_C, &h_h_C,
             c0_sparse_all,
             A0_all, A1_all, B0_all, B1_all,
+            nullptr, nullptr,   /* B0nc/B1nc: grad stays complex for now */
             wdm_window, n_sparse_local_arr,
             params_priv.data(), params_ref_all, &data_idx_local,
             1, num_data,
@@ -2754,7 +2777,7 @@ void GBComputationGroup::gb_signal_het_get_ll_grad_in_kernel_wrap(
             layer_df, dt,
             T_obs, t_start,
             nchannels, tdi_type,
-            N_sparse_fd, tukey_alpha, max_r);
+            N_sparse_fd, tukey_alpha, max_r, 0);
 
         d_h_central[bin] = d_h_C;
         h_h_central[bin] = h_h_C;
@@ -2776,6 +2799,7 @@ void GBComputationGroup::gb_signal_het_get_ll_grad_in_kernel_wrap(
                 &d_h_P, &h_h_P,
                 c0_sparse_all,
                 A0_all, A1_all, B0_all, B1_all,
+                nullptr, nullptr,   /* B0nc/B1nc: grad stays complex for now */
                 wdm_window, n_sparse_local_arr,
                 params_priv.data(), params_ref_all, &data_idx_local,
                 1, num_data,
@@ -2787,7 +2811,7 @@ void GBComputationGroup::gb_signal_het_get_ll_grad_in_kernel_wrap(
                 layer_df, dt,
                 T_obs, t_start,
                 nchannels, tdi_type,
-                N_sparse_fd, tukey_alpha, max_r);
+                N_sparse_fd, tukey_alpha, max_r, 0);
 
             // -eps
             params_priv[k] = saved - eps;
@@ -2796,6 +2820,7 @@ void GBComputationGroup::gb_signal_het_get_ll_grad_in_kernel_wrap(
                 &d_h_M, &h_h_M,
                 c0_sparse_all,
                 A0_all, A1_all, B0_all, B1_all,
+                nullptr, nullptr,   /* B0nc/B1nc: grad stays complex for now */
                 wdm_window, n_sparse_local_arr,
                 params_priv.data(), params_ref_all, &data_idx_local,
                 1, num_data,
@@ -2807,7 +2832,7 @@ void GBComputationGroup::gb_signal_het_get_ll_grad_in_kernel_wrap(
                 layer_df, dt,
                 T_obs, t_start,
                 nchannels, tdi_type,
-                N_sparse_fd, tukey_alpha, max_r);
+                N_sparse_fd, tukey_alpha, max_r, 0);
 
             params_priv[k] = saved;
 

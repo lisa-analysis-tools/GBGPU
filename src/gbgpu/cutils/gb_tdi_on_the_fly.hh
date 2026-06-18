@@ -518,6 +518,8 @@ class GBComputationGroup{
         cmplx  *A1_all,
         cmplx  *B0_all,
         cmplx  *B1_all,
+        cmplx  *B0nc_all,
+        cmplx  *B1nc_all,
         double *wdm_window,
         int    *n_sparse_local_arr,
         double *params_cand_all,
@@ -531,7 +533,7 @@ class GBComputationGroup{
         int     m_active_half_width,
         double  layer_df, double dt,
         int     nchannels, int tdi_type,
-        int     N_sparse_fd, double max_r);
+        int     N_sparse_fd, double max_r, int project_real);
 
     // Stage 2b -- in-kernel sparse-FD signal-het. Fuses the existing
     // ``gb_run_fd_wave_tdi`` (sparse heterodyned rfft) with the polyphase +
@@ -547,6 +549,7 @@ class GBComputationGroup{
         cmplx  *c0_sparse_all,
         cmplx  *A0_all, cmplx *A1_all,
         cmplx  *B0_all, cmplx *B1_all,
+        cmplx  *B0nc_all, cmplx *B1nc_all,
         double *wdm_window,
         int    *n_sparse_local_arr,
         double *params_cand_all,
@@ -561,7 +564,7 @@ class GBComputationGroup{
         double  layer_df, double dt,
         double  T_obs, double t_start,
         int     nchannels, int tdi_type,
-        int     N_sparse_fd, double tukey_alpha, double max_r);
+        int     N_sparse_fd, double tukey_alpha, double max_r, int project_real);
 
     // Signal-het fill_global. Same FD + polyphase + r_sparse machinery as
     // get_ll, but reconstructs the dense template via the heterodyne

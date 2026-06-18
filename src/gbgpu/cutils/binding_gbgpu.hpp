@@ -772,6 +772,8 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<std::complex<double>> A1_all,
         array_type<std::complex<double>> B0_all,
         array_type<std::complex<double>> B1_all,
+        array_type<std::complex<double>> B0nc_all,
+        array_type<std::complex<double>> B1nc_all,
         array_type<double> wdm_window,
         array_type<int> n_sparse_local_arr,
         array_type<double> params_cand_all,
@@ -786,7 +788,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         double layer_df, double dt,
         double T_obs, double t_start,
         int nchannels, int tdi_type,
-        int N_sparse_fd, double tukey_alpha, double max_r);
+        int N_sparse_fd, double tukey_alpha, double max_r, int project_real);
 
     // Signal-het fill_global. Reuses Stage 2b's FD + polyphase machinery to
     // build r at sparse n, then linear-interpolates r to the dense WDM

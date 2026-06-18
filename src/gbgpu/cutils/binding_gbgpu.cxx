@@ -539,6 +539,7 @@ void GBComputationGroupWrap::gb_signal_het_get_ll_sparse(
             B0_all, "B0_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
         reinterpret_cast<cmplx*>(return_pointer_and_check_length(
             B1_all, "B1_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        nullptr, nullptr,   /* B0nc/B1nc: this validation path stays complex */
         return_pointer_and_check_length(wdm_window, "wdm_window", Nt, 1),
         return_pointer_and_check_length(n_sparse_local_arr, "n_sparse_local",
                                          N_sparse_t, 1),
@@ -556,7 +557,7 @@ void GBComputationGroupWrap::gb_signal_het_get_ll_sparse(
         m_active_half_width,
         layer_df, dt,
         nchannels, tdi_type,
-        N_sparse_fd, max_r);
+        N_sparse_fd, max_r, 0);
 }
 
 void GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel(
@@ -567,6 +568,8 @@ void GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel(
     array_type<std::complex<double>> A1_all,
     array_type<std::complex<double>> B0_all,
     array_type<std::complex<double>> B1_all,
+    array_type<std::complex<double>> B0nc_all,
+    array_type<std::complex<double>> B1nc_all,
     array_type<double> wdm_window,
     array_type<int> n_sparse_local_arr,
     array_type<double> params_cand_all,
@@ -581,7 +584,7 @@ void GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel(
     double layer_df, double dt,
     double T_obs, double t_start,
     int nchannels, int tdi_type,
-    int N_sparse_fd, double tukey_alpha, double max_r)
+    int N_sparse_fd, double tukey_alpha, double max_r, int project_real)
 {
     (void) Nt_layer;
     const size_t b_xyz  = (size_t) num_data * nchannels * nchannels
@@ -605,6 +608,10 @@ void GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel(
             B0_all, "B0_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
         reinterpret_cast<cmplx*>(return_pointer_and_check_length(
             B1_all, "B1_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B0nc_all, "B0nc_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B1nc_all, "B1nc_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
         return_pointer_and_check_length(wdm_window, "wdm_window", Nt, 1),
         return_pointer_and_check_length(n_sparse_local_arr, "n_sparse_local",
                                          N_sparse_t, 1),
@@ -623,7 +630,7 @@ void GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel(
         layer_df, dt,
         T_obs, t_start,
         nchannels, tdi_type,
-        N_sparse_fd, tukey_alpha, max_r);
+        N_sparse_fd, tukey_alpha, max_r, project_real);
 }
 
 void GBComputationGroupWrap::gb_signal_het_fill_global_in_kernel(
