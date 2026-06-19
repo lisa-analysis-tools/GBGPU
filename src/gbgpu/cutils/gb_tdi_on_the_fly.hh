@@ -411,13 +411,14 @@ class GBComputationGroup{
         Orbits* orbits, TDIConfig *tdi_config, FDDomain *fd,
         double *params_all, int *data_index_all, double *factors_all,
         int num_bin, int nparams, double T, double t_start, double t_ref,
-        int N_sparse, int nchannels);
+        int N_sparse, int nchannels, double tukey_alpha, double edge_frac);
 
     void gb_fd_get_ll_wrap(double *d_h_out, double *h_h_out,
         Orbits* orbits, TDIConfig *tdi_config, FDDomain *fd,
         double *params_all, int *data_index_all, int *noise_index_all,
         int num_bin, int nparams, double T, double t_start, double t_ref,
-        int N_sparse, int nchannels, int tdi_type);
+        int N_sparse, int nchannels, int tdi_type, double tukey_alpha,
+        double edge_frac);
 
     void gb_fd_swap_ll_wrap(
         double *d_h_add_out, double *d_h_remove_out,
@@ -426,7 +427,8 @@ class GBComputationGroup{
         double *params_add_all, double *params_remove_all,
         int *data_index_all, int *noise_index_all,
         int num_bin, int nparams, double T, double t_start, double t_ref,
-        int N_sparse, int nchannels, int tdi_type);
+        int N_sparse, int nchannels, int tdi_type, double tukey_alpha,
+        double edge_frac);
 
     // Chain-rule parameter gradients of the two FD likelihood kernels.
     // Same convention as the WDM counterparts:

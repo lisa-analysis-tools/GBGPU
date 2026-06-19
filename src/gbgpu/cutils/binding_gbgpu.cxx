@@ -83,7 +83,7 @@ void GBComputationGroupWrap::gb_fd_fill_global(
     array_type<double> params_all, array_type<int> data_index_all,
     array_type<double> factors_all,
     int num_bin, int nparams, double T, double t_start, double t_ref,
-    int N_sparse, int nchannels)
+    int N_sparse, int nchannels, double tukey_alpha, double edge_frac)
 {
     int n_rfft = fd_wrap->fd->n_rfft;
     int num_data = fd_wrap->fd->num_data;
@@ -94,7 +94,7 @@ void GBComputationGroupWrap::gb_fd_fill_global(
         return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(factors_all, "factors_all", num_bin, 1),
-        num_bin, nparams, T, t_start, t_ref, N_sparse, nchannels);
+        num_bin, nparams, T, t_start, t_ref, N_sparse, nchannels, tukey_alpha, edge_frac);
 }
 
 void GBComputationGroupWrap::gb_fd_get_ll(
@@ -104,7 +104,7 @@ void GBComputationGroupWrap::gb_fd_get_ll(
     array_type<double> params_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
     int num_bin, int nparams, double T, double t_start, double t_ref,
-    int N_sparse, int nchannels, int tdi_type)
+    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac)
 {
     gb_fd_get_ll_wrap(
         return_pointer_and_check_length(d_h_out, "d_h_out", num_bin, 1),
@@ -113,7 +113,7 @@ void GBComputationGroupWrap::gb_fd_get_ll(
         return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
-        num_bin, nparams, T, t_start, t_ref, N_sparse, nchannels, tdi_type);
+        num_bin, nparams, T, t_start, t_ref, N_sparse, nchannels, tdi_type, tukey_alpha, edge_frac);
 }
 
 void GBComputationGroupWrap::gb_fd_swap_ll(
@@ -125,7 +125,7 @@ void GBComputationGroupWrap::gb_fd_swap_ll(
     array_type<double> params_add_all, array_type<double> params_remove_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
     int num_bin, int nparams, double T, double t_start, double t_ref,
-    int N_sparse, int nchannels, int tdi_type)
+    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac)
 {
     gb_fd_swap_ll_wrap(
         return_pointer_and_check_length(d_h_add_out, "d_h_add_out", num_bin, 1),
@@ -138,7 +138,7 @@ void GBComputationGroupWrap::gb_fd_swap_ll(
         return_pointer_and_check_length(params_remove_all, "params_remove_all", nparams, num_bin),
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
-        num_bin, nparams, T, t_start, t_ref, N_sparse, nchannels, tdi_type);
+        num_bin, nparams, T, t_start, t_ref, N_sparse, nchannels, tdi_type, tukey_alpha, edge_frac);
 }
 
 void GBComputationGroupWrap::gb_fd_get_ll_grad(

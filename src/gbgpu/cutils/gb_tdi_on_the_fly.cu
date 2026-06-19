@@ -351,7 +351,7 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
                            int log2N,
                            cmplx **tdi_chan_out,
                            int *kf0_out, double *f0g_out, double *dts_out,
-                           double tukey_alpha)
+                           double tukey_alpha, double edge_frac)
 {
     // ---- carve up shared memory ------------------------------------------
     char *cur = (char*) shared_mem;
@@ -406,13 +406,22 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
     // matches the dense rfft(Tukey*td) inner product. alpha=0 -> no taper.
     const double n_taper_fd = 0.5 * tukey_alpha * (double) (N - 1);
     const double dlast_fd   = (double) (N - 1);
+    // Edge-cut: zero the first / last edge_frac fraction of the sparse grid, so
+    // the FD-het template analyses the SAME time region as the WDM grid's
+    // [min_time, max_time] = [EC, Nt-EC] layers (edge_frac = EC/Nt). Without it
+    // the FD het integrates the full Tobs and its off-source logL is ~13% too
+    // steep vs the (edge-cut) WDM. The tukey taper is kept (it suppresses the
+    // active-band leakage); when EC > taper the cut subsumes the taper region.
+    const int n_edge = (int) llround(edge_frac * (double) N);
     for (int n = THREAD_START_X; n < N; n += BLOCK_INCR_X)
     {
         const double tau     = (double) n * dts;
         const double carrier = 2.0 * M_PI * f0g * tau;
         const double phref   = phi_ref[n];
         double w = 1.0;
-        if (tukey_alpha > 0.0 && n_taper_fd > 0.0) {
+        if (n < n_edge || n >= N - n_edge) {
+            w = 0.0;
+        } else if (tukey_alpha > 0.0 && n_taper_fd > 0.0) {
             const double di = (double) n;
             if (di < n_taper_fd) {
                 const double xn = di / n_taper_fd;
@@ -493,7 +502,7 @@ void gbfd_run_one_source(GBTDIonTheFly *tof, void *shared_mem,
     double dts      = 0.0;
     gbfd_build_one_source(tof, shared_mem, params_in, t_start, Tobs,
                           N, nchannels, n_params, bin_i, log2N,
-                          &tdi_chan, &kf0, &f0g, &dts, tukey_alpha);
+                          &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, 0.0);
 
     // Write heterodyne FD to global, in FFT order.
     for (int n = THREAD_START_X; n < N; n += BLOCK_INCR_X)
@@ -713,7 +722,8 @@ void gb_fd_get_ll_kernel(double *d_h_out, double *h_h_out,
     GBTDIonTheFly *tdi_on_fly_handle, FDDomain *fd,
     double *params, int *data_index_all, int *noise_index_all,
     double t_start, double Tobs,
-    int N, int num_bin, int n_params, int nchannels, int log2N, int tdi_type)
+    int N, int num_bin, int n_params, int nchannels, int log2N, int tdi_type,
+    double tukey_alpha, double edge_frac)
 {
     extern CUDA_SHARED char shared_mem[];
     CUDA_SHARED double d_h_tmp[NUM_THREADS_HERE];
@@ -737,7 +747,7 @@ void gb_fd_get_ll_kernel(double *d_h_out, double *h_h_out,
         double dts      = 0.0;
         gbfd_build_one_source(&tof, (void*) shared_mem, params, t_start, Tobs,
                               N, nchannels, n_params, bin_i, log2N,
-                              &tdi_chan, &kf0, &f0g, &dts, 0.0);
+                              &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, edge_frac);
 
         double dh_local = 0.0, hh_local = 0.0;
         gbfd_accumulate_ll(&dh_local, &hh_local, tdi_chan, N, nchannels,
@@ -766,7 +776,7 @@ void GBComputationGroup::gb_fd_get_ll_wrap(double *d_h_out, double *h_h_out,
     Orbits* orbits, TDIConfig *tdi_config, FDDomain *fd,
     double *params_all, int *data_index_all, int *noise_index_all,
     int num_bin, int nparams, double T, double t_start, double t_ref,
-    int N_sparse, int nchannels, int tdi_type)
+    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac)
 {
     int log2N = 0;
     {
@@ -805,7 +815,8 @@ void GBComputationGroup::gb_fd_get_ll_wrap(double *d_h_out, double *h_h_out,
     gb_fd_get_ll_kernel<<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(
         d_h_out, h_h_out, d_gb, d_fd,
         params_all, data_index_all, noise_index_all,
-        t_start, T, N_sparse, num_bin, nparams, nchannels, log2N, tdi_type);
+        t_start, T, N_sparse, num_bin, nparams, nchannels, log2N, tdi_type,
+        tukey_alpha, edge_frac);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
     cudaFree(d_orbits);
@@ -826,7 +837,7 @@ void GBComputationGroup::gb_fd_get_ll_wrap(double *d_h_out, double *h_h_out,
         gbfd_build_one_source(&tof, (void*) shared_mem,
                               params_all, t_start, T,
                               N_sparse, nchannels, nparams, bin_i, log2N,
-                              &tdi_chan, &kf0, &f0g, &dts, 0.0);
+                              &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, edge_frac);
 
         double dh = 0.0, hh = 0.0;
         gbfd_accumulate_ll(&dh, &hh, tdi_chan, N_sparse, nchannels, fd, kf0,
@@ -850,7 +861,8 @@ void gb_fd_fill_global_kernel(cmplx *template_fill,
     GBTDIonTheFly *tdi_on_fly_handle, FDDomain *fd,
     double *params, int *data_index_all, double *factors_all,
     double t_start, double Tobs,
-    int N, int num_bin, int n_params, int nchannels, int log2N)
+    int N, int num_bin, int n_params, int nchannels, int log2N,
+    double tukey_alpha, double edge_frac)
 {
     extern CUDA_SHARED char shared_mem[];
     GBTDIonTheFly tof(tdi_on_fly_handle->orbits, tdi_on_fly_handle->tdi_config,
@@ -863,7 +875,7 @@ void gb_fd_fill_global_kernel(cmplx *template_fill,
         double dts      = 0.0;
         gbfd_build_one_source(&tof, (void*) shared_mem, params, t_start, Tobs,
                               N, nchannels, n_params, bin_i, log2N,
-                              &tdi_chan, &kf0, &f0g, &dts, 0.0);
+                              &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, edge_frac);
 
         int data_index = data_index_all[bin_i];
         double factor  = factors_all[bin_i];
@@ -891,7 +903,7 @@ void GBComputationGroup::gb_fd_fill_global_wrap(cmplx *template_fill,
     Orbits* orbits, TDIConfig *tdi_config, FDDomain *fd,
     double *params_all, int *data_index_all, double *factors_all,
     int num_bin, int nparams, double T, double t_start, double t_ref,
-    int N_sparse, int nchannels)
+    int N_sparse, int nchannels, double tukey_alpha, double edge_frac)
 {
     int log2N = 0;
     {
@@ -929,7 +941,8 @@ void GBComputationGroup::gb_fd_fill_global_wrap(cmplx *template_fill,
     }
     gb_fd_fill_global_kernel<<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(
         template_fill, d_gb, d_fd, params_all, data_index_all, factors_all,
-        t_start, T, N_sparse, num_bin, nparams, nchannels, log2N);
+        t_start, T, N_sparse, num_bin, nparams, nchannels, log2N, tukey_alpha,
+        edge_frac);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
     cudaFree(d_orbits);
@@ -950,7 +963,7 @@ void GBComputationGroup::gb_fd_fill_global_wrap(cmplx *template_fill,
         gbfd_build_one_source(&tof, (void*) shared_mem,
                               params_all, t_start, T,
                               N_sparse, nchannels, nparams, bin_i, log2N,
-                              &tdi_chan, &kf0, &f0g, &dts, 0.0);
+                              &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, edge_frac);
 
         int data_index = data_index_all[bin_i];
         double factor  = factors_all[bin_i];
@@ -990,7 +1003,7 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
     double *params_add_all, double *params_remove_all,
     int *data_index_all, int *noise_index_all,
     int num_bin, int nparams, double T, double t_start, double t_ref,
-    int N_sparse, int nchannels, int tdi_type)
+    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac)
 {
     // Reuse get_ll for the diagonal-in-source accumulators, then explicitly
     // form the cross term (h_add | h_remove) per source.
@@ -1019,7 +1032,7 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
     (void) data_index_all; (void) noise_index_all;
     (void) num_bin; (void) nparams; (void) T;
     (void) t_start; (void) t_ref; (void) N_sparse;
-    (void) nchannels; (void) tdi_type;
+    (void) nchannels; (void) tdi_type; (void) tukey_alpha; (void) edge_frac;
     printf("gb_fd_swap_ll_wrap GPU path not implemented yet.\n");
 #else
     int shared_bytes = tof.get_gb_fd_buffer_size(N_sparse, nchannels);
@@ -1034,7 +1047,7 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
         double dts_a = 0.0;
         gbfd_build_one_source(&tof, (void*) shared_mem_a, params_add_all,
                               t_start, T, N_sparse, nchannels, nparams,
-                              bin_i, log2N, &h_add, &kf0_a, &f0g_a, &dts_a, 0.0);
+                              bin_i, log2N, &h_add, &kf0_a, &f0g_a, &dts_a, tukey_alpha, edge_frac);
         // (d|h_add), (h_add|h_add)
         double dh_a = 0.0, hh_aa = 0.0;
         gbfd_accumulate_ll(&dh_a, &hh_aa, h_add, N_sparse, nchannels, fd,
@@ -1047,7 +1060,7 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
         double dts_r = 0.0;
         gbfd_build_one_source(&tof, (void*) shared_mem_b, params_remove_all,
                               t_start, T, N_sparse, nchannels, nparams,
-                              bin_i, log2N, &h_rem, &kf0_r, &f0g_r, &dts_r, 0.0);
+                              bin_i, log2N, &h_rem, &kf0_r, &f0g_r, &dts_r, tukey_alpha, edge_frac);
         double dh_r = 0.0, hh_rr = 0.0;
         gbfd_accumulate_ll(&dh_r, &hh_rr, h_rem, N_sparse, nchannels, fd,
                            kf0_r, data_index_all[bin_i],
@@ -1264,7 +1277,7 @@ void GBComputationGroup::gb_fd_get_ll_grad_wrap(double *grad_out,
         gbfd_build_one_source(&tof, (void*) scratch, params_priv,
                               t_start, T, N_sparse, nchannels, nparams,
                               /*bin_i=*/0, log2N,
-                              &h_C_shared, &kf0_C, &f0g_C, &dts_C, 0.0);
+                              &h_C_shared, &kf0_C, &f0g_C, &dts_C, 0.0, 0.0);
         // The scratch's tdi_chan slab will be overwritten by perturbed builds
         // below, so stash the central signal in our own buffer.
         for (size_t idx = 0;
@@ -1293,7 +1306,7 @@ void GBComputationGroup::gb_fd_get_ll_grad_wrap(double *grad_out,
             gbfd_build_one_source(&tof, (void*) scratch, params_priv,
                                   t_start, T, N_sparse, nchannels, nparams,
                                   0, log2N,
-                                  &h_P_shared, &kf0_P, &f0g_P, &dts_P, 0.0);
+                                  &h_P_shared, &kf0_P, &f0g_P, &dts_P, 0.0, 0.0);
             double acc_p = gbfd_grad_one_sided_partial(
                 h_P_shared, kf0_P,
                 central_stash, kf0_C,
@@ -1309,7 +1322,7 @@ void GBComputationGroup::gb_fd_get_ll_grad_wrap(double *grad_out,
             gbfd_build_one_source(&tof, (void*) scratch, params_priv,
                                   t_start, T, N_sparse, nchannels, nparams,
                                   0, log2N,
-                                  &h_M_shared, &kf0_M, &f0g_M, &dts_M, 0.0);
+                                  &h_M_shared, &kf0_M, &f0g_M, &dts_M, 0.0, 0.0);
             double acc_m = gbfd_grad_one_sided_partial(
                 h_M_shared, kf0_M,
                 central_stash, kf0_C,
@@ -1385,7 +1398,7 @@ void GBComputationGroup::gb_fd_swap_ll_grad_wrap(
         gbfd_build_one_source(&tof, (void*) scratch, params_add_priv,
                               t_start, T, N_sparse, nchannels, nparams,
                               0, log2N,
-                              &h_addC_shared, &kf0_addC, &f0g_addC, &dts_addC, 0.0);
+                              &h_addC_shared, &kf0_addC, &f0g_addC, &dts_addC, 0.0, 0.0);
         for (size_t idx = 0;
              idx < (size_t) nchannels * (size_t) N_sparse; ++idx)
             add_stash[idx] = h_addC_shared[idx];
@@ -1396,7 +1409,7 @@ void GBComputationGroup::gb_fd_swap_ll_grad_wrap(
         gbfd_build_one_source(&tof, (void*) scratch, params_rem_priv,
                               t_start, T, N_sparse, nchannels, nparams,
                               0, log2N,
-                              &h_remC_shared, &kf0_remC, &f0g_remC, &dts_remC, 0.0);
+                              &h_remC_shared, &kf0_remC, &f0g_remC, &dts_remC, 0.0, 0.0);
         for (size_t idx = 0;
              idx < (size_t) nchannels * (size_t) N_sparse; ++idx)
             rem_stash[idx] = h_remC_shared[idx];
@@ -1422,7 +1435,7 @@ void GBComputationGroup::gb_fd_swap_ll_grad_wrap(
             gbfd_build_one_source(&tof, (void*) scratch, params_add_priv,
                                   t_start, T, N_sparse, nchannels, nparams,
                                   0, log2N,
-                                  &h_aP, &kf0_aP, &f0g_aP, &dts_aP, 0.0);
+                                  &h_aP, &kf0_aP, &f0g_aP, &dts_aP, 0.0, 0.0);
             double acc_p = gbfd_grad_one_sided_partial(
                 h_aP, kf0_aP,
                 add_stash, kf0_addC,
@@ -1436,7 +1449,7 @@ void GBComputationGroup::gb_fd_swap_ll_grad_wrap(
             gbfd_build_one_source(&tof, (void*) scratch, params_add_priv,
                                   t_start, T, N_sparse, nchannels, nparams,
                                   0, log2N,
-                                  &h_aM, &kf0_aM, &f0g_aM, &dts_aM, 0.0);
+                                  &h_aM, &kf0_aM, &f0g_aM, &dts_aM, 0.0, 0.0);
             double acc_m = gbfd_grad_one_sided_partial(
                 h_aM, kf0_aM,
                 add_stash, kf0_addC,
@@ -1467,7 +1480,7 @@ void GBComputationGroup::gb_fd_swap_ll_grad_wrap(
             gbfd_build_one_source(&tof, (void*) scratch, params_rem_priv,
                                   t_start, T, N_sparse, nchannels, nparams,
                                   0, log2N,
-                                  &h_rP, &kf0_rP, &f0g_rP, &dts_rP, 0.0);
+                                  &h_rP, &kf0_rP, &f0g_rP, &dts_rP, 0.0, 0.0);
             double acc_p = gbfd_grad_one_sided_partial(
                 h_rP, kf0_rP,
                 add_stash, kf0_addC,
@@ -1481,7 +1494,7 @@ void GBComputationGroup::gb_fd_swap_ll_grad_wrap(
             gbfd_build_one_source(&tof, (void*) scratch, params_rem_priv,
                                   t_start, T, N_sparse, nchannels, nparams,
                                   0, log2N,
-                                  &h_rM, &kf0_rM, &f0g_rM, &dts_rM, 0.0);
+                                  &h_rM, &kf0_rM, &f0g_rM, &dts_rM, 0.0, 0.0);
             double acc_m = gbfd_grad_one_sided_partial(
                 h_rM, kf0_rM,
                 add_stash, kf0_addC,

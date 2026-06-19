@@ -82,7 +82,8 @@ class GBFDComputations(FastLISAResponseParallelModule):
     def __init__(self, T, t_ref, t_start, N_sparse, df,
                  data_fd, invC,
                  orbits=None, tdi_config=None, force_backend=None,
-                 d_d=0.0, tdi_type="XYZ", ind_min=None, ind_max=None):
+                 d_d=0.0, tdi_type="XYZ", ind_min=None, ind_max=None,
+                 tukey_alpha=0.0, edge_frac=0.0):
         super().__init__(force_backend=force_backend)
         if N_sparse < 1 or (N_sparse & (N_sparse - 1)) != 0:
             raise ValueError("N_sparse must be a power of two.")
@@ -99,6 +100,17 @@ class GBFDComputations(FastLISAResponseParallelModule):
         self.df = float(df)
         self.d_d = float(d_d)
         self.tdi_type = tdi_type
+        # Tukey taper (scipy.signal.windows.tukey alpha) applied to the slow
+        # signal before the sparse-FD FFT, mirroring rfft(Tukey*td). MUST match
+        # the window used to build ``data_fd`` -- with the same alpha the FD
+        # heterodyne reproduces the WDM-domain mismatch (mm ~ 1e-11); the
+        # default 0.0 (rectangular) matches lisatools' unwindowed FD reference.
+        self.tukey_alpha = float(tukey_alpha)
+        # Edge-cut fraction (EC/Nt): zero the first/last edge_frac of the sparse
+        # grid so the FD-het template analyses the SAME time region as a WDM grid
+        # with min_time=EC*layer, max_time=(Nt-EC)*layer. Set this (and window the
+        # data the same way) to make the FD-het off-source logL match the WDM.
+        self.edge_frac = float(edge_frac)
 
         self.orbits = orbits
         self.tdi_config = tdi_config
@@ -213,6 +225,7 @@ class GBFDComputations(FastLISAResponseParallelModule):
             num_bin, 9, self.T, self.t_start, self.t_ref,
             self.N_sparse, self.nchannels,
             self.backend.TDITypeDict[self.tdi_type],
+            self.tukey_alpha, self.edge_frac,
         )
         self.d_h_out = d_h_out
         self.h_h_out = h_h_out
@@ -247,6 +260,7 @@ class GBFDComputations(FastLISAResponseParallelModule):
             num_bin, 9, self.T, self.t_start, self.t_ref,
             self.N_sparse, self.nchannels,
             self.backend.TDITypeDict[self.tdi_type],
+            self.tukey_alpha, self.edge_frac,
         )
         like_add = -0.5 * (self.d_d + aa - 2.0 * d_h_a)
         like_rem = -0.5 * (self.d_d + rr - 2.0 * d_h_r)
@@ -278,6 +292,7 @@ class GBFDComputations(FastLISAResponseParallelModule):
             p.flatten().copy(), data_index, factors,
             num_bin, 9, self.T, self.t_start, self.t_ref,
             self.N_sparse, self.nchannels,
+            self.tukey_alpha, self.edge_frac,
         )
 
     # ------------------------------------------------------------------
