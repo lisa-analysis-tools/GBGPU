@@ -537,6 +537,31 @@ class GBComputationGroup{
         int     nchannels, int tdi_type,
         int     N_sparse_fd, double max_r, int project_real);
 
+    // Reference producer (V2 sig-het) -- EMIT the reference WDM ``c0`` from the
+    // backend (replaces the Python polyphase ``_compute_sparse_complex_wdm``).
+    // Runs ``gb_run_fd_wave_tdi`` on the REFERENCE params + the SAME polyphase as
+    // ``gb_signal_het_get_ll_*``, but over ALL ``Nf_active`` layers and at BOTH the
+    // sparse grid (``c0_sparse_out``, what get_ll consumes) and full ``Nt``
+    // resolution (``c0_dense_out``, what the bin-fold / fill_global need). One call
+    // per reference set; ``data_index`` selects them downstream. CPU-only (GPU TODO,
+    // like the sibling sig-het wraps).
+    void gb_signal_het_make_reference_wrap(
+        GBTDIonTheFly *tdi_on_fly,
+        cmplx  *c0_sparse_out,
+        cmplx  *c0_dense_out,
+        double *wdm_window,
+        int    *n_sparse_local_arr,
+        double *params_ref_all,
+        int     num_data,
+        int     nparams, int f0_idx, int fdot_idx,
+        int     Nf, int Nt, int Nf_active, int Nt_active,
+        int     Nt_layer, int N_sparse_t, int stride,
+        int     ind_min_t, int ind_min_f,
+        double  layer_df, double dt,
+        double  T_obs, double t_start,
+        int     nchannels,
+        int     N_sparse_fd, double tukey_alpha);
+
     // Stage 2b -- in-kernel sparse-FD signal-het. Fuses the existing
     // ``gb_run_fd_wave_tdi`` (sparse heterodyned rfft) with the polyphase +
     // bin-fold pipeline. X_het is allocated in a transient per-call buffer

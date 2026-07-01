@@ -689,6 +689,47 @@ void GBComputationGroupWrap::gb_signal_het_fill_global_in_kernel(
         N_sparse_fd, tukey_alpha, max_r);
 }
 
+void GBComputationGroupWrap::gb_signal_het_make_reference(
+    GBTDIonTheFlyWrap *tdi_wrap,
+    array_type<std::complex<double>> c0_sparse_out,
+    array_type<std::complex<double>> c0_dense_out,
+    array_type<double> wdm_window,
+    array_type<int> n_sparse_local_arr,
+    array_type<double> params_ref_all,
+    int num_data,
+    int nparams, int f0_idx, int fdot_idx,
+    int Nf, int Nt, int Nf_active, int Nt_active,
+    int Nt_layer, int N_sparse_t, int stride,
+    int ind_min_t, int ind_min_f,
+    double layer_df, double dt,
+    double T_obs, double t_start,
+    int nchannels,
+    int N_sparse_fd, double tukey_alpha)
+{
+    gb_signal_het_make_reference_wrap(
+        tdi_wrap->waveform,
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            c0_sparse_out, "c0_sparse_out",
+            (size_t) num_data * nchannels * Nf_active * N_sparse_t, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            c0_dense_out, "c0_dense_out",
+            (size_t) num_data * nchannels * Nf_active * Nt_active, 1)),
+        return_pointer_and_check_length(wdm_window, "wdm_window", Nt, 1),
+        return_pointer_and_check_length(n_sparse_local_arr, "n_sparse_local",
+                                         N_sparse_t, 1),
+        return_pointer_and_check_length(params_ref_all, "params_ref_all",
+                                         nparams, num_data),
+        num_data,
+        nparams, f0_idx, fdot_idx,
+        Nf, Nt, Nf_active, Nt_active,
+        Nt_layer, N_sparse_t, stride,
+        ind_min_t, ind_min_f,
+        layer_df, dt,
+        T_obs, t_start,
+        nchannels,
+        N_sparse_fd, tukey_alpha);
+}
+
 void GBComputationGroupWrap::gb_signal_het_get_ll_grad_in_kernel(
     GBTDIonTheFlyWrap *tdi_wrap,
     array_type<double> grad_out,
@@ -918,6 +959,13 @@ void gbgpu_part(nb::module_ &m) {
          "template_fill at the absolute (m, n_global) WDM positions. "
          "Caller pre-zeroes / accumulates into template_fill. tukey_alpha "
          "must be supplied by the caller (no default).")
+    .def("gb_signal_het_make_reference",
+         &GBComputationGroupWrap::gb_signal_het_make_reference,
+         "Reference producer: run gb_run_fd_wave_tdi on the REFERENCE params + "
+         "the same polyphase as get_ll over ALL Nf_active layers, emitting the "
+         "complex WDM c0 at the sparse grid (c0_sparse_out) and full Nt "
+         "resolution (c0_dense_out). Replaces the Python polyphase so the sig-het "
+         "reference comes from the backend. CPU-only (GPU TODO).")
     .def("gb_signal_het_get_ll_grad_in_kernel",
          &GBComputationGroupWrap::gb_signal_het_get_ll_grad_in_kernel,
          "Signal-het central-difference gradient of logL = d_h - 0.5*h_h. "

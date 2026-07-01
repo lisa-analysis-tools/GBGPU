@@ -822,6 +822,27 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         int nchannels,
         int N_sparse_fd, double tukey_alpha, double max_r);
 
+    // Reference producer: emit the reference WDM c0 (sparse + dense complex) from
+    // the REFERENCE params via the backend FD-gen + polyphase -- replaces the
+    // Python polyphase. c0_sparse_out (num_data,nch,Nf_active,N_sparse_t);
+    // c0_dense_out (num_data,nch,Nf_active,Nt_active).
+    void gb_signal_het_make_reference(
+        GBTDIonTheFlyWrap *tdi_wrap,
+        array_type<std::complex<double>> c0_sparse_out,
+        array_type<std::complex<double>> c0_dense_out,
+        array_type<double> wdm_window,
+        array_type<int> n_sparse_local_arr,
+        array_type<double> params_ref_all,
+        int num_data,
+        int nparams, int f0_idx, int fdot_idx,
+        int Nf, int Nt, int Nf_active, int Nt_active,
+        int Nt_layer, int N_sparse_t, int stride,
+        int ind_min_t, int ind_min_f,
+        double layer_df, double dt,
+        double T_obs, double t_start,
+        int nchannels,
+        int N_sparse_fd, double tukey_alpha);
+
     // Signal-het central-difference gradient of logL = d_h - 0.5*h_h. Per
     // binary, performs 1 central + 2*nparams perturbed get_ll_in_kernel
     // evaluations. grad_out is (num_bin, nparams); d_h_central /

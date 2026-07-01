@@ -2398,6 +2398,148 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
 
 
 // ============================================================================
+// Signal-heterodyne (v2 polyphase) -- REFERENCE PRODUCER.
+//
+// Emits the reference WDM c0 FROM THE BACKEND (replaces the Python polyphase
+// _compute_sparse_complex_wdm). Runs gb_run_fd_wave_tdi on the REFERENCE params,
+// then the SAME polyphase fold + iFFT as gb_signal_het_get_ll_sparse_wrap, but
+// over ALL Nf_active layers and at BOTH the sparse grid (c0_sparse_out, consumed
+// by get_ll) and full Nt resolution (c0_dense_out, consumed by the bin-fold /
+// fill_global). CPU-only (GPU TODO, like the sibling sig-het wraps).
+// ============================================================================
+void GBComputationGroup::gb_signal_het_make_reference_wrap(
+    GBTDIonTheFly *tdi_on_fly,
+    cmplx  *c0_sparse_out,
+    cmplx  *c0_dense_out,
+    double *wdm_window,
+    int    *n_sparse_local_arr,
+    double *params_ref_all,
+    int     num_data,
+    int     nparams, int f0_idx, int fdot_idx,
+    int     Nf, int Nt, int Nf_active, int Nt_active,
+    int     Nt_layer, int N_sparse_t, int stride,
+    int     ind_min_t, int ind_min_f,
+    double  layer_df, double dt,
+    double  T_obs, double t_start,
+    int     nchannels,
+    int     N_sparse_fd, double tukey_alpha)
+{
+    (void) f0_idx; (void) fdot_idx; (void) layer_df;
+
+#ifdef __CUDACC__
+    throw std::runtime_error(
+        "[gb_signal_het_make_reference_wrap] GPU implementation is a TODO -- the v2 "
+        "signal-het CUDA kernels are not implemented yet. Construct the Python class "
+        "with force_backend=\"cpu\" until then.");
+#endif
+
+    const double TWO_PI  = 2.0 * M_PI;
+    const cmplx  I_c     = cmplx(0.0, 1.0);
+    const int    half_Nt = Nt / 2;
+    const int    half_NS = N_sparse_fd / 2;
+    const double kappa   = 2.0 * std::sqrt(M_PI * dt) / (double) Nf;
+    const int    n_start = ind_min_t + n_sparse_local_arr[0];   // sparse grid origin
+
+    // length-Nt twiddle table exp(i 2pi k / Nt): reused for the dense prephase +
+    // dense iFFT so the O(Nt^2) dense transform avoids per-element gcmplx::exp.
+    std::vector<cmplx> tw(Nt);
+    for (int k = 0; k < Nt; ++k)
+        tw[k] = gcmplx::exp(I_c * (TWO_PI * (double) k / (double) Nt));
+    auto twn = [&](long a) -> cmplx { long m = a % Nt; if (m < 0) m += Nt; return tw[m]; };
+
+    // (1) FD-heterodyne of the REFERENCE sources via the chunked-het front-end.
+    std::vector<cmplx>  X_het_raw((size_t) num_data * nchannels * N_sparse_fd);
+    std::vector<int>    k_f0_buf(num_data);
+    std::vector<double> f0_grid_buf(num_data);
+    gb_run_fd_wave_tdi_wrap(
+        tdi_on_fly,
+        X_het_raw.data(), k_f0_buf.data(), f0_grid_buf.data(),
+        params_ref_all, t_start, T_obs,
+        N_sparse_fd, num_data, nparams, nchannels,
+        tukey_alpha);
+
+    // (2) fftshift + 1/dt -> centered absolute-rfft slice (matches get_ll path).
+    std::vector<cmplx> X_het((size_t) num_data * nchannels * N_sparse_fd);
+    const double dt_inv = 1.0 / dt;
+    for (int d = 0; d < num_data; ++d)
+        for (int c = 0; c < nchannels; ++c) {
+            const size_t base = ((size_t) d * nchannels + c) * N_sparse_fd;
+            for (int i = 0; i < N_sparse_fd; ++i) {
+                const int m_signed = i - half_NS;
+                const int m_fft = (m_signed >= 0) ? m_signed : (m_signed + N_sparse_fd);
+                X_het[base + i] = X_het_raw[base + m_fft] * dt_inv;
+            }
+        }
+
+    // (3) polyphase fold + iFFT over ALL Nf_active layers, sparse + dense.
+    std::vector<cmplx> fold_s(Nt_layer);
+    std::vector<cmplx> fold_d(Nt);
+    for (int d = 0; d < num_data; ++d) {
+        const int k_f0 = k_f0_buf[d];
+        for (int c = 0; c < nchannels; ++c) {
+            const cmplx *X_chan = X_het.data() + ((size_t) d * nchannels + c) * N_sparse_fd;
+            for (int m_local = 0; m_local < Nf_active; ++m_local) {
+                const int m_global = ind_min_f + m_local;
+                std::fill(fold_s.begin(), fold_s.end(), cmplx(0.0, 0.0));
+                std::fill(fold_d.begin(), fold_d.end(), cmplx(0.0, 0.0));
+                // fold the N_sparse_fd nonzero bins into BOTH the sparse (mod
+                // Nt_layer) and dense (index j) accumulators, each with its own
+                // prephase origin (n_start for sparse, ind_min_t for dense).
+                for (int i = 0; i < N_sparse_fd; ++i) {
+                    const cmplx Xi = X_chan[i];
+                    if (Xi.real() == 0.0 && Xi.imag() == 0.0) continue;
+                    const int k_abs = k_f0 + (i - half_NS);
+                    const int j = k_abs - m_global * half_Nt + half_Nt;
+                    if (j < 0 || j >= Nt) continue;
+                    const int    j_off = j - half_Nt;
+                    const double win   = wdm_window[j];
+                    const cmplx  ph_s  = gcmplx::exp(I_c * (TWO_PI * (double) j_off
+                                                    * (double) n_start / (double) Nt));
+                    fold_s[j % Nt_layer] += Xi * win * ph_s;
+                    // DENSE uses the transform (Python _compute_sparse_complex_wdm)
+                    // convention: NATURAL-index prephase (j, not centered j_off) +
+                    // sign_scale = 1/stride with NO (-1)^n_global. (The get_ll sparse
+                    // convention above -- j_off + (-1)^n_global -- is equivalent ONLY on
+                    // the always-odd sparse grid, so it must NOT be reused for the dense
+                    // full-Nt grid; doing so adds a spurious (-1)^n.)
+                    fold_d[j]            += Xi * win * twn((long) j * (long) ind_min_t);
+                }
+                // SPARSE iFFT (length Nt_layer, N_sparse_t outputs).
+                for (int n_layer = 0; n_layer < N_sparse_t; ++n_layer) {
+                    cmplx acc(0.0, 0.0);
+                    for (int rr = 0; rr < Nt_layer; ++rr)
+                        acc += fold_s[rr] * gcmplx::exp(I_c * (TWO_PI * (double) rr
+                                            * (double) n_layer / (double) Nt_layer));
+                    acc *= (1.0 / (double) Nt_layer);
+                    const int    n_global   = n_start + n_layer * stride;
+                    const double sign_scale = ((n_global & 1) ? -1.0 : 1.0) / (double) stride;
+                    const int    m_plus_n   = (m_global + n_global) & 1;
+                    const cmplx  conj_cmn   = (m_plus_n == 0) ? cmplx(1.0, 0.0) : cmplx(0.0, -1.0);
+                    const double sign_mn    = (((m_global + 1) * n_global) & 1) ? -1.0 : 1.0;
+                    c0_sparse_out[(((size_t) d * nchannels + c) * Nf_active + m_local)
+                                  * N_sparse_t + n_layer] = acc * sign_scale * (kappa * sign_mn * conj_cmn);
+                }
+                // DENSE iFFT (length Nt, Nt_active outputs, stride 1, origin ind_min_t).
+                for (int n = 0; n < Nt_active; ++n) {
+                    cmplx acc(0.0, 0.0);
+                    for (int rr = 0; rr < Nt; ++rr)
+                        acc += fold_d[rr] * twn((long) rr * (long) n);
+                    acc *= (1.0 / (double) Nt);       // 1/Nt = (1/Nt_layer)*(1/stride), stride_dense=1
+                    const int    n_global   = ind_min_t + n;
+                    const int    m_plus_n   = (m_global + n_global) & 1;
+                    const cmplx  conj_cmn   = (m_plus_n == 0) ? cmplx(1.0, 0.0) : cmplx(0.0, -1.0);
+                    const double sign_mn    = (((m_global + 1) * n_global) & 1) ? -1.0 : 1.0;
+                    // no (-1)^n_global for the dense grid (transform convention).
+                    c0_dense_out[(((size_t) d * nchannels + c) * Nf_active + m_local)
+                                 * Nt_active + n] = acc * (kappa * sign_mn * conj_cmn);
+                }
+            }
+        }
+    }
+}
+
+
+// ============================================================================
 // Signal-heterodyne (v2 polyphase) -- fill_global path.
 // ============================================================================
 //
