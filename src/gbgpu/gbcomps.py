@@ -598,15 +598,16 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         the analytic Fresnel per-pixel value. Converges to :meth:`get_ll_stft` as
         ``n_sub`` grows. Stores raw ``self.d_h_out_fft`` / ``self.h_h_out_fft``.
 
-        Prototype limitations (design 2026-07-01, get_ll-only phase):
+        Window: the FFT kernel applies the analysis window as a plain per-sample
+        multiply from ``stft_comps.cpp_fresnel.window_alpha`` -- Tukey taper
+        (taper_duration = alpha*dt/2, matching ``scipy.signal.windows.tukey`` and the
+        Fresnel ``get_windowed_fourier_value``) when alpha>0, else a flat window scaled
+        by ``window_factor``. This matches the windowed data STFT + the Fresnel path.
 
-        * **Rectangular window only.** ``self.window_factor`` is *not* applied by the
-          FFT kernel (per-sample window is w_m=1); results are only correct for a
-          rectangular analysis window (``window_factor == 1.0``). Windowed (Tukey)
-          support is deferred.
-        * **``n_sub`` must satisfy ``n_sub >~ 2*n_side_bins + 1``** to resolve the
-          requested band; below that the far bins alias. Default n_sub=32 pairs with
-          the default n_side_bins=2 (5 bins); raise n_sub for wide side-bands.
+        Note (design 2026-07-01, get_ll-only phase): **``n_sub`` must satisfy
+        ``n_sub >~ 2*n_side_bins + 1``** to resolve the requested band; below that the
+        far bins alias. Default n_sub=32 pairs with the default n_side_bins=2 (5 bins);
+        raise n_sub for wide side-bands.
         """
         if phase_maximize:
             raise NotImplementedError("Phase maximization not implemented for STFT GB FFT yet.")

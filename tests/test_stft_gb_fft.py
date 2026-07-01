@@ -29,15 +29,29 @@ except (ImportError, ModuleNotFoundError) as _e:
 AMP, F0, FDOT, FDDOT = 1e-23, 4.2300812341e-3, 1e-18, 0.0
 PHI0, INC, PSI, LAM, BETA = 0.892342342342, 1.2309804223, 3.00908098, 4.827342308, -0.50923423
 
-_FIXTURE = None
+def _tukey(n, alpha):
+    """scipy.signal.windows.tukey(n, alpha), numpy-only (matches the C++ taper)."""
+    if alpha <= 0.0:
+        return np.ones(n)
+    w = np.ones(n)
+    t = int(np.floor(alpha * (n - 1) / 2.0))
+    k = np.arange(0, t + 1)
+    ramp = 0.5 * (1.0 + np.cos(np.pi * (2.0 * k / (alpha * (n - 1)) - 1.0)))
+    w[:t + 1] = ramp
+    w[-(t + 1):] = ramp[::-1]
+    return w
 
 
-def _build_fixture():
-    """Inject a real GB, build its true STFT as the data + XYZ noise (rectangular
-    window). Cached module-wide so the heavy 64-day STFT setup builds once."""
-    global _FIXTURE
-    if _FIXTURE is not None:
-        return _FIXTURE
+def _build_fixture(alpha=0.0):
+    """Inject a real GB, build its true STFT as the data + XYZ noise. `alpha` is the
+    analysis-window Tukey parameter (0.0 = rectangular).
+
+    NOT cached, and each caller must build + fully use a fixture before building
+    another: the LAT STFT computation groups do not support two live instances
+    (building a second invalidates the first's C++ device buffers). A shared cache
+    reused across test classes would hand back a group later corrupted by the
+    windowed (alpha>0) build -> spurious mismatch=1.0.
+    """
     fb = "cpu"; xp = np
     orbits = DefaultOrbits(force_backend=fb); orbits.configure(linear_interp_setup=True)
     tdi_config = TDIConfig("2nd generation", force_backend=fb)
@@ -56,19 +70,18 @@ def _build_fixture():
     keep = (data_t > t_tdi[0]) & (data_t < t_tdi[-1])
     tdi_output = xp.zeros((1, 3, nobs)); tdi_output[:, :, keep] = out.eval_tdi(data_t[keep])
     td_signal = TDSignal(tdi_output[0], settings=TDSettings(nobs, dt, 0.0, force_backend=fb))
-    stft_signal = td_signal.stft(window=xp.ones(nperseg), settings=settings)
+    stft_signal = td_signal.stft(window=_tukey(nperseg, alpha), settings=settings)
     data_res = DataResidualArray(stft_signal)
     sens = XYZSensitivityBackend(orbits=orbits, settings=settings, force_backend=fb)
     sens.sens_mat = sens.compute_sensitivity_matrix(sens.basis_settings.f_arr, 15e-12, 3e-15)
     ac = AnalysisContainer(data_res, sens)
     acs = AnalysisContainerArray([ac], gpus=None)
-    grp = STFTComputationGroup(acs, split_index=0, window_alpha=0.0, force_backend=fb)
+    grp = STFTComputationGroup(acs, split_index=0, window_alpha=alpha, force_backend=fb)
     grp.compute_d_d_term()
     d_d = float(np.asarray(grp.d_d).reshape(-1)[0].real)
     params = np.array([[AMP, F0, FDOT, FDDOT, PHI0, INC, PSI, LAM, BETA]])
-    _FIXTURE = dict(orbits=orbits, tdi_config=tdi_config, grp=grp, d_d=d_d,
-                    Tobs=Tobs, params=params)
-    return _FIXTURE
+    return dict(orbits=orbits, tdi_config=tdi_config, grp=grp, d_d=d_d,
+                Tobs=Tobs, params=params)
 
 
 def _make_gb(fx, n_side_bins):
@@ -134,6 +147,24 @@ class STFTGBFFTAccuracyTest(unittest.TestCase):
         print(f"[fft-recovery] d_h.re={d_h.real:.6e} h_h={h_h:.6e} mismatch={mm:.3e}")
         self.assertLess(abs(mm), 1e-2)
         self.assertAlmostEqual(h_h / self.fx["d_d"], 1.0, delta=0.05)
+
+    def test_fft_windowed_recovers_and_matches_fresnel(self):
+        """With a Tukey window (alpha=0.1) FFTColumn applies the taper as a per-sample
+        multiply; it must still recover the injection and match windowed Fresnel."""
+        fx = _build_fixture(alpha=0.1)
+        gb = _make_gb(fx, n_side_bins=10)
+        gb.get_ll_stft(fx["params"])
+        d_h_f = complex(np.asarray(gb.d_h_out).reshape(-1)[0])
+        h_h_f = float(np.asarray(gb.h_h_out).reshape(-1)[0].real)
+        mm_f = abs(1.0 - d_h_f.real / np.sqrt(fx["d_d"] * h_h_f))
+        gb.get_ll_stft_fft(fx["params"], n_sub=32)
+        d_h_x = complex(np.asarray(gb.d_h_out_fft).reshape(-1)[0])
+        h_h_x = float(np.asarray(gb.h_h_out_fft).reshape(-1)[0].real)
+        mm_x = abs(1.0 - d_h_x.real / np.sqrt(fx["d_d"] * h_h_x))
+        print(f"\n[fft-tukey a=0.1] fresnel mm={mm_f:.3e}  fft mm={mm_x:.3e}  "
+              f"dh rel={abs(d_h_x - d_h_f) / abs(d_h_f):.3e}")
+        self.assertLess(mm_x, 1e-2)                    # windowed FFT recovers injection
+        self.assertLessEqual(mm_x, mm_f * 1.20 + 1e-4)  # >= windowed Fresnel accuracy
 
 
 @unittest.skipUnless(HAVE, "requires GBGPU STFT-GB build + LAT stack")
