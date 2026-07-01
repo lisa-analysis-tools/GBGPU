@@ -1584,6 +1584,118 @@ void GBComputationGroup::gb_wdm_het_get_ll_wrap(
         group_m_lo, group_m_hi, n_groups, m_band_half_width);
 }
 
+// ---- STFT/Fresnel GB likelihood wraps (get_ll + fill_global + swap_ll) ------
+// Instantiate LAT's templated stft_*_impl<SourceT> (lisatools/cutils/
+// lat_stft_kernels.hh) against <GBTDIonTheFly>. The STFT/Fresnel device
+// primitives (get_freq_index / add_ip_contrib / get_amp_phase /
+// get_fourier_value / diff_comp) live in lisatools/cutils/domains.{hpp,cu}.
+void GBComputationGroup::gb_stft_get_ll_wrap(
+    cmplx *d_h_out, cmplx *h_h_out,
+    Orbits *orbits, TDIConfig *tdi_config,
+    STFTFresnel *fresnel, STFTDomain *stft,
+    double *params_all, int *data_index_all, int *noise_index_all,
+    int num_bin, int nparams, double T, double t_ref,
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+{
+    stft_get_ll_impl<GBTDIonTheFly>(
+        d_h_out, h_h_out, orbits, tdi_config, fresnel, stft,
+        params_all, data_index_all, noise_index_all,
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor,
+        freq_from_tdi_phase);
+}
+
+void GBComputationGroup::gb_stft_fill_global_wrap(
+    cmplx *template_fill,
+    Orbits *orbits, TDIConfig *tdi_config,
+    STFTFresnel *fresnel, STFTDomain *stft,
+    double *params_all, int *data_index_all, double *factors_all,
+    int num_bin, int nparams, double T, double t_ref,
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    bool active_band)
+{
+    stft_fill_global_impl<GBTDIonTheFly>(
+        template_fill, orbits, tdi_config, fresnel, stft,
+        params_all, data_index_all, factors_all,
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor,
+        freq_from_tdi_phase, active_band);
+}
+
+void GBComputationGroup::gb_stft_swap_ll_wrap(
+    cmplx *d_h_add_out, cmplx *d_h_remove_out,
+    cmplx *add_add_out, cmplx *remove_remove_out, cmplx *add_remove_out,
+    Orbits *orbits, TDIConfig *tdi_config,
+    STFTFresnel *fresnel, STFTDomain *stft,
+    double *params_add_all, double *params_remove_all,
+    int *data_index_all, int *noise_index_all,
+    int num_bin, int nparams, double T, double t_ref,
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+{
+    stft_swap_ll_impl<GBTDIonTheFly>(
+        d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
+        orbits, tdi_config, fresnel, stft,
+        params_add_all, params_remove_all, data_index_all, noise_index_all,
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor,
+        freq_from_tdi_phase);
+}
+
+// ---- STFT/Fresnel GB F-statistic wrap (Stage 4: get_fstat_ll) --------------
+// Instantiate LAT's stft_get_fstat_ll_impl<SourceT> against <GBTDIonTheFly>:
+// N_i=(d|A_i) [num_bin,4] + upper-triangle M_ij=(A_i|A_j) [num_bin,10] from the
+// 4 Cornish & Crowder basis filters; caller forms 2F = N^T M^-1 N.
+void GBComputationGroup::gb_stft_get_fstat_ll_wrap(
+    double *N_re_out, double *N_im_out,
+    double *M_re_out, double *M_im_out,
+    Orbits *orbits, TDIConfig *tdi_config,
+    STFTFresnel *fresnel, STFTDomain *stft,
+    double *params_all, int *data_index_all, int *noise_index_all,
+    int num_bin, int nparams, double T, double t_ref,
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+{
+    stft_get_fstat_ll_impl<GBTDIonTheFly>(
+        N_re_out, N_im_out, M_re_out, M_im_out,
+        orbits, tdi_config, fresnel, stft,
+        params_all, data_index_all, noise_index_all,
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor,
+        freq_from_tdi_phase);
+}
+
+// ---- STFT/Fresnel GB gradient wraps (Stage 3: get_ll_grad + swap_ll_grad) ---
+// Instantiate LAT's templated stft_*_grad_impl<SourceT> against <GBTDIonTheFly>;
+// per-parameter central finite difference of the STFT log-likelihood.
+void GBComputationGroup::gb_stft_get_ll_grad_wrap(
+    double *grad_out,
+    Orbits *orbits, TDIConfig *tdi_config,
+    STFTFresnel *fresnel, STFTDomain *stft,
+    double *params_all, int *data_index_all, int *noise_index_all,
+    double *param_eps,
+    int num_bin, int nparams, double T, double t_ref,
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+{
+    stft_get_ll_grad_impl<GBTDIonTheFly>(
+        grad_out, orbits, tdi_config, fresnel, stft,
+        params_all, data_index_all, noise_index_all, param_eps,
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor,
+        freq_from_tdi_phase);
+}
+
+void GBComputationGroup::gb_stft_swap_ll_grad_wrap(
+    double *grad_add_out, double *grad_remove_out,
+    Orbits *orbits, TDIConfig *tdi_config,
+    STFTFresnel *fresnel, STFTDomain *stft,
+    double *params_add_all, double *params_remove_all,
+    int *data_index_all, int *noise_index_all,
+    double *param_eps_add, double *param_eps_remove,
+    int num_bin, int nparams, double T, double t_ref,
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+{
+    stft_swap_ll_grad_impl<GBTDIonTheFly>(
+        grad_add_out, grad_remove_out, orbits, tdi_config, fresnel, stft,
+        params_add_all, params_remove_all, data_index_all, noise_index_all,
+        param_eps_add, param_eps_remove,
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor,
+        freq_from_tdi_phase);
+}
+
 void GBComputationGroup::gb_wdm_het_swap_ll_wrap(
     double *d_h_add_out, double *d_h_remove_out,
     double *add_add_out, double *remove_remove_out, double *add_remove_out,

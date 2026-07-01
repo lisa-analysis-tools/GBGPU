@@ -48,6 +48,7 @@
 // FDDomainWrap + LISATDIonTheFlyWrap live in LAT (moved at Phase 3L.1-3L.6).
 #include "binding_wdm_settings.hpp"   // WDMSettingsWrap
 #include "binding_fd_domain.hpp"      // FDDomainWrap
+#include "binding_domains.hpp"        // STFTDomainWrap / STFTFresnelWrap (STFT/Fresnel path; defs only -- LAT registers them)
 #include "binding_lat_spline_tdi.hpp" // LISATDIonTheFlyWrap (parent of GBTDIonTheFlyWrap)
 
 #include <string>
@@ -661,6 +662,71 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<int> binary_perm, array_type<int> group_starts, array_type<int> group_ends,
         array_type<int> group_m_lo, array_type<int> group_m_hi, int n_groups,
         int m_band_half_width);
+
+    // STFT/Fresnel GB likelihood (Stage 1). Receives LAT-registered
+    // STFTFresnelWrap / STFTDomainWrap (cross-module, like OrbitsWrap) and
+    // unwraps ->fresnel / ->domain.
+    void gb_stft_get_ll(
+        array_type<std::complex<double>> d_h_out, array_type<std::complex<double>> h_h_out,
+        OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        STFTFresnelWrap *fresnel_wrap, STFTDomainWrap *stft_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+
+    void gb_stft_get_fstat_ll(
+        array_type<double> N_re_out, array_type<double> N_im_out,
+        array_type<double> M_re_out, array_type<double> M_im_out,
+        OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        STFTFresnelWrap *fresnel_wrap, STFTDomainWrap *stft_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+
+    void gb_stft_fill_global(
+        array_type<std::complex<double>> template_fill,
+        OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        STFTFresnelWrap *fresnel_wrap, STFTDomainWrap *stft_wrap,
+        array_type<double> params_all, array_type<int> data_index_all,
+        array_type<double> factors_all,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase, bool active_band);
+
+    void gb_stft_swap_ll(
+        array_type<std::complex<double>> d_h_add_out, array_type<std::complex<double>> d_h_remove_out,
+        array_type<std::complex<double>> add_add_out, array_type<std::complex<double>> remove_remove_out,
+        array_type<std::complex<double>> add_remove_out,
+        OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        STFTFresnelWrap *fresnel_wrap, STFTDomainWrap *stft_wrap,
+        array_type<double> params_add_all, array_type<double> params_remove_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+
+    // get_ll_grad / swap_ll_grad (Stage 3): per-parameter central
+    // finite-difference gradients of the STFT log-likelihood. param_eps[k] is
+    // the FD step for theta_k; eps_k <= 0 freezes it. grad layout [bin, k].
+    void gb_stft_get_ll_grad(
+        array_type<double> grad_out,
+        OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        STFTFresnelWrap *fresnel_wrap, STFTDomainWrap *stft_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        array_type<double> param_eps,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+
+    void gb_stft_swap_ll_grad(
+        array_type<double> grad_add_out, array_type<double> grad_remove_out,
+        OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        STFTFresnelWrap *fresnel_wrap, STFTDomainWrap *stft_wrap,
+        array_type<double> params_add_all, array_type<double> params_remove_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        array_type<double> param_eps_add, array_type<double> param_eps_remove,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
 
     void gb_wdm_het_swap_ll(
         array_type<double> d_h_add_out, array_type<double> d_h_remove_out,

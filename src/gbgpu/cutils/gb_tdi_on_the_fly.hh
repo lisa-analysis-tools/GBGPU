@@ -46,6 +46,8 @@
 #include "wdm_domain.hh"              // WDMDomain
 #include "lat_tdi_on_the_fly.hh"      // LISATDIonTheFly base + OrbitsSplineCache
 #include "lat_chunked_het_kernels.hh" // wdm_het_*_impl<SourceT> + helpers
+#include "domains.hpp"                // STFTDomain / STFTFresnel (STFT/Fresnel path)
+#include "lat_stft_kernels.hh"        // stft_*_impl<SourceT> (STFT GB likelihood kernels)
 #include "gbt_global.h"               // cmplx + CUDA_DEVICE etc.
 #include <vector>
 
@@ -352,6 +354,83 @@ class GBComputationGroup{
         double T_chunk, double dt, double T, double t_ref, int tdi_type,
         double tukey_alpha,
         int grid_dim, int m_band_half_width);
+
+    // ------------------------------------------------------------------------
+    // STFT/Fresnel GB likelihood (Stage 1: get_ll + fill_global). Instantiates
+    // LAT's templated stft_*_impl<SourceT> (lat_stft_kernels.hh) on the Fresnel
+    // domain primitives in domains.{hpp,cu}. f0/fdot0 are derived from the TDI
+    // phase (Doppler-corrected) when freq_from_tdi_phase is true, else from the
+    // astrophysical GBTDIonTheFly::get_f / get_fdot.
+    // Param order: (amp, f0, fdot, fddot, phi0, iota, psi, lam, beta).
+    void gb_stft_get_ll_wrap(
+        cmplx *d_h_out, cmplx *h_h_out,
+        Orbits *orbits, TDIConfig *tdi_config,
+        STFTFresnel *fresnel, STFTDomain *stft,
+        double *params_all, int *data_index_all, int *noise_index_all,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+
+    void gb_stft_fill_global_wrap(
+        cmplx *template_fill,
+        Orbits *orbits, TDIConfig *tdi_config,
+        STFTFresnel *fresnel, STFTDomain *stft,
+        double *params_all, int *data_index_all, double *factors_all,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        bool active_band);
+
+    // swap_ll (Stage 2): the 5 RJMCMC source-swap inner-product terms per
+    // binary -- (d|h_add), (d|h_remove), (h_add|h_add), (h_remove|h_remove),
+    // (h_add|h_remove). Instantiates LAT's stft_swap_ll_impl<GBTDIonTheFly>
+    // (add_ip_swap_contrib over the union of the add/remove side-bands).
+    void gb_stft_swap_ll_wrap(
+        cmplx *d_h_add_out, cmplx *d_h_remove_out,
+        cmplx *add_add_out, cmplx *remove_remove_out, cmplx *add_remove_out,
+        Orbits *orbits, TDIConfig *tdi_config,
+        STFTFresnel *fresnel, STFTDomain *stft,
+        double *params_add_all, double *params_remove_all,
+        int *data_index_all, int *noise_index_all,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+
+    // get_fstat_ll (Stage 4): F-statistic per binary. Builds the 4 Cornish &
+    // Crowder '05 basis filters (GB waveform at fixed extrinsic A/iota/psi/phi0)
+    // and returns N_i=(d|A_i) [num_bin,4] + upper-triangle M_ij=(A_i|A_j)
+    // [num_bin,10] (re+im); caller forms 2F = N^T M^-1 N. Instantiates LAT's
+    // stft_get_fstat_ll_impl<GBTDIonTheFly> (4x eval_block_ll + 6x
+    // eval_block_swap; byte-identical to {get_ll x4, swap_ll x6}).
+    void gb_stft_get_fstat_ll_wrap(
+        double *N_re_out, double *N_im_out,
+        double *M_re_out, double *M_im_out,
+        Orbits *orbits, TDIConfig *tdi_config,
+        STFTFresnel *fresnel, STFTDomain *stft,
+        double *params_all, int *data_index_all, int *noise_index_all,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+
+    // get_ll_grad / swap_ll_grad (Stage 3): per-parameter central
+    // finite-difference gradients of the STFT log-likelihood. Instantiate
+    // LAT's stft_*_grad_impl<GBTDIonTheFly>. param_eps[k] is the FD step for
+    // theta_k (length nparams); eps_k <= 0 freezes that component. grad_out
+    // layout: grad_out[bin*nparams + k].
+    void gb_stft_get_ll_grad_wrap(
+        double *grad_out,
+        Orbits *orbits, TDIConfig *tdi_config,
+        STFTFresnel *fresnel, STFTDomain *stft,
+        double *params_all, int *data_index_all, int *noise_index_all,
+        double *param_eps,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+
+    void gb_stft_swap_ll_grad_wrap(
+        double *grad_add_out, double *grad_remove_out,
+        Orbits *orbits, TDIConfig *tdi_config,
+        STFTFresnel *fresnel, STFTDomain *stft,
+        double *params_add_all, double *params_remove_all,
+        int *data_index_all, int *noise_index_all,
+        double *param_eps_add, double *param_eps_remove,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
 
     // Spline-path mirrors. `coarse_dt` (seconds) sets the coarse-grid spacing
     // for the cubic-spline window builder (smaller -> more accurate / more

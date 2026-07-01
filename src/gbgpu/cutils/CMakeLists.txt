@@ -248,6 +248,17 @@ if(GBGPU_WITH_CPU)
             "${CMAKE_CURRENT_BINARY_DIR}/Interpolate.cxx"
     DEPENDS "${GBT_CUTILS}/Interpolate.cu"
     VERBATIM)
+
+  # STFT/Fresnel GB likelihood: STFTDomain / STFTFresnel device-method bodies
+  # live in LAT's domains.cu (consumed by lat_stft_kernels.hh -> stft_*_impl).
+  # Copy-compile it into cgbgpu CPU (same pattern as lat_tdi_on_the_fly.cu).
+  add_custom_command(
+    OUTPUT "domains.cxx"
+    COMMENT "Copy LAT's domains.cu to domains.cxx (for cgbgpu CPU)"
+    COMMAND ${CMAKE_COMMAND} -E copy "${LISATOOLS_CUTILS}/domains.cu"
+            "${CMAKE_CURRENT_BINARY_DIR}/domains.cxx"
+    DEPENDS "${LISATOOLS_CUTILS}/domains.cu"
+    VERBATIM)
 endif()
 
 
@@ -328,7 +339,8 @@ if(GBGPU_WITH_CPU)
     SharedMemoryGBGPU.cxx
     gb_tdi_on_the_fly.cxx
     lat_tdi_on_the_fly.cxx
-    Interpolate.cxx)
+    Interpolate.cxx
+    domains.cxx)
   apply_cpu_backend_common_options(cgbgpu)
   target_include_directories(gbgpu_cpu_cgbgpu PRIVATE
     "${LISATOOLS_CUTILS}"        # ReturnPointerBase + lisatools_header_abi.hpp + LAT Detector.hpp
@@ -361,6 +373,7 @@ if(GBGPU_WITH_GPU)
     binding_gbgpu.cxx
     "${LISATOOLS_CUTILS}/Detector.cu"
     "${LISATOOLS_CUTILS}/lat_tdi_on_the_fly.cu"
+    "${LISATOOLS_CUTILS}/domains.cu"
     "${GBT_CUTILS}/Interpolate.cu"
     gbgpu_utils.cu
     SharedMemoryGBGPU.cu

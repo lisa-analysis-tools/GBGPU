@@ -68,7 +68,63 @@ class GBWDMComputations(WDMComputationsBase):
     _F0_PARAM_INDEX = 1   # GBTDIonTheFly: params[1] = f0
 
 
-class GBFDComputations(FastLISAResponseParallelModule):
+class _GBGradEpsMixin:
+    """Shared finite-difference-step machinery for the GB gradient methods
+    (``GBFDComputations`` FD path and ``STFTGBComputations`` STFT path).
+
+    ``_DEFAULT_PARAM_EPS`` is the per-parameter central-FD step. Supplying
+    ``param_scales`` switches the returned gradient to rescaled coordinates
+    ``eta_k = theta_k / Delta_theta_k`` with a uniform step
+    ``eps_theta_k = param_eps_relative * Delta_theta_k`` (matching
+    ``GBWDMComputations.get_ll_grad_wdm``). Requires ``self.xp``.
+    """
+
+    _DEFAULT_PARAM_EPS = (
+        1.0e-25,   # amp
+        2.0e-14,   # f0    (Hz)
+        1.0e-21,   # fdot  (Hz/s)
+        1.0e-28,   # fddot (Hz/s^2)
+        1.0e-6,    # phi0
+        1.0e-6,    # iota
+        1.0e-6,    # psi
+        1.0e-6,    # lam (or RA after convert)
+        1.0e-6,    # beta (or DEC after convert)
+    )
+
+    def _default_param_eps(self, nparams=9):
+        eps = self.xp.asarray(self._DEFAULT_PARAM_EPS[:nparams],
+                              dtype=self.xp.float64)
+        if eps.shape[0] != nparams:
+            extra = self.xp.full(nparams - eps.shape[0],
+                                 eps[-1].item(), dtype=self.xp.float64)
+            eps = self.xp.concatenate([eps, extra])
+        return eps
+
+    def _resolve_eps_and_scales(self, nparams,
+                                param_eps, param_scales, param_eps_relative):
+        if param_scales is not None:
+            scales = self.xp.asarray(param_scales, dtype=self.xp.float64)
+            assert scales.shape[0] == nparams, (
+                f"param_scales length {scales.shape[0]} != nparams {nparams}"
+            )
+            if param_eps is None:
+                eps_theta = scales * float(param_eps_relative)
+            else:
+                eps_theta = self.xp.asarray(param_eps, dtype=self.xp.float64)
+                assert eps_theta.shape[0] == nparams
+            return eps_theta, scales
+
+        if param_eps is None:
+            eps_theta = self._default_param_eps(nparams)
+        else:
+            eps_theta = self.xp.asarray(param_eps, dtype=self.xp.float64)
+            assert eps_theta.shape[0] == nparams, (
+                f"param_eps length {eps_theta.shape[0]} != nparams {nparams}"
+            )
+        return eps_theta, None
+
+
+class GBFDComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
     """Frequency-domain heterodyne analog of :class:`GBWDMComputations`.
 
     Mirrors the WDM ``get_ll_wdm`` / ``get_swap_ll_wdm`` / ``fill_global``
@@ -304,50 +360,6 @@ class GBFDComputations(FastLISAResponseParallelModule):
     # that supplying param_scales returns the gradient in rescaled coordinates
     # eta = theta / Delta_theta.
     # ------------------------------------------------------------------
-    _DEFAULT_PARAM_EPS = (
-        1.0e-25,   # amp
-        2.0e-14,   # f0    (Hz)
-        1.0e-21,   # fdot  (Hz/s)
-        1.0e-28,   # fddot (Hz/s^2)
-        1.0e-6,    # phi0
-        1.0e-6,    # iota
-        1.0e-6,    # psi
-        1.0e-6,    # lam (or RA after convert)
-        1.0e-6,    # beta (or DEC after convert)
-    )
-
-    def _default_param_eps(self, nparams=9):
-        eps = self.xp.asarray(self._DEFAULT_PARAM_EPS[:nparams],
-                              dtype=self.xp.float64)
-        if eps.shape[0] != nparams:
-            extra = self.xp.full(nparams - eps.shape[0],
-                                 eps[-1].item(), dtype=self.xp.float64)
-            eps = self.xp.concatenate([eps, extra])
-        return eps
-
-    def _resolve_eps_and_scales(self, nparams,
-                                param_eps, param_scales, param_eps_relative):
-        if param_scales is not None:
-            scales = self.xp.asarray(param_scales, dtype=self.xp.float64)
-            assert scales.shape[0] == nparams, (
-                f"param_scales length {scales.shape[0]} != nparams {nparams}"
-            )
-            if param_eps is None:
-                eps_theta = scales * float(param_eps_relative)
-            else:
-                eps_theta = self.xp.asarray(param_eps, dtype=self.xp.float64)
-                assert eps_theta.shape[0] == nparams
-            return eps_theta, scales
-
-        if param_eps is None:
-            eps_theta = self._default_param_eps(nparams)
-        else:
-            eps_theta = self.xp.asarray(param_eps, dtype=self.xp.float64)
-            assert eps_theta.shape[0] == nparams, (
-                f"param_eps length {eps_theta.shape[0]} != nparams {nparams}"
-            )
-        return eps_theta, None
-
     def get_ll_grad_fd(self, params,
                        param_eps=None,
                        param_scales=None,
@@ -447,6 +459,376 @@ class GBFDComputations(FastLISAResponseParallelModule):
             num_bin, nparams, self.T, self.t_start, self.t_ref,
             self.N_sparse, self.nchannels,
             self.backend.TDITypeDict[self.tdi_type],
+        )
+        grad_add = grad_add_out.reshape(num_bin, nparams)
+        grad_remove = grad_remove_out.reshape(num_bin, nparams)
+        if scales_add is not None:
+            grad_add = grad_add * scales_add[None, :]
+        if scales_remove is not None:
+            grad_remove = grad_remove * scales_remove[None, :]
+        return grad_add, grad_remove
+
+
+class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
+    """Source-side STFT/Fresnel-domain GB likelihood (Fresnel transform path).
+
+    On-the-fly analog of :class:`GBFDComputations` / :class:`GBWDMComputations`
+    for the STFT (Fresnel) domain. Routes through the ``gb_stft_{get_ll,
+    fill_global}`` kernels on the backend (templated
+    ``stft_*_impl<GBTDIonTheFly>`` in LAT's ``lat_stft_kernels.hh``), reusing the
+    ``STFTFresnel`` / ``STFTDomain`` device primitives. The domain objects
+    (``cpp_fresnel`` / ``cpp_domain``) and the ``<d|d>`` term are taken from a
+    ``lisatools.domaincomputation.STFTComputationGroup``.
+
+    Param order (matches ``GBTDIonTheFly``):
+        ``(amp, f0, fdot, fddot, phi0, iota, psi, lam, beta)`` -- 9 params.
+
+    ``freq_from_tdi_phase`` (default ``True``) derives the per-bin Fresnel chirp
+    frequency / rate from the TDI phase, so the LISA orbital Doppler (whose rate
+    typically exceeds the astrophysical fdot) is included; set ``False`` to
+    recover the legacy astrophysical-``get_f``/``get_fdot`` behaviour.
+    """
+
+    _BACKEND_PREFIX = "gbgpu"
+
+    def __init__(self, stft_comps, T, t_ref=0.0, orbits=None, tdi_config=None,
+                 force_backend=None, n_side_bins=2, window_factor=1.0,
+                 freq_from_tdi_phase=True):
+        super().__init__(force_backend=force_backend)
+        self.stft_comps = stft_comps
+        self.T = float(T)
+        self.t_ref = float(t_ref)
+        self.n_side_bins = int(n_side_bins)
+        self.window_factor = float(window_factor)
+        self.freq_from_tdi_phase = bool(freq_from_tdi_phase)
+        self.orbits = orbits
+        self.tdi_config = tdi_config
+
+    @property
+    def xp(self): return self.backend.xp
+
+    @property
+    def num_params(self): return 9
+
+    @property
+    def stft_comps(self): return self._stft_comps
+    @stft_comps.setter
+    def stft_comps(self, sc): self._stft_comps = sc
+
+    @property
+    def orbits(self): return self._orbits
+    @orbits.setter
+    def orbits(self, o):
+        if o is None:
+            o = EqualArmlengthOrbits()
+        elif not isinstance(o, Orbits) and issubclass(o, Orbits):
+            o = o()
+        else:
+            assert isinstance(o, Orbits)
+        self._orbits = deepcopy(o)
+        if not self._orbits.configured:
+            self._orbits.configure(linear_interp_setup=True)
+        self.cpp_orbits = self.backend.OrbitsWrap(*self._orbits.pycppdetector_args)
+
+    @property
+    def tdi_config(self): return self._tdi_config
+    @tdi_config.setter
+    def tdi_config(self, tc):
+        if tc is None:
+            tc = TDIConfig("1st generation")
+        elif isinstance(tc, str):
+            tc = TDIConfig(tc)
+        elif not isinstance(tc, TDIConfig):
+            raise ValueError("tdi_config must be TDIConfig, str, or None.")
+        self._tdi_config = tc
+        self.cpp_tdi_config = self.backend.TDIConfigWrap(*self._tdi_config.pytdiconfig_args)
+
+    @classmethod
+    def supported_backends(cls):
+        return [cls._BACKEND_PREFIX + "_" + _t for _t in cls.GPU_RECOMMENDED()]
+
+    def _prep_params(self, params):
+        return self.xp.asarray(self.xp.atleast_2d(params)).copy()
+
+    def _resolve_indices(self, num_bin, data_index, noise_index):
+        if data_index is None:
+            data_index = self.xp.zeros(num_bin, dtype=self.xp.int32)
+        else:
+            data_index = self.xp.asarray(data_index).astype(self.xp.int32)
+        if noise_index is None:
+            noise_index = self.xp.zeros(num_bin, dtype=self.xp.int32)
+        else:
+            noise_index = self.xp.asarray(noise_index).astype(self.xp.int32)
+        return data_index, noise_index
+
+    def get_ll_stft(self, params, data_index=None, noise_index=None,
+                    phase_maximize=False):
+        """Log-likelihood ``-0.5*(<d|d> + <h|h> - 2<d|h>)`` per binary.
+
+        Also stores the raw complex ``self.d_h_out`` / ``self.h_h_out`` (handy
+        for cross-checks against the template-based STFTComputationGroup path).
+        """
+        if phase_maximize:
+            raise NotImplementedError("Phase maximization not implemented for STFT GB yet.")
+        p = self._prep_params(params)
+        num_bin = p.shape[0]
+        d_h_out = self.xp.zeros(num_bin, dtype=self.xp.complex128)
+        h_h_out = self.xp.zeros(num_bin, dtype=self.xp.complex128)
+        data_index, noise_index = self._resolve_indices(num_bin, data_index, noise_index)
+
+        self.backend.GBComputationGroupWrap().gb_stft_get_ll(
+            d_h_out, h_h_out,
+            self.cpp_orbits, self.cpp_tdi_config,
+            self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
+            p.flatten().copy(), data_index, noise_index,
+            num_bin, self.num_params, self.T, self.t_ref,
+            self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
+        )
+        self.d_h_out = d_h_out
+        self.h_h_out = h_h_out
+        d_d_arr = self.stft_comps.d_d
+        d_d = d_d_arr[data_index] if d_d_arr is not None else 0.0
+        return (-0.5 * (d_d + h_h_out - 2.0 * d_h_out)).real
+
+    def get_swap_ll_stft(self, params_add, params_remove,
+                         data_index=None, noise_index=None):
+        """The 5 RJMCMC source-swap inner-product terms per binary.
+
+        On-the-fly STFT analog of :meth:`GBFDComputations.get_swap_ll_fd`.
+        Returns ``(like_add, like_remove, d_h_add, d_h_remove, add_add,
+        remove_remove, add_remove)``. ``like_add`` / ``like_remove`` are the
+        per-binary log-likelihoods of the add / remove template against the
+        (shared) data; the five trailing complex arrays are the raw inner
+        products an RJMCMC swap combines as
+        ``2*Re[(d|h_add) - (d|h_remove)] - [(h_add|h_add) - (h_remove|h_remove)]
+        - 2*Re[(h_add|h_remove)]``. They are also stored on ``self`` as
+        ``d_h_add`` / ``d_h_remove`` / ``add_add`` / ``remove_remove`` /
+        ``add_remove``. With ``params_add == params_remove`` every term collapses
+        to the corresponding :meth:`get_ll_stft` ``(d|h)`` / ``(h|h)``.
+        """
+        pa = self._prep_params(params_add)
+        pr = self._prep_params(params_remove)
+        num_bin = pa.shape[0]
+        assert pr.shape[0] == num_bin
+
+        d_h_a = self.xp.zeros(num_bin, dtype=self.xp.complex128)
+        d_h_r = self.xp.zeros(num_bin, dtype=self.xp.complex128)
+        aa = self.xp.zeros(num_bin, dtype=self.xp.complex128)
+        rr = self.xp.zeros(num_bin, dtype=self.xp.complex128)
+        ar = self.xp.zeros(num_bin, dtype=self.xp.complex128)
+        data_index, noise_index = self._resolve_indices(num_bin, data_index, noise_index)
+
+        self.backend.GBComputationGroupWrap().gb_stft_swap_ll(
+            d_h_a, d_h_r, aa, rr, ar,
+            self.cpp_orbits, self.cpp_tdi_config,
+            self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
+            pa.flatten().copy(), pr.flatten().copy(),
+            data_index, noise_index,
+            num_bin, self.num_params, self.T, self.t_ref,
+            self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
+        )
+        self.d_h_add, self.d_h_remove = d_h_a, d_h_r
+        self.add_add, self.remove_remove, self.add_remove = aa, rr, ar
+        d_d_arr = self.stft_comps.d_d
+        d_d = d_d_arr[data_index] if d_d_arr is not None else 0.0
+        like_add = (-0.5 * (d_d + aa - 2.0 * d_h_a)).real
+        like_rem = (-0.5 * (d_d + rr - 2.0 * d_h_r)).real
+        return like_add, like_rem, d_h_a, d_h_r, aa, rr, ar
+
+    def get_fstat_ll_stft(self, params, data_index=None, noise_index=None):
+        """F-statistic per binary over the STFT/Fresnel grid.
+
+        Builds the 4 Cornish & Crowder '05 basis filters ``A_i`` at the binary's
+        intrinsic ``(f0, fdot, fddot, lam, beta)`` with fixed
+        ``(A, iota, psi, phi0) = (2, pi/2, {0, pi/4, 0, pi/4},
+        {0, pi, 3*pi/2, pi/2})``.
+
+        Returns
+        -------
+        N_arr : ndarray, shape ``(num_bin, 4)``
+            Per-binary ``Re<d | A_i>``.
+        M_mat : ndarray, shape ``(num_bin, 10)``
+            Per-binary upper-triangle ``Re<A_i | A_j>`` (i <= j), flattened
+            ``[M00, M01, M02, M03, M11, M12, M13, M22, M23, M33]``.
+
+        Compute ``2F = N^T M^{-1} N`` from these via :meth:`fstat_2F`.
+
+        STFT inner products are complex; the F-stat uses the real part (the same
+        convention :meth:`get_ll_stft`'s logL uses). The kernel is a thin
+        orchestration over the validated Stage-1/2 helpers (``stft_eval_block_ll``
+        x4 + ``stft_eval_block_swap`` x6), so ``N`` / ``M`` are byte-identical to
+        the matching :meth:`get_ll_stft` (d|A_i),(A_i|A_i) and
+        :meth:`get_swap_ll_stft` (A_i|A_j) terms. The raw complex re+im outputs
+        are stored on ``self`` as ``N_arr_cmplx`` / ``M_mat_cmplx`` (imag is a
+        near-zero diagnostic).
+        """
+        p = self._prep_params(params)
+        num_bin = p.shape[0]
+        N_re = self.xp.zeros((num_bin, 4))
+        N_im = self.xp.zeros((num_bin, 4))
+        M_re = self.xp.zeros((num_bin, 10))
+        M_im = self.xp.zeros((num_bin, 10))
+        data_index, noise_index = self._resolve_indices(num_bin, data_index, noise_index)
+
+        self.backend.GBComputationGroupWrap().gb_stft_get_fstat_ll(
+            N_re.reshape(-1), N_im.reshape(-1),
+            M_re.reshape(-1), M_im.reshape(-1),
+            self.cpp_orbits, self.cpp_tdi_config,
+            self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
+            p.flatten().copy(), data_index, noise_index,
+            num_bin, self.num_params, self.T, self.t_ref,
+            self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
+        )
+        self.N_arr = N_re
+        self.M_mat = M_re
+        self.N_arr_cmplx = N_re + 1j * N_im
+        self.M_mat_cmplx = M_re + 1j * M_im
+        return N_re, M_re
+
+    @staticmethod
+    def fstat_2F(N_arr, M_mat):
+        """Assemble ``2F = N^T M^{-1} N`` per binary from the F-stat outputs.
+
+        Args:
+            N_arr: ``(num_bin, 4)`` real ``<d|A_i>``.
+            M_mat: ``(num_bin, 10)`` real upper-triangle ``<A_i|A_j>`` (i <= j,
+                row-major) as returned by :meth:`get_fstat_ll_stft`. The flatten
+                matches ``numpy.triu_indices(4)`` (= the kernel's ``m_idx``).
+
+        Returns:
+            ``(num_bin,)`` numpy array of ``2F`` values (host-side linear algebra;
+            cupy inputs are pulled to host via ``.get()``).
+        """
+        N_arr = N_arr.get() if hasattr(N_arr, "get") else np.asarray(N_arr)
+        M_mat = M_mat.get() if hasattr(M_mat, "get") else np.asarray(M_mat)
+        N_arr = np.atleast_2d(N_arr)
+        M_mat = np.atleast_2d(M_mat)
+        iu = np.triu_indices(4)
+        two_F = np.zeros(N_arr.shape[0])
+        for b in range(N_arr.shape[0]):
+            M = np.zeros((4, 4))
+            M[iu] = M_mat[b]
+            M = M + M.T - np.diag(np.diag(M))      # symmetrize from upper triangle
+            two_F[b] = float(N_arr[b] @ np.linalg.solve(M, N_arr[b]))
+        return two_F
+
+    def fill_global_stft(self, params, templates, data_index=None, factors=None,
+                         active_band=True):
+        """Scatter ``0.5 * factor * fourier_value`` per (time, side-freq, channel)
+        pixel into ``templates`` (shape ``(num_templates, nchannels, NT,
+        NF_active)`` complex, the layout STFTComputationGroup consumes).
+        Accumulates in place (caller pre-zeroes / accumulates)."""
+        assert isinstance(templates, self.xp.ndarray)
+        p = self._prep_params(params)
+        num_bin = p.shape[0]
+        if data_index is None:
+            data_index = self.xp.zeros(num_bin, dtype=self.xp.int32)
+        else:
+            data_index = self.xp.asarray(data_index).astype(self.xp.int32)
+        if factors is None:
+            factors = self.xp.ones(num_bin, dtype=self.xp.float64)
+        else:
+            factors = self.xp.asarray(factors, dtype=self.xp.float64)
+
+        self.backend.GBComputationGroupWrap().gb_stft_fill_global(
+            templates.reshape(-1),
+            self.cpp_orbits, self.cpp_tdi_config,
+            self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
+            p.flatten().copy(), data_index, factors,
+            num_bin, self.num_params, self.T, self.t_ref,
+            self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
+            active_band,
+        )
+
+    # ------------------------------------------------------------------
+    # Gradients (Stage 3): central finite difference over the 9 params,
+    # reusing get_ll_stft / get_swap_ll_stft's exact forward evaluation.
+    # Same _resolve_eps_and_scales convention as GBFDComputations (shared
+    # via _GBGradEpsMixin): supplying param_scales returns the gradient in
+    # rescaled coordinates eta = theta / Delta_theta.
+    # ------------------------------------------------------------------
+    def get_ll_grad_stft(self, params,
+                         param_eps=None,
+                         param_scales=None,
+                         param_eps_relative=1.0e-6,
+                         data_index=None, noise_index=None):
+        """Per-parameter central finite-difference gradient of
+        :meth:`get_ll_stft` (logL = Re(d|h) - 0.5*(h|h); the -0.5*(d|d) constant
+        cancels in the difference).
+
+        Returns ``grad`` of shape ``(num_bin, nparams)`` holding ``dL/dtheta_k``
+        (default) or ``dL/d(eta_k)`` when ``param_scales`` is supplied (see
+        :meth:`GBFDComputations.get_ll_grad_fd`). ``param_eps[k] <= 0`` freezes
+        parameter ``k``. The kernel reuses ``get_ll_stft``'s exact forward
+        evaluation, so it reproduces a host-side central difference of
+        ``get_ll_stft`` to machine precision.
+        """
+        p = self._prep_params(params)
+        num_bin = p.shape[0]
+        nparams = self.num_params
+        data_index, noise_index = self._resolve_indices(num_bin, data_index, noise_index)
+        eps_theta, scales = self._resolve_eps_and_scales(
+            nparams, param_eps, param_scales, param_eps_relative,
+        )
+
+        grad_out = self.xp.zeros(num_bin * nparams, dtype=self.xp.float64)
+        self.backend.GBComputationGroupWrap().gb_stft_get_ll_grad(
+            grad_out,
+            self.cpp_orbits, self.cpp_tdi_config,
+            self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
+            p.flatten().copy(), data_index, noise_index,
+            eps_theta,
+            num_bin, nparams, self.T, self.t_ref,
+            self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
+        )
+        grad = grad_out.reshape(num_bin, nparams)
+        if scales is not None:
+            grad = grad * scales[None, :]
+        return grad
+
+    def get_swap_ll_grad_stft(self, params_add, params_remove,
+                              param_eps_add=None, param_eps_remove=None,
+                              param_scales_add=None, param_scales_remove=None,
+                              param_eps_relative=1.0e-6,
+                              data_index=None, noise_index=None):
+        """Central finite-difference gradients of the swap scalar
+        ``S = Re(d|h_add) - Re(d|h_remove) - 0.5*(h_add|h_add)
+        - 0.5*(h_remove|h_remove) + Re(h_add|h_remove)`` -- the STFT analog of
+        :meth:`GBFDComputations.get_swap_ll_grad_fd` (``S = -0.5*||d - h_add +
+        h_remove||^2`` up to the param-independent ``-0.5*(d|d)``).
+
+        Returns ``(grad_add, grad_remove)``, each ``(num_bin, nparams)``:
+        ``grad_add`` differentiates ``S`` w.r.t. ``theta_add`` (``theta_remove``
+        held fixed); ``grad_remove`` w.r.t. ``theta_remove``. Rescaling
+        semantics match :meth:`get_ll_grad_stft`; ``eps_k <= 0`` freezes the
+        component.
+        """
+        pa = self._prep_params(params_add)
+        pr = self._prep_params(params_remove)
+        num_bin = pa.shape[0]
+        assert pr.shape[0] == num_bin, (
+            f"params_add num_bin {num_bin} != params_remove {pr.shape[0]}"
+        )
+        nparams = self.num_params
+        data_index, noise_index = self._resolve_indices(num_bin, data_index, noise_index)
+        eps_theta_add, scales_add = self._resolve_eps_and_scales(
+            nparams, param_eps_add, param_scales_add, param_eps_relative,
+        )
+        eps_theta_remove, scales_remove = self._resolve_eps_and_scales(
+            nparams, param_eps_remove, param_scales_remove, param_eps_relative,
+        )
+
+        grad_add_out    = self.xp.zeros(num_bin * nparams, dtype=self.xp.float64)
+        grad_remove_out = self.xp.zeros(num_bin * nparams, dtype=self.xp.float64)
+        self.backend.GBComputationGroupWrap().gb_stft_swap_ll_grad(
+            grad_add_out, grad_remove_out,
+            self.cpp_orbits, self.cpp_tdi_config,
+            self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
+            pa.flatten().copy(), pr.flatten().copy(),
+            data_index, noise_index,
+            eps_theta_add, eps_theta_remove,
+            num_bin, nparams, self.T, self.t_ref,
+            self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
         )
         grad_add = grad_add_out.reshape(num_bin, nparams)
         grad_remove = grad_remove_out.reshape(num_bin, nparams)
