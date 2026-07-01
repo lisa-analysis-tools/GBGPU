@@ -597,6 +597,16 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         response sub-sampled at ``n_sub`` points (design 2026-07-01), instead of
         the analytic Fresnel per-pixel value. Converges to :meth:`get_ll_stft` as
         ``n_sub`` grows. Stores raw ``self.d_h_out_fft`` / ``self.h_h_out_fft``.
+
+        Prototype limitations (design 2026-07-01, get_ll-only phase):
+
+        * **Rectangular window only.** ``self.window_factor`` is *not* applied by the
+          FFT kernel (per-sample window is w_m=1); results are only correct for a
+          rectangular analysis window (``window_factor == 1.0``). Windowed (Tukey)
+          support is deferred.
+        * **``n_sub`` must satisfy ``n_sub >~ 2*n_side_bins + 1``** to resolve the
+          requested band; below that the far bins alias. Default n_sub=32 pairs with
+          the default n_side_bins=2 (5 bins); raise n_sub for wide side-bands.
         """
         if phase_maximize:
             raise NotImplementedError("Phase maximization not implemented for STFT GB FFT yet.")
