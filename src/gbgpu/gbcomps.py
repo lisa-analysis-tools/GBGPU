@@ -590,6 +590,36 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         d_d = d_d_arr[data_index] if d_d_arr is not None else 0.0
         return (-0.5 * (d_d + h_h_out - 2.0 * d_h_out)).real
 
+    def get_ll_stft_fft(self, params, data_index=None, noise_index=None,
+                        n_sub=32, phase_maximize=False):
+        """FFT-per-column log-likelihood, the throughput-oriented variant of
+        :meth:`get_ll_stft`. Each STFT segment's template is a targeted DFT of the
+        response sub-sampled at ``n_sub`` points (design 2026-07-01), instead of
+        the analytic Fresnel per-pixel value. Converges to :meth:`get_ll_stft` as
+        ``n_sub`` grows. Stores raw ``self.d_h_out_fft`` / ``self.h_h_out_fft``.
+        """
+        if phase_maximize:
+            raise NotImplementedError("Phase maximization not implemented for STFT GB FFT yet.")
+        p = self._prep_params(params)
+        num_bin = p.shape[0]
+        d_h_out = self.xp.zeros(num_bin, dtype=self.xp.complex128)
+        h_h_out = self.xp.zeros(num_bin, dtype=self.xp.complex128)
+        data_index, noise_index = self._resolve_indices(num_bin, data_index, noise_index)
+
+        self.backend.GBComputationGroupWrap().gb_stft_get_ll_fft(
+            d_h_out, h_h_out,
+            self.cpp_orbits, self.cpp_tdi_config,
+            self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
+            p.flatten().copy(), data_index, noise_index,
+            num_bin, self.num_params, self.T, self.t_ref,
+            self.n_side_bins, int(n_sub), self.window_factor, self.freq_from_tdi_phase,
+        )
+        self.d_h_out_fft = d_h_out
+        self.h_h_out_fft = h_h_out
+        d_d_arr = self.stft_comps.d_d
+        d_d = d_d_arr[data_index] if d_d_arr is not None else 0.0
+        return (-0.5 * (d_d + h_h_out - 2.0 * d_h_out)).real
+
     def get_swap_ll_stft(self, params_add, params_remove,
                          data_index=None, noise_index=None):
         """The 5 RJMCMC source-swap inner-product terms per binary.

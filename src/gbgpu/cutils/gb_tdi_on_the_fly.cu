@@ -1604,6 +1604,21 @@ void GBComputationGroup::gb_stft_get_ll_wrap(
         freq_from_tdi_phase);
 }
 
+void GBComputationGroup::gb_stft_get_ll_fft_wrap(
+    cmplx *d_h_out, cmplx *h_h_out,
+    Orbits *orbits, TDIConfig *tdi_config,
+    STFTFresnel *fresnel, STFTDomain *stft,
+    double *params_all, int *data_index_all, int *noise_index_all,
+    int num_bin, int nparams, double T, double t_ref,
+    int n_side_bins, int n_sub, double window_factor, bool freq_from_tdi_phase)
+{
+    stft_get_ll_fft_impl<GBTDIonTheFly>(
+        d_h_out, h_h_out, orbits, tdi_config, fresnel, stft,
+        params_all, data_index_all, noise_index_all,
+        num_bin, nparams, T, t_ref, n_side_bins, n_sub, window_factor,
+        freq_from_tdi_phase);
+}
+
 void GBComputationGroup::gb_stft_fill_global_wrap(
     cmplx *template_fill,
     Orbits *orbits, TDIConfig *tdi_config,

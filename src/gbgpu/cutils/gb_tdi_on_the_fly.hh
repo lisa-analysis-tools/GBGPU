@@ -370,6 +370,17 @@ class GBComputationGroup{
         int num_bin, int nparams, double T, double t_ref,
         int n_side_bins, double window_factor, bool freq_from_tdi_phase);
 
+    // FFT-per-column variant of gb_stft_get_ll_wrap (design 2026-07-01). Same
+    // surface + n_sub (response sub-samples per STFT segment). Instantiates
+    // LAT's stft_get_ll_fft_impl<GBTDIonTheFly> (FFTColumn policy).
+    void gb_stft_get_ll_fft_wrap(
+        cmplx *d_h_out, cmplx *h_h_out,
+        Orbits *orbits, TDIConfig *tdi_config,
+        STFTFresnel *fresnel, STFTDomain *stft,
+        double *params_all, int *data_index_all, int *noise_index_all,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, int n_sub, double window_factor, bool freq_from_tdi_phase);
+
     void gb_stft_fill_global_wrap(
         cmplx *template_fill,
         Orbits *orbits, TDIConfig *tdi_config,

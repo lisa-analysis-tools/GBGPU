@@ -319,6 +319,26 @@ void GBComputationGroupWrap::gb_stft_get_ll(
         num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
 }
 
+void GBComputationGroupWrap::gb_stft_get_ll_fft(
+    array_type<std::complex<double>> d_h_out, array_type<std::complex<double>> h_h_out,
+    OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+    STFTFresnelWrap *fresnel_wrap, STFTDomainWrap *stft_wrap,
+    array_type<double> params_all,
+    array_type<int> data_index_all, array_type<int> noise_index_all,
+    int num_bin, int nparams, double T, double t_ref,
+    int n_side_bins, int n_sub, double window_factor, bool freq_from_tdi_phase)
+{
+    gb_stft_get_ll_fft_wrap(
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(d_h_out, "d_h_out", num_bin, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(h_h_out, "h_h_out", num_bin, 1)),
+        orbits_wrap->orbits, tdi_config_wrap->tdi_config,
+        fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
+        return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
+        return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
+        num_bin, nparams, T, t_ref, n_side_bins, n_sub, window_factor, freq_from_tdi_phase);
+}
+
 void GBComputationGroupWrap::gb_stft_get_fstat_ll(
     array_type<double> N_re_out, array_type<double> N_im_out,
     array_type<double> M_re_out, array_type<double> M_im_out,
@@ -1067,6 +1087,10 @@ void gbgpu_part(nb::module_ &m) {
          "Fresnel transform on the STFT grid (STFTFresnel/STFTDomain primitives). "
          "f0/fdot0 are derived from the TDI phase (Doppler-corrected) when "
          "freq_from_tdi_phase=True, else from the astrophysical get_f/get_fdot.")
+    .def("gb_stft_get_ll_fft", &GBComputationGroupWrap::gb_stft_get_ll_fft,
+         "FFT-per-column variant of gb_stft_get_ll: per-STFT-segment targeted DFT "
+         "of the sub-sampled (n_sub) windowed response (FFTColumn policy). Same "
+         "(d|h),(h|h) surface; converges to gb_stft_get_ll as n_sub grows.")
     .def("gb_stft_fill_global", &GBComputationGroupWrap::gb_stft_fill_global,
          "STFT/Fresnel GB fill_global: scatter 0.5*factor*fourier_value into a "
          "per-template STFT grid (num_templates, nchannels, num_times, num_freqs) "

@@ -675,6 +675,15 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         int num_bin, int nparams, double T, double t_ref,
         int n_side_bins, double window_factor, bool freq_from_tdi_phase);
 
+    void gb_stft_get_ll_fft(
+        array_type<std::complex<double>> d_h_out, array_type<std::complex<double>> h_h_out,
+        OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+        STFTFresnelWrap *fresnel_wrap, STFTDomainWrap *stft_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        int num_bin, int nparams, double T, double t_ref,
+        int n_side_bins, int n_sub, double window_factor, bool freq_from_tdi_phase);
+
     void gb_stft_get_fstat_ll(
         array_type<double> N_re_out, array_type<double> N_im_out,
         array_type<double> M_re_out, array_type<double> M_im_out,
