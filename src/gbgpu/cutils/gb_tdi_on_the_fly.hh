@@ -379,7 +379,7 @@ class GBComputationGroup{
         STFTFresnel *fresnel, STFTDomain *stft,
         double *params_all, int *data_index_all, int *noise_index_all,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, int n_sub, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, int n_sub, int n_cp_orbit, double window_factor, bool freq_from_tdi_phase);
 
     void gb_stft_fill_global_wrap(
         cmplx *template_fill,

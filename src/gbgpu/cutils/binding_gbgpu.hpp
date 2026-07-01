@@ -682,7 +682,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<double> params_all,
         array_type<int> data_index_all, array_type<int> noise_index_all,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, int n_sub, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, int n_sub, int n_cp_orbit, double window_factor, bool freq_from_tdi_phase);
 
     void gb_stft_get_fstat_ll(
         array_type<double> N_re_out, array_type<double> N_im_out,

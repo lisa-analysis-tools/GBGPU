@@ -166,6 +166,20 @@ class STFTGBFFTAccuracyTest(unittest.TestCase):
         self.assertLess(mm_x, 1e-2)                    # windowed FFT recovers injection
         self.assertLessEqual(mm_x, mm_f * 1.20 + 1e-4)  # >= windowed Fresnel accuracy
 
+    def test_orbit_cache_matches_direct(self):
+        """The orbit spline cache (n_cp_orbit>0) reproduces the direct-get_tdi FFT
+        (n_cp_orbit=0) to spline precision, at a fraction of the orbit evaluations
+        (the smooth LISA orbit is captured by a coarse cubic)."""
+        fx = _build_fixture(alpha=0.0)   # fresh group (STFT groups don't share state)
+        gb = _make_gb(fx, n_side_bins=20)
+        gb.get_ll_stft_fft(fx["params"], n_sub=64, n_cp_orbit=0)          # direct
+        d_h_d = complex(np.asarray(gb.d_h_out_fft).reshape(-1)[0])
+        gb.get_ll_stft_fft(fx["params"], n_sub=64, n_cp_orbit=48)         # cached
+        d_h_c = complex(np.asarray(gb.d_h_out_fft).reshape(-1)[0])
+        rel = abs(d_h_c - d_h_d) / abs(d_h_d)
+        print(f"\n[orbit-cache] direct dh={d_h_d.real:.6e}  cached dh={d_h_c.real:.6e}  rel={rel:.3e}")
+        self.assertLess(rel, 1e-3)
+
 
 @unittest.skipUnless(HAVE, "requires GBGPU STFT-GB build + LAT stack")
 class STFTGBFFTConvergenceCostTest(unittest.TestCase):

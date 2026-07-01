@@ -591,7 +591,7 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         return (-0.5 * (d_d + h_h_out - 2.0 * d_h_out)).real
 
     def get_ll_stft_fft(self, params, data_index=None, noise_index=None,
-                        n_sub=32, phase_maximize=False):
+                        n_sub=32, n_cp_orbit=48, phase_maximize=False):
         """FFT-per-column log-likelihood, the throughput-oriented variant of
         :meth:`get_ll_stft`. Each STFT segment's template is a targeted DFT of the
         response sub-sampled at ``n_sub`` points (design 2026-07-01), instead of
@@ -608,6 +608,12 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         ``n_sub >~ 2*n_side_bins + 1``** to resolve the requested band; below that the
         far bins alias. Default n_sub=32 pairs with the default n_side_bins=2 (5 bins);
         raise n_sub for wide side-bands.
+
+        ``n_cp_orbit`` (default 48) sets the orbit spline-cache density: the LISA
+        orbit is built once over the analysis span and evaluated cheaply per
+        sub-sample instead of recomputing light-travel-times/positions each call,
+        cutting the dominant orbit-evaluation cost. ``n_cp_orbit=0`` disables the
+        cache (direct ``get_tdi`` per sub-sample). Max is ``STFT_ORBIT_NCP_MAX``.
         """
         if phase_maximize:
             raise NotImplementedError("Phase maximization not implemented for STFT GB FFT yet.")
@@ -623,7 +629,7 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
             self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
             p.flatten().copy(), data_index, noise_index,
             num_bin, self.num_params, self.T, self.t_ref,
-            self.n_side_bins, int(n_sub), self.window_factor, self.freq_from_tdi_phase,
+            self.n_side_bins, int(n_sub), int(n_cp_orbit), self.window_factor, self.freq_from_tdi_phase,
         )
         self.d_h_out_fft = d_h_out
         self.h_h_out_fft = h_h_out

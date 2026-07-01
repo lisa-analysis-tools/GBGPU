@@ -326,7 +326,7 @@ void GBComputationGroupWrap::gb_stft_get_ll_fft(
     array_type<double> params_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, int n_sub, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, int n_sub, int n_cp_orbit, double window_factor, bool freq_from_tdi_phase)
 {
     gb_stft_get_ll_fft_wrap(
         reinterpret_cast<cmplx*>(return_pointer_and_check_length(d_h_out, "d_h_out", num_bin, 1)),
@@ -336,7 +336,7 @@ void GBComputationGroupWrap::gb_stft_get_ll_fft(
         return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
-        num_bin, nparams, T, t_ref, n_side_bins, n_sub, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, n_sub, n_cp_orbit, window_factor, freq_from_tdi_phase);
 }
 
 void GBComputationGroupWrap::gb_stft_get_fstat_ll(
