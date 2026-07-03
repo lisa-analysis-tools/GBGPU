@@ -282,3 +282,27 @@ the shared driver + policies; Fresnel path untouched. Commits LAT `0085355`, GBG
 evals per binary, vs Fresnel's ~`22·(2·n_side+1)` `sincos` + `~3·NT` orbit evals — i.e. the
 "fewer transcendentals + amortized response" thesis is realized at the op-count level. The
 **GPU wall-clock** (occupancy, SFU throughput) remains the final go/no-go, off-box.
+
+## 13. GPU verdict (A100-SXM4-40GB, 2026-07-03) — NO-GO
+
+Answered on erebor (single A100-40GB). Full report + raw data:
+`scripts/bench_results_A100.md`, `scripts/bench_stft_fft_A100.csv`.
+
+**FFTColumn `get_ll` is 3.2–7.1× slower than FresnelColumn** at production scale
+(num_bin=16384, n_side=10) at matched accuracy. Best FFT config (n_sub=24, n_cp=48)
+= 3.18×. The FFT/Fresnel ratio is dead-stable and linear across num_bin (3.16 →
+3.18 over 1024→16384) — the GPU is saturated, so scaling up does not close the gap.
+
+**Root cause** (`cuobjdump -res-usage`; `ncu` achieved-occupancy blocked by
+`ERR_NVGPUCTRPERM`): the FFT kernel needs **~30.5 KB shared/block** (the R2 orbit
+cache → ~1 block/SM on A100's default carveout) and spills the `slow[3·n_sub]`
+buffer (compile-time `STFT_FFT_NSUB_MAX=64`) to **3824 B/thread of local memory**,
+vs Fresnel's 4.2 KB shared / 832 B local. The §12.2 op-count win is real but is
+defeated on GPU by shared-memory occupancy + local-memory traffic plus the raw
+per-segment envelope sampling. The §5 knobs (n_sub floor already 24; `NSUB_MAX`↓;
+`n_cp`↓; `__launch_bounds__`) do not plausibly close a 3.2× shared-mem-bound gap.
+
+**Decision:** Fresnel stays the production STFT-GB kernel (now arbitrary-taper-
+correct, LAT `6d010cf`); FFTColumn is retained as the accuracy oracle / any-window
+escape hatch. **Phase B (FFT swap/grad/fstat + JAX) is a NO.** Correctness: GPU
+built-in gate passes; CPU↔GPU cross-check identical to 4 sig figs.
