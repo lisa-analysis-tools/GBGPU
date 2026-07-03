@@ -152,8 +152,8 @@ def main(argv=None):
     sens = XYZSensitivityBackend(orbits=orbits, settings=settings, force_backend=fb)
     sens.sens_mat = sens.compute_sensitivity_matrix(sens.basis_settings.f_arr, 15e-12, 3e-15)
     ac = AnalysisContainer(stft_signal, sens)
-    grp = STFTComputationGroup(AnalysisContainerArray([ac], gpus=None), split_index=0,
-                               window_alpha=a.alpha, force_backend=fb)
+    grp = STFTComputationGroup(AnalysisContainerArray([ac], gpus=[0] if on_gpu else None),
+                               split_index=0, window_alpha=a.alpha, force_backend=fb)
     grp.compute_d_d_term()
     d_d = float(xp.asarray(grp.d_d).reshape(-1)[0].real)
     p_inj = np.array([[AMP, F0, FDOT, FDDOT, PHI0, INC, PSI, LAM, BETA]])
