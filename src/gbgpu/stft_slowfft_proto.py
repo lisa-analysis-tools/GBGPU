@@ -239,7 +239,16 @@ def stft_template_from_slow_part(gb, E, q, t_seg, dt, n_sub, n_side, settings):
 
     # Analysis window per sub-sample (midpoint tau_local = (m+0.5)*dts_sub), matching
     # FFTColumn: Tukey taper of duration alpha*dt/2 when window_alpha>0, else flat.
-    alpha = float(getattr(gb, "window_alpha", 0.0) or 0.0)
+    # The authoritative alpha is the computation group's ``window_alpha`` -- the very
+    # value the windowed data STFT + the C++ Fresnel/FFT paths use. ``STFTGBComputations``
+    # carries no ``window_alpha`` of its own, so a bare ``getattr(gb, "window_alpha")``
+    # would silently default to 0.0 and skip the taper on a windowed fixture (leaving
+    # the template rectangular vs windowed data -> lost overlap). An explicit
+    # ``gb.window_alpha`` still overrides the group when present.
+    alpha = getattr(gb, "window_alpha", None)
+    if alpha is None:
+        alpha = getattr(getattr(gb, "stft_comps", None), "window_alpha", 0.0)
+    alpha = float(alpha or 0.0)
     m_idx = xp.arange(n_sub)
     tau_local = (m_idx + 0.5) * dts_sub                    # [n_sub], relative to seg start
     w = xp.ones(n_sub)
@@ -279,8 +288,92 @@ def stft_template_from_slow_part(gb, E, q, t_seg, dt, n_sub, n_side, settings):
 
 
 def get_ll_stft_slowfft_proto(grp, gb, params, n_sub=32):
+    """Fill the FastGB-STFT prototype end-to-end and score the injection.
+
+    Stage 1 (:func:`slow_part_on_stft_grid`, heterodyned slow part on the STFT
+    sub-grid) -> Stage 2 (:func:`stft_template_from_slow_part`, narrow per-segment
+    DFT template ``H``) -> restore the amplitude -> score ``H`` against the data
+    STFT + ``invC``.
+
+    Scoring contracts ``H`` against the data STFT + ``invC`` with the one-sided
+    factor, exactly as :meth:`STFTComputationGroup.compute_signal_likelihood_terms`'s
+    C++ kernel does (``get_inner_product_cross`` + ``4 * domain.diff_comp``):
+
+        ``d_h = 4*df * sum_{t,f,ci,cj} conj(D[ci]) invC[ci,cj] H[cj]``
+        ``h_h = 4*df * sum_{t,f,ci,cj} conj(H[ci]) invC[ci,cj] H[cj]``
+
+    (full XYZ 3x3 cross-channel contraction; diagonal AET path handled too). We
+    contract manually -- reading ``grp.data_arr`` / ``grp.invC_arr`` / ``settings.df``
+    -- rather than calling the group kernel, because Stage 1 constructs a private
+    ``GBGPU`` and **the LAT STFT computation group's C++ ``STFTDomain`` device state
+    is invalidated by building a second waveform/orbits instance** (the documented
+    "STFT groups do not support two live instances" hazard; verified:
+    ``compute_signal_likelihood_terms`` returns ~1e-44 garbage after Stage 1, while
+    the numpy ``data_arr`` / ``invC_arr`` snapshots stay intact and reproduce the
+    kernel's ``<d|d>`` to machine precision). The brief sanctions this manual
+    fallback. The two paths agree bit-for-bit pre-clobber (validated).
+
+    Args:
+        grp (STFTComputationGroup): owns the data STFT (``grp.data_arr``), the
+            inverse covariance (``grp.invC_arr``) and the grid (``grp.settings``).
+        gb (STFTGBComputations): supplies ``xp``, ``T``, ``orbits``, ``n_side_bins``
+            and -- via ``gb.stft_comps.window_alpha`` -- the analysis window.
+        params (array): ``[num_bin, 9]`` in GBTDIonTheFly order.
+        n_sub (int): sub-samples per STFT segment (Stage-1/2 quadrature density).
+
+    Returns:
+        (d_h, h_h): xp complex ``[num_bin]`` raw inner products, also stored on
+        ``gb`` as ``d_h_out_slowfft`` / ``h_h_out_slowfft`` (mirrors how
+        :meth:`get_ll_stft` stores ``d_h_out`` / ``h_h_out``). The caller forms the
+        recovery ``mm = |1 - d_h.real / sqrt(d_d * h_h.real)|`` with
+        ``d_d = grp.d_d``.
+    """
     xp = gb.xp
-    num_bin = int(params.shape[0])
-    d_h = xp.zeros(num_bin, dtype=xp.complex128)
-    h_h = xp.zeros(num_bin, dtype=xp.complex128)
-    return d_h, h_h  # stub; filled in Tasks 2-4
+    settings = grp.settings
+
+    p = np.atleast_2d(np.asarray(params))
+    amp = xp.asarray(p[:, 0].copy())                    # [num_bin]; H is amp-free
+
+    NT = int(settings.NT)
+    NF = int(settings.NF_active)
+    nch = int(grp.num_channels)
+    df = float(settings.df)
+    stft_dt = float(settings.dt)
+    t0 = float(settings.t0)
+
+    # Snapshot the (numpy/xp) data + inverse-covariance BEFORE Stage 1 builds a
+    # GBGPU (which clobbers the group's C++ domain but leaves these host arrays
+    # intact). data_arr: [num_data, nch, NT, NF]; take data_index 0 (the injection).
+    D = xp.asarray(grp.data_arr).reshape(-1, nch, NT, NF)[0]           # [nch, NT, NF]
+    invC = xp.asarray(grp.invC_arr)
+
+    # STFT segment start times on the domain's ABSOLUTE t0 (the phase reference the
+    # data STFT uses), NOT a 0-based grid: a 0-based grid would incur a per-segment
+    # phase error whenever settings.t0 != 0 (Task-3 review). The same t_seg feeds
+    # Stage 1 (relative, since gb.t_ref == settings.t0 here) and Stage 2 (absolute).
+    t_seg = t0 + xp.arange(NT) * stft_dt
+
+    # Stage 1 -> Stage 2 (n_side from the group's per-binary side-band config).
+    E, q = slow_part_on_stft_grid(gb, p, t_seg, stft_dt, n_sub)
+    H = stft_template_from_slow_part(
+        gb, E, q, t_seg, stft_dt, n_sub, gb.n_side_bins, settings)      # [num_bin,nch,NT,NF]
+
+    # Restore the amplitude divided out in Stage 1 (H is amplitude-free) before scoring.
+    H = H * amp[:, None, None, None]
+
+    # One-sided noise-weighted inner products (4*df factor == C++ 4*diff_comp).
+    four_df = 4.0 * df
+    if invC.size == nch * nch * NT * NF:                # XYZ full 3x3 cross-channel
+        invC = invC.reshape(-1, nch, nch, NT, NF)[0]                   # [nch,nch,NT,NF]
+        d_h = four_df * xp.einsum("itf,ijtf,bjtf->b", xp.conj(D), invC, H)
+        h_h = four_df * xp.einsum("bitf,ijtf,bjtf->b", xp.conj(H), invC, H)
+    else:                                               # AET diagonal
+        invC = invC.reshape(-1, nch, NT, NF)[0]                        # [nch,NT,NF]
+        d_h = four_df * xp.einsum("itf,itf,bitf->b", xp.conj(D), invC, H)
+        h_h = four_df * xp.einsum("bitf,itf,bitf->b", xp.conj(H), invC, H)
+
+    d_h = xp.ascontiguousarray(d_h.astype(xp.complex128))
+    h_h = xp.ascontiguousarray(h_h.astype(xp.complex128))
+    gb.d_h_out_slowfft = d_h
+    gb.h_h_out_slowfft = h_h
+    return d_h, h_h
