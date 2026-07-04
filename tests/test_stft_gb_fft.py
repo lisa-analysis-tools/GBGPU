@@ -42,9 +42,15 @@ def _tukey(n, alpha):
     return w
 
 
-def _build_fixture(alpha=0.0):
+def _build_fixture(alpha=0.0, N_sparse=512):
     """Inject a real GB, build its true STFT as the data + XYZ noise. `alpha` is the
     analysis-window Tukey parameter (0.0 = rectangular).
+
+    ``N_sparse`` sets the number of sparse knots for the ToF slow-part spline the
+    brute STFT is built from (default 512). The brute STFT is the GROUND TRUTH, and
+    a coarse spline caps its accuracy: at N_sparse=512 (10800 s knots) it is only
+    ~4e-3 accurate, adequate for the C++ FFT tests (thresholds ~6e-3) but NOT for
+    validating a <1e-3 template. Densify (e.g. 8192) for a <1e-3-accurate oracle.
 
     NOT cached, and each caller must build + fully use a fixture before building
     another: the LAT STFT computation groups do not support two live instances
@@ -57,7 +63,6 @@ def _build_fixture(alpha=0.0):
     tdi_config = TDIConfig("2nd generation", force_backend=fb)
     dt = 10.0; stft_dt = 6 * 3600.0; n_stft = 256
     nperseg = int(stft_dt / dt); nobs = n_stft * nperseg; Tobs = nobs * dt
-    N_sparse = 512
     t_tdi = xp.linspace(0.0, Tobs, N_sparse + 1)[1:-1]
     data_t = xp.arange(nobs) * dt
     df_grid = 1.0 / stft_dt
