@@ -158,13 +158,21 @@ class SlowPartRecoveryTest(unittest.TestCase):
         self.assertLessEqual(mms[-1], mms[0]) # converges with n_sub
 
     def test_matches_fresnel_short_segments(self):
-        gb = _make_gb(self.fx, n_side_bins=20)
-        gb.get_ll_stft(self.fx["params"])
+        # Order-independent by construction: build a FRESH fixture *inside* the method
+        # instead of reusing the shared setUpClass group. The Fresnel oracle below needs
+        # a LIVE C++ STFTDomain, but the sibling test's slow-FFT Stage-1 GBGPU clobbers
+        # the shared group -- so a rename/reorder (or any earlier slowfft call) that ran
+        # the sibling first would score a clobbered domain -> garbage oracle -> silent
+        # false-pass. Own fixture + Fresnel FIRST, THEN the slow-FFT (which clobbers)
+        # mirrors test_stft_gb_fft.py::test_fft_windowed_recovers_and_matches_fresnel.
+        fx = _build_fixture(N_sparse=8192)
+        gb = _make_gb(fx, n_side_bins=20)
+        gb.get_ll_stft(fx["params"])                     # Fresnel oracle: needs a live group
         d_h_f = complex(np.asarray(gb.d_h_out).reshape(-1)[0]); h_h_f = float(np.asarray(gb.h_h_out).reshape(-1)[0].real)
-        mm_f = abs(1.0 - d_h_f.real / np.sqrt(self.fx["d_d"] * h_h_f))
-        d_h, h_h = get_ll_stft_slowfft_proto(self.fx["grp"], gb, self.fx["params"], n_sub=64)
+        mm_f = abs(1.0 - d_h_f.real / np.sqrt(fx["d_d"] * h_h_f))
+        d_h, h_h = get_ll_stft_slowfft_proto(fx["grp"], gb, fx["params"], n_sub=64)  # clobbers the group
         d_h = complex(np.asarray(d_h).reshape(-1)[0]); h_h = float(np.asarray(h_h).reshape(-1)[0].real)
-        mm_x = abs(1.0 - d_h.real / np.sqrt(self.fx["d_d"] * h_h))
+        mm_x = abs(1.0 - d_h.real / np.sqrt(fx["d_d"] * h_h))
         print(f"[slowfft-vs-fresnel 6h] fresnel {mm_f:.3e}  slowfft {mm_x:.3e}")
         self.assertLessEqual(mm_x, mm_f * 1.20 + 1e-4)   # at least Fresnel accuracy at 6 h
 
