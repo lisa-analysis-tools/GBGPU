@@ -1,7 +1,9 @@
 import unittest
 import numpy as np
 try:
-    from tests.test_stft_gb_fft import _build_fixture, _make_gb, _tukey   # reuse the reference fixture
+    from tests.test_stft_gb_fft import (          # reuse the reference fixture + source
+        _build_fixture, _make_gb, _tukey,
+        AMP, F0, FDOT, FDDOT, PHI0, INC, PSI, LAM, BETA)
     from gbgpu.stft_slowfft_proto import get_ll_stft_slowfft_proto
     HAVE = True
 except (ImportError, ModuleNotFoundError) as _e:
@@ -60,6 +62,77 @@ def _build_multi_fixture(specs, alpha=0.0, N_sparse=8192):
     params = np.array(specs)
     return dict(orbits=orbits, tdi_config=tdi_config, grp=grp, d_d=d_d,
                 Tobs=Tobs, params=params)
+
+
+def _build_fixture_dt(stft_hours, taper_s, N_sparse=8192):
+    """``_build_fixture`` variant parametrized by the STFT segment length ``Delta``.
+
+    Injects the SAME reference GB (``AMP, F0, ...`` from ``test_stft_gb_fft``) as the
+    data STFT, but with:
+
+    * ``stft_dt = stft_hours * 3600`` (the segment length under test);
+    * ``n_stft = round(YRSID_SI / stft_dt)`` so ``Tobs ~ 1 yr`` at every ``Delta``
+      (fixed physical baseline; only the segmentation changes);
+    * a Tukey analysis window with ``alpha = min(1.0, 2*taper_s/stft_dt)``, i.e. a
+      fixed ``~taper_s``-second taper per side (``taper_s=1e4`` -> a ~1e-4 Hz taper),
+      independent of ``Delta`` (exercises the Stage-2 taper branch);
+    * ``N_sparse=8192`` -- the SHARP ToF-spline oracle. The default 512 brute STFT is
+      only ~4e-3 accurate and cannot validate a large-``Delta`` win (see
+      ``_build_fixture``); 8192 gives a <1e-3-accurate ground truth.
+
+    Band placement: ``_build_fixture`` hard-codes ``min_freq=70*df_grid,
+    max_freq=115*df_grid`` with ``df_grid = 1/stft_dt``. Because ``df_grid`` scales
+    with ``stft_dt``, that FIXED-bin band slides off the source carrier as ``Delta``
+    grows (at 24 h ``F0`` sits at bin ~365, outside [70,115] -> the signal would fall
+    entirely OUTSIDE the analysis band). So the band is re-centered on the carrier
+    bin ``qc = round(F0*stft_dt)`` as ``[qc-25, qc+25]`` (51 active bins, carrier at
+    ~bin 25), giving >=4 bins of margin beyond ``n_side=20`` at 6/24/96 h. Same
+    single-live-instance caveat as ``_build_fixture``.
+    """
+    from lisatools.utils.constants import YRSID_SI
+    from lisatools.detector import DefaultOrbits
+    from lisatools.response.tdiconfig import TDIConfig
+    from lisatools.response.tdionfly import GBTDIonTheFly
+    from lisatools.domains import TDSignal, TDSettings, get_stft_settings
+    from lisatools.domaincomputation import STFTComputationGroup
+    from lisatools.datacontainer import DataResidualArray
+    from lisatools.sensitivity import XYZSensitivityBackend
+    from lisatools.analysiscontainer import AnalysisContainer, AnalysisContainerArray
+
+    fb = "cpu"; xp = np
+    orbits = DefaultOrbits(force_backend=fb); orbits.configure(linear_interp_setup=True)
+    tdi_config = TDIConfig("2nd generation", force_backend=fb)
+    dt = 10.0
+    stft_dt = stft_hours * 3600.0
+    n_stft = int(round(YRSID_SI / stft_dt))                 # Tobs ~ 1 yr, any Delta
+    alpha = min(1.0, 2.0 * taper_s / stft_dt)               # fixed ~taper_s-per-side Tukey
+    nperseg = int(stft_dt / dt); nobs = n_stft * nperseg; Tobs = nobs * dt
+    t_tdi = xp.linspace(0.0, Tobs, N_sparse + 1)[1:-1]
+    data_t = xp.arange(nobs) * dt
+    df_grid = 1.0 / stft_dt
+    qc = int(round(F0 * stft_dt))                           # source carrier bin at this df
+    settings = get_stft_settings(data_t, stft_dt, min_freq=(qc - 25) * df_grid,
+                                 max_freq=(qc + 25) * df_grid, force_backend=fb)
+    gb_gen = GBTDIonTheFly(t_tdi, Tobs, 0.0, 1.0 / dt, 1, tdi_config=tdi_config,
+                           orbits=orbits, tdi_chan="XYZ", force_backend=fb)
+    out = gb_gen(AMP, F0, FDOT, FDDOT, PHI0, INC, PSI, LAM, BETA,
+                 convert_to_ra_dec=False, return_spline=True)
+    keep = (data_t > t_tdi[0]) & (data_t < t_tdi[-1])
+    tdi_output = xp.zeros((1, 3, nobs)); tdi_output[:, :, keep] = out.eval_tdi(data_t[keep])
+    td_signal = TDSignal(tdi_output[0], settings=TDSettings(nobs, dt, 0.0, force_backend=fb))
+    stft_signal = td_signal.stft(window=_tukey(nperseg, alpha), settings=settings)
+    data_res = DataResidualArray(stft_signal)
+    sens = XYZSensitivityBackend(orbits=orbits, settings=settings, force_backend=fb)
+    sens.sens_mat = sens.compute_sensitivity_matrix(sens.basis_settings.f_arr, 15e-12, 3e-15)
+    ac = AnalysisContainer(data_res, sens)
+    acs = AnalysisContainerArray([ac], gpus=None)
+    grp = STFTComputationGroup(acs, split_index=0, window_alpha=alpha, force_backend=fb)
+    grp.compute_d_d_term()
+    d_d = float(np.asarray(grp.d_d).reshape(-1)[0].real)
+    params = np.array([[AMP, F0, FDOT, FDDOT, PHI0, INC, PSI, LAM, BETA]])
+    return dict(orbits=orbits, tdi_config=tdi_config, grp=grp, d_d=d_d,
+                Tobs=Tobs, params=params)
+
 
 @unittest.skipUnless(HAVE, "requires GBGPU STFT-GB build + LAT stack")
 class SlowFFTSmokeTest(unittest.TestCase):
@@ -239,3 +312,58 @@ class SlowFFTMultiSourceTest(unittest.TestCase):
             self.fx["grp"], gb, self.fx["params"][::-1], n_sub=64)
         d_h = np.asarray(d_h).reshape(-1); d_h_s = np.asarray(d_h_s).reshape(-1)
         np.testing.assert_allclose(d_h, d_h_s[::-1], rtol=1e-10, atol=0.0)
+
+
+@unittest.skipUnless(HAVE, "requires GBGPU STFT-GB build + LAT stack")
+class SlowPartLargeDeltaTest(unittest.TestCase):
+    """The value proposition: slow-FFT stays EXACT at large STFT segment Delta, where
+    the analytic Fresnel kernel is not even usable.
+
+    Ground truth is the INJECTED brute STFT, never Fresnel (design 2026-07-04 §6:
+    "Ground truth = injected brute STFT, never Fresnel (Fresnel has its own model
+    error)"). slow-FFT samples the response envelope at ``n_sub`` sub-points (exact
+    midpoint quadrature) and heterodynes against the FastGB carrier ``q/T``, so it
+    recovers the injection at every Delta -- mm <= 1e-4 @ 24 h, <= 1e-3 @ 96 h
+    (measured 7.05e-6 / 3.21e-4).
+
+    Fresnel (``get_ll_stft``) is scored + PRINTED as documented evidence ONLY -- it is
+    numerically DEGENERATE at Delta >= 24 h for this near-monochromatic source, so its mm
+    is unreliable (nan @ 24 h; a garbage finite value such as ~4e-3 @ 96 h, itself
+    process-history-dependent) and is NEVER asserted on. Two root causes (Task-5 report):
+      (1) ``freq_from_tdi_phase`` derives the per-pixel frequency from a central finite
+          difference of half-width ``stft_dt``; the first segment samples the orbit at
+          ``t < 0`` (orbit starts at t=0) and extrapolates to garbage -- worsening with
+          Delta: OK @ 6 h -> zeroed template @ 24 h (h_h ~ -3e-38) -> overflow (~1e260)
+          @ 96 h; and
+      (2) the analytic Fresnel value's ``amp/sqrt(2|fdot0|)`` / large-argument Fresnel
+          integrals degenerate for the fdot=1e-18 source (chirp bandwidth ~1e-13 Hz per
+          segment; fails even with ``freq_from_tdi_phase=False``).
+    slow-FFT is immune to both (in-range sub-grid + FastGB carrier, no get_freq_index).
+
+    Order within each ``hours`` block: a FRESH fixture per ``hours``, Fresnel scored
+    FIRST (its C++ path needs a LIVE ``STFTDomain``) THEN slow-FFT (whose Stage-1
+    private ``GBGPU`` clobbers the live group's device buffers) -- mirrors
+    ``test_matches_fresnel_short_segments``."""
+
+    def test_recovers_injection_at_large_delta(self):
+        target = {24.0: 1e-4, 96.0: 1e-3}                    # injection-oracle recovery gate
+        for hours in (24.0, 96.0):                           # 1 day, 4 days
+            fx = _build_fixture_dt(hours, taper_s=1e4)       # ~1 yr, fixed ~1e-4 Hz taper
+            gb = _make_gb(fx, n_side_bins=20)
+            # Fresnel is EVIDENCE ONLY (printed, never asserted): degenerate at large
+            # Delta (finite-diff samples the orbit at t<0; analytic 1/sqrt(fdot)) -> mm_f
+            # is nan/garbage. Score it first: its C++ path needs a still-live group.
+            gb.get_ll_stft(fx["params"])
+            d_h_f = complex(np.asarray(gb.d_h_out).reshape(-1)[0])
+            h_h_f = float(np.asarray(gb.h_h_out).reshape(-1)[0].real)
+            mm_f = (abs(1.0 - d_h_f.real / np.sqrt(fx["d_d"] * h_h_f))
+                    if np.isfinite(h_h_f) and h_h_f > 0.0 else float("nan"))
+            # slow-FFT scored against the INJECTION (grp.d_d) -- the real oracle. Its
+            # Stage-1 private GBGPU clobbers the group, so it MUST run after Fresnel.
+            d_h, h_h = get_ll_stft_slowfft_proto(fx["grp"], gb, fx["params"], n_sub=96)
+            d_h = complex(np.asarray(d_h).reshape(-1)[0])
+            h_h = float(np.asarray(h_h).reshape(-1)[0].real)
+            mm_x = abs(1.0 - d_h.real / np.sqrt(fx["d_d"] * h_h))
+            print(f"[large-dt {hours:.0f}h] slowfft mm={mm_x:.3e}   "
+                  f"(fresnel mm={mm_f:.3e} -- degenerate, evidence only)")
+            self.assertLess(mm_x, target[hours])   # slow-FFT recovers the injected GB
