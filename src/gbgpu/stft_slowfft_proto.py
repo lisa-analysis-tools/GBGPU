@@ -10,7 +10,36 @@ import numpy as np
 from lisatools.utils.constants import C_SI
 
 
-def slow_part_on_stft_grid(gb, params, t_seg, dt, n_sub):
+def make_slowpart_gbgpu(gb):
+    """Build the private FastGB ``GBGPU`` used by :func:`slow_part_on_stft_grid`.
+
+    Constructs a ``GBGPU`` on a **deepcopy** of ``gb.orbits`` (so ``gb``'s privately
+    owned orbit object is never mutated), on the same backend and reference epoch as
+    ``gb`` (``t0=gb.t_ref``), with ``flip_ref_phase=True`` (the ``GBTDIonTheFly``
+    reference-phase convention -- see :func:`slow_part_on_stft_grid`).
+
+    Exposed as a helper so a caller that evaluates the slow part MANY times (a
+    benchmark, a sampler) can build this object ONCE and pass it back via
+    ``slow_part_on_stft_grid(..., gbtmp=...)`` / ``get_ll_stft_slowfft_proto(...,
+    gbtmp=...)``. Construction re-runs the orbit configuration and is the dominant
+    per-call cost (seconds), yet it is orbit/param/``n_sub``-independent, so hoisting
+    it out of the per-call path is both correct and a large speedup. Building it
+    invalidates a live :class:`STFTComputationGroup`'s C++ device state (the documented
+    "two live instances" hazard) -- identical to the inline path it replaces.
+    """
+    from gbgpu.gbgpu import GBGPU
+
+    xp = gb.xp
+    on_gpu = hasattr(xp, "cuda")
+    return GBGPU(
+        orbits=deepcopy(gb.orbits),
+        force_backend=("gpu" if on_gpu else "cpu"),
+        t0=float(gb.t_ref),
+        flip_ref_phase=True,
+    )
+
+
+def slow_part_on_stft_grid(gb, params, t_seg, dt, n_sub, gbtmp=None):
     """Stage 1: FastGB heterodyned time-domain "slow part" on the STFT sub-grid.
 
     Reuses the classic ``GBGPU`` FastGB slow part (the heterodyned,
@@ -28,6 +57,11 @@ def slow_part_on_stft_grid(gb, params, t_seg, dt, n_sub):
         t_seg (array): ``[NT]`` STFT segment start times (relative, seconds).
         dt (float): STFT segment length ``stft_dt`` (seconds).
         n_sub (int): sub-samples per segment.
+        gbtmp (GBGPU, optional): a prebuilt private FastGB ``GBGPU`` (from
+            :func:`make_slowpart_gbgpu`) to REUSE instead of constructing one on this
+            call. ``None`` (default) builds it inline (behavior unchanged). Reuse is
+            safe -- ``GBGPU`` is designed for many waveform calls -- and hoists the
+            dominant (~seconds) per-call construction out of a repeated-eval loop.
 
     Returns:
         (E, q): ``E`` xp complex ``[num_bin, 3, NT, n_sub]`` heterodyned
@@ -47,9 +81,6 @@ def slow_part_on_stft_grid(gb, params, t_seg, dt, n_sub):
         for Task 3 to apply: the only FastGB->GBTDIonTheFly reconciliation left is
         the param-independent ``tdi2_factor(f0)`` (derived from ``q``).
     """
-    # local import to avoid a heavy import at module load (mirrors gbgpu.py deps)
-    from gbgpu.gbgpu import GBGPU
-
     xp = gb.xp
     on_gpu = hasattr(xp, "cuda")
 
@@ -66,12 +97,13 @@ def slow_part_on_stft_grid(gb, params, t_seg, dt, n_sub):
     # the Stage-2 template with only the param-INDEPENDENT, derivable TDI-generation
     # factor to reconcile -- verified: after the flip the FastGB->GBTDIonTheFly gap
     # is a pure ``tdi2_factor(f0)`` (arg +64.6 deg), no phi0-dependent residual.
-    gbtmp = GBGPU(
-        orbits=deepcopy(gb.orbits),
-        force_backend=("gpu" if on_gpu else "cpu"),
-        t0=float(gb.t_ref),
-        flip_ref_phase=True,
-    )
+    #
+    # Building this GBGPU re-runs the orbit configuration and is the dominant per-call
+    # cost (~seconds); it is orbit/param/``n_sub``-independent, so a caller evaluating
+    # the slow part repeatedly may build it ONCE with :func:`make_slowpart_gbgpu` and
+    # pass it in as ``gbtmp`` (default ``None`` -> build inline; behavior unchanged).
+    if gbtmp is None:
+        gbtmp = make_slowpart_gbgpu(gb)
     T = float(gb.T)
     t0_abs = gbtmp.t0_abs                 # == gb.t_ref (0.0 for the fixture)
     arm_length = gbtmp.orbits.armlength
@@ -287,7 +319,7 @@ def stft_template_from_slow_part(gb, E, q, t_seg, dt, n_sub, n_side, settings):
     return H
 
 
-def get_ll_stft_slowfft_proto(grp, gb, params, n_sub=32):
+def get_ll_stft_slowfft_proto(grp, gb, params, n_sub=32, gbtmp=None):
     """Fill the FastGB-STFT prototype end-to-end and score the injection.
 
     Stage 1 (:func:`slow_part_on_stft_grid`, heterodyned slow part on the STFT
@@ -320,6 +352,9 @@ def get_ll_stft_slowfft_proto(grp, gb, params, n_sub=32):
             and -- via ``gb.stft_comps.window_alpha`` -- the analysis window.
         params (array): ``[num_bin, 9]`` in GBTDIonTheFly order.
         n_sub (int): sub-samples per STFT segment (Stage-1/2 quadrature density).
+        gbtmp (GBGPU, optional): prebuilt private FastGB ``GBGPU`` (see
+            :func:`make_slowpart_gbgpu`) reused across calls to hoist the ~seconds
+            construction out of the per-call path; ``None`` builds it inline.
 
     Returns:
         (d_h, h_h): xp complex ``[num_bin]`` raw inner products, also stored on
@@ -354,7 +389,10 @@ def get_ll_stft_slowfft_proto(grp, gb, params, n_sub=32):
     t_seg = t0 + xp.arange(NT) * stft_dt
 
     # Stage 1 -> Stage 2 (n_side from the group's per-binary side-band config).
-    E, q = slow_part_on_stft_grid(gb, p, t_seg, stft_dt, n_sub)
+    # ``gbtmp`` (optional, from :func:`make_slowpart_gbgpu`) is passed through so a
+    # repeated-eval caller can hoist the ~seconds private-GBGPU construction out of the
+    # per-call path (``None`` -> build inline; behavior unchanged).
+    E, q = slow_part_on_stft_grid(gb, p, t_seg, stft_dt, n_sub, gbtmp=gbtmp)
     H = stft_template_from_slow_part(
         gb, E, q, t_seg, stft_dt, n_sub, gb.n_side_bins, settings)      # [num_bin,nch,NT,NF]
 
