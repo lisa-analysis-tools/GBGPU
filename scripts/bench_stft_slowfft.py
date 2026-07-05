@@ -339,6 +339,12 @@ def run_single(a, stft_hours):
     valid_n_sub = [n for n in a.n_sub if (2 * max(a.n_side) + 1) <= n <= N_SUB_MAX]
 
     rows = []
+    # One fixture/group is reused across n_side, but Stage-1's private GBGPU clobbers the
+    # live C++ group after the first pass -- a 2nd n_side would then score Fresnel on a
+    # clobbered group. Rebuild the fixture per n_side to lift this (Phase-2 item).
+    assert len(a.n_side) == 1, (
+        "bench reuses one group; multiple n_side would score Fresnel on a clobbered "
+        "group -- rebuild the fixture per n_side to support >1")
     for ns in a.n_side:
         gb = STFTGBComputations(stft_comps=grp, T=Tobs, t_ref=0.0, orbits=orbits,
                                 tdi_config=fx["tdi_config"], force_backend=fb, n_side_bins=ns,

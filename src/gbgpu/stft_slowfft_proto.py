@@ -82,7 +82,6 @@ def slow_part_on_stft_grid(gb, params, t_seg, dt, n_sub, gbtmp=None):
         the param-independent ``tdi2_factor(f0)`` (derived from ``q``).
     """
     xp = gb.xp
-    on_gpu = hasattr(xp, "cuda")
 
     # A private GBGPU on the SAME orbits / backend / reference epoch as `gb`.
     # deepcopy the orbits: GBGPUBase's setter re-runs ``configure`` in place, and
@@ -171,7 +170,6 @@ def slow_part_on_stft_grid(gb, params, t_seg, dt, n_sub, gbtmp=None):
     NT = int(t_seg.shape[0])
     sub = (xp.arange(n_sub) + 0.5) * (dt / n_sub)         # [n_sub]
     tm = (t_seg[:, None] + sub[None, :]).reshape(-1)      # [M], relative time
-    M = NT * n_sub
 
     # spacecraft on the ABSOLUTE sub-grid (run_wave feeds _spacecraft tm_abs),
     # evaluated once and reused across binaries.
@@ -366,6 +364,13 @@ def get_ll_stft_slowfft_proto(grp, gb, params, n_sub=32, gbtmp=None):
     xp = gb.xp
     settings = grp.settings
 
+    # Prototype validated only at t_ref==0: the absolute/relative STFT time split below
+    # (Stage-1 relative t_seg vs Stage-2 absolute, tied to gb.t_ref == settings.t0 == 0)
+    # would need re-deriving for a nonzero epoch. Fail loud rather than score silently.
+    assert float(gb.t_ref) == 0.0, (
+        "prototype validated only at t_ref==0; nonzero epoch needs the "
+        "abs/rel time split re-derived (Phase 2)")
+
     p = np.atleast_2d(np.asarray(params))
     amp = xp.asarray(p[:, 0].copy())                    # [num_bin]; H is amp-free
 
@@ -401,6 +406,13 @@ def get_ll_stft_slowfft_proto(grp, gb, params, n_sub=32, gbtmp=None):
 
     # One-sided noise-weighted inner products (4*df factor == C++ 4*diff_comp).
     four_df = 4.0 * df
+    # The XYZ(3x3)/AET(diagonal) disambiguation below keys off invC.size, which is
+    # unambiguous ONLY at num_noise==1: a multi-noise AET invC [num_noise,nch,NT,NF]
+    # aliases a single-noise XYZ invC [1,nch,nch,NT,NF]. Guard the assumption loudly.
+    num_noise = int(grp.num_noise)
+    assert num_noise == 1, (
+        "prototype supports single-noise (num_noise==1); "
+        "multi-noise invC disambiguation is a Phase-2 item")
     if invC.size == nch * nch * NT * NF:                # XYZ full 3x3 cross-channel
         invC = invC.reshape(-1, nch, nch, NT, NF)[0]                   # [nch,nch,NT,NF]
         d_h = four_df * xp.einsum("itf,ijtf,bjtf->b", xp.conj(D), invC, H)
