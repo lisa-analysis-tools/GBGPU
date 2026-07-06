@@ -13,10 +13,16 @@ except (ModuleNotFoundError, ImportError) as e:
     tdi_available = False
     warnings.warn("tdi module not found. No sensitivity information will be included.")
 
+# NOTE: import the runtime module via the attribute form (`from cupy.cuda import
+# runtime`), NOT the submodule form (`from cupy.cuda.runtime import setDevice`).
+# The submodule form forces Python to load cupy's `cupy/cuda/runtime.py` shim
+# (a `from ... import *` re-export that drops underscore-private names) and
+# rebinds `cupy.cuda.runtime` process-wide to that shim, which breaks
+# `cupy.cuda.get_local_runtime_version()` for other libraries (e.g. FastEMRIWaveforms).
 try:
-    from cupy.cuda.runtime import setDevice
+    from cupy.cuda import runtime as _cuda_runtime
 
-
+    setDevice = _cuda_runtime.setDevice
 except (ModuleNotFoundError, ImportError):
     setDevice = None
 
