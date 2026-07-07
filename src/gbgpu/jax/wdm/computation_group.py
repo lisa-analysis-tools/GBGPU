@@ -287,6 +287,7 @@ class GBComputationGroupWrapJAX:
         cpp_orbits, cpp_tdi_config,
         cpp_wdm_settings,
         params_in, factors,
+        data_index,
         chunk_t_starts, chunk_keep_lo, chunk_keep_hi, chunk_n_global_lo,
         wdm_window,
         n_chunks, num_bin, nparams,
@@ -302,12 +303,24 @@ class GBComputationGroupWrapJAX:
         Mutates ``templates`` in place (must be numpy). ``fill_global``
         writes into the FULL ``(nchannels, Nf, Nt)`` template -- the
         active-band layout only applies on the inner-product paths.
+
+        ``data_index`` is the per-binary slab index into a multi-template
+        buffer (single-template callers pass all-zeros -> slab 0, matching
+        the historical behaviour). NOTE: the JAX kernel itself is not yet
+        slab-aware; only the single-slab (all-zeros) case is supported here
+        and asserted. Full multi-slab JAX routing is a separate follow-up
+        tracked with the JAX chunked-het parity item.
         """
         from .heterodyne_kernels import gb_wdm_het_fill_global_jax
         source = self._resolve_source(t_ref)
         p2d = self._reshape_params(params_in, num_bin, nparams)
         Nf = int(cpp_wdm_settings.Nf)
         Nt = int(cpp_wdm_settings.Nt)
+        if data_index is not None:
+            di = np.asarray(data_index)
+            assert di.size == 0 or int(di.max()) == 0, (
+                "JAX chunked-het fill_global does not yet support multi-slab "
+                "data_index routing; all indices must be 0.")
         import jax.numpy as jnp
         out = gb_wdm_het_fill_global_jax(
             params_batch=jnp.asarray(p2d),
@@ -323,7 +336,10 @@ class GBComputationGroupWrapJAX:
             dt=float(dt), T_chunk=float(T_chunk),
             tukey_alpha=float(tukey_alpha),
         )
-        # Accumulate into the caller's buffer (matches C++ contract).
+        # Accumulate into the caller's buffer (matches C++ contract). Single
+        # slab only (see the data_index assert above): the flat/dense buffer
+        # is written at slab-0 offset, so this reshape+add is unchanged from
+        # the historical single-template path.
         tmpl_np = np.asarray(templates)
         out_np  = np.asarray(out).reshape(tmpl_np.shape)
         tmpl_np += out_np

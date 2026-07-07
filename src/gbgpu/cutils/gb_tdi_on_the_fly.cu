@@ -673,7 +673,8 @@ inline void gbfd_accumulate_ll(double *d_h_acc, double *h_h_acc,
         for (int m = THREAD_START_X; m < N; m += BLOCK_INCR_X)
         {
             int k = gbfd_dense_bin(m, N, kf0);
-            if (!fd->in_band(k)) continue;
+            if (!fd->in_band(k) || !fd->in_row(k, data_index)
+                || !fd->in_row(k, noise_index)) continue;
             for (int c1 = 0; c1 < C; ++c1)
             {
                 cmplx d_c1 = fd->get_data(k, c1, data_index);
@@ -697,7 +698,8 @@ inline void gbfd_accumulate_ll(double *d_h_acc, double *h_h_acc,
         for (int m = THREAD_START_X; m < N; m += BLOCK_INCR_X)
         {
             int k = gbfd_dense_bin(m, N, kf0);
-            if (!fd->in_band(k)) continue;
+            if (!fd->in_band(k) || !fd->in_row(k, data_index)
+                || !fd->in_row(k, noise_index)) continue;
             for (int c = 0; c < Cd; ++c)
             {
                 cmplx d_c = fd->get_data(k, c, data_index);
@@ -860,6 +862,7 @@ CUDA_KERNEL
 void gb_fd_fill_global_kernel(cmplx *template_fill,
     GBTDIonTheFly *tdi_on_fly_handle, FDDomain *fd,
     double *params, int *data_index_all, double *factors_all,
+    int *template_start_inds,
     double t_start, double Tobs,
     int N, int num_bin, int n_params, int nchannels, int log2N,
     double tukey_alpha, double edge_frac)
@@ -879,15 +882,18 @@ void gb_fd_fill_global_kernel(cmplx *template_fill,
 
         int data_index = data_index_all[bin_i];
         double factor  = factors_all[bin_i];
+        int row_start  = template_start_inds[data_index];
         for (int m = THREAD_START_X; m < N; m += BLOCK_INCR_X)
         {
             int k = gbfd_dense_bin(m, N, kf0);
-            if (!fd->in_band(k)) continue;
+            int k_loc = k - row_start;
+            if (!fd->in_band(k) || k_loc < 0 || k_loc >= fd->n_rfft) continue;
             for (int c = 0; c < nchannels; ++c)
             {
                 cmplx v = tdi_chan[c * N + m];
                 size_t idx = (size_t) data_index * nchannels * fd->n_rfft
-                             + (size_t) c * fd->n_rfft + k;
+                             + (size_t) c * fd->n_rfft
+                             + k_loc;
                 double re = factor * v.real();
                 double im = factor * v.imag();
                 atomicAdd(((double*)&template_fill[idx]) + 0, re);
@@ -902,6 +908,7 @@ void gb_fd_fill_global_kernel(cmplx *template_fill,
 void GBComputationGroup::gb_fd_fill_global_wrap(cmplx *template_fill,
     Orbits* orbits, TDIConfig *tdi_config, FDDomain *fd,
     double *params_all, int *data_index_all, double *factors_all,
+    int *template_start_inds,
     int num_bin, int nparams, double T, double t_start, double t_ref,
     int N_sparse, int nchannels, double tukey_alpha, double edge_frac)
 {
@@ -941,6 +948,7 @@ void GBComputationGroup::gb_fd_fill_global_wrap(cmplx *template_fill,
     }
     gb_fd_fill_global_kernel<<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(
         template_fill, d_gb, d_fd, params_all, data_index_all, factors_all,
+        template_start_inds,
         t_start, T, N_sparse, num_bin, nparams, nchannels, log2N, tukey_alpha,
         edge_frac);
     cudaDeviceSynchronize();
@@ -967,14 +975,17 @@ void GBComputationGroup::gb_fd_fill_global_wrap(cmplx *template_fill,
 
         int data_index = data_index_all[bin_i];
         double factor  = factors_all[bin_i];
+        int row_start  = template_start_inds[data_index];
         for (int m = 0; m < N_sparse; ++m)
         {
             int k = gbfd_dense_bin(m, N_sparse, kf0);
-            if (!fd->in_band(k)) continue;
+            int k_loc = k - row_start;
+            if (!fd->in_band(k) || k_loc < 0 || k_loc >= fd->n_rfft) continue;
             for (int c = 0; c < nchannels; ++c)
             {
                 size_t idx = (size_t) data_index * nchannels * fd->n_rfft
-                             + (size_t) c * fd->n_rfft + k;
+                             + (size_t) c * fd->n_rfft
+                             + k_loc;
                 template_fill[idx] = template_fill[idx]
                     + cmplx(factor * tdi_chan[c * N_sparse + m].real(),
                             factor * tdi_chan[c * N_sparse + m].imag());
@@ -1076,7 +1087,8 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
             for (int m = 0; m < N; ++m)
             {
                 int k = gbfd_dense_bin(m, N, kf0_a);
-                if (!fd->in_band(k)) continue;
+                if (!fd->in_band(k)
+                    || !fd->in_row(k, noise_index_all[bin_i])) continue;
                 // matching m on remove side: (k - kf0_r) mod N
                 int mr_signed = k - kf0_r;
                 int mr = ((mr_signed % N) + N) % N;
@@ -1102,7 +1114,8 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
             for (int m = 0; m < N; ++m)
             {
                 int k = gbfd_dense_bin(m, N, kf0_a);
-                if (!fd->in_band(k)) continue;
+                if (!fd->in_band(k)
+                    || !fd->in_row(k, noise_index_all[bin_i])) continue;
                 int mr_signed = k - kf0_r;
                 int mr = ((mr_signed % N) + N) % N;
                 int kr = gbfd_dense_bin(mr, N, kf0_r);
@@ -1177,7 +1190,8 @@ inline double gbfd_grad_one_sided_partial(
     for (int mp = 0; mp < N; ++mp)
     {
         int kk = gbfd_dense_bin(mp, N, kf0_pert);
-        if (!fd->in_band(kk)) continue;
+        if (!fd->in_band(kk) || !fd->in_row(kk, data_index)
+            || !fd->in_row(kk, noise_index)) continue;
 
         int ma_signed = kk - kf0_add_C;
         int ma = ((ma_signed % N) + N) % N;
@@ -1531,6 +1545,7 @@ void GBComputationGroup::gb_wdm_het_fill_global_wrap(
     double *template_fill, Orbits *orbits, TDIConfig *tdi_config,
     WDMSettings *wdm_settings,
     double *params_all, double *factors_all,
+    int *data_index_all,
     double *chunk_t_starts, int *chunk_keep_lo, int *chunk_keep_hi,
     int *chunk_n_global_offset, double *wdm_window,
     int n_chunks, int num_bin, int nparams,
@@ -1545,6 +1560,7 @@ void GBComputationGroup::gb_wdm_het_fill_global_wrap(
         template_fill, orbits, tdi_config,
         wdm_settings,
         params_all, factors_all,
+        data_index_all,
         chunk_t_starts, chunk_keep_lo, chunk_keep_hi, chunk_n_global_offset,
         wdm_window, n_chunks, num_bin, nparams,
         Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,

@@ -51,6 +51,7 @@
 #include "binding_lat_spline_tdi.hpp" // LISATDIonTheFlyWrap (parent of GBTDIonTheFlyWrap)
 
 #include <string>
+#include <stdexcept>
 #include <iostream>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -570,6 +571,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         FDDomainWrap *fd_wrap,
         array_type<double> params_all, array_type<int> data_index_all,
         array_type<double> factors_all,
+        array_type<int> template_start_inds,
         int num_bin, int nparams, double T, double t_start, double t_ref,
         int N_sparse, int nchannels, double tukey_alpha, double edge_frac);
 
@@ -629,6 +631,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
         WDMSettingsWrap *wdm_settings_wrap,
         array_type<double> params_all, array_type<double> factors_all,
+        array_type<int> data_index,
         array_type<double> chunk_t_starts,
         array_type<int> chunk_keep_lo, array_type<int> chunk_keep_hi,
         array_type<int> chunk_n_global_offset,

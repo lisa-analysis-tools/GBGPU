@@ -82,18 +82,30 @@ void GBComputationGroupWrap::gb_fd_fill_global(
     FDDomainWrap *fd_wrap,
     array_type<double> params_all, array_type<int> data_index_all,
     array_type<double> factors_all,
+    array_type<int> template_start_inds,
     int num_bin, int nparams, double T, double t_start, double t_ref,
     int N_sparse, int nchannels, double tukey_alpha, double edge_frac)
 {
     int n_rfft = fd_wrap->fd->n_rfft;
-    int num_data = fd_wrap->fd->num_data;
+    // template_fill rows need not match fd->num_data: fill_global writes into
+    // caller-provided template buffers (e.g. the Fisher's per-source dh
+    // workspace), each row carrying its own window start
+    // (template_start_inds, length = row count, indexed by data_index).
+    if (template_fill.size() % ((size_t) n_rfft * nchannels) != 0 ||
+        template_fill.size() == 0) {
+        throw std::invalid_argument(
+            "template_fill: length must be a positive multiple of "
+            "n_rfft * nchannels.");
+    }
+    size_t num_rows = template_fill.size() / ((size_t) n_rfft * nchannels);
     gb_fd_fill_global_wrap(
-        (cmplx*) return_pointer_and_check_length(template_fill,
-            "template_fill", n_rfft * nchannels * num_data, 1),
+        (cmplx*) return_pointer(template_fill, "template_fill"),
         orbits_wrap->orbits, tdi_config_wrap->tdi_config, fd_wrap->fd,
         return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(factors_all, "factors_all", num_bin, 1),
+        return_pointer_and_check_length(template_start_inds,
+            "template_start_inds", (int) num_rows, 1),
         num_bin, nparams, T, t_start, t_ref, N_sparse, nchannels, tukey_alpha, edge_frac);
 }
 
@@ -197,6 +209,7 @@ void GBComputationGroupWrap::gb_wdm_het_fill_global(
     OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
     WDMSettingsWrap *wdm_settings_wrap,
     array_type<double> params_all, array_type<double> factors_all,
+    array_type<int> data_index,
     array_type<double> chunk_t_starts,
     array_type<int> chunk_keep_lo, array_type<int> chunk_keep_hi,
     array_type<int> chunk_n_global_offset,
@@ -214,18 +227,33 @@ void GBComputationGroupWrap::gb_wdm_het_fill_global(
     // active_band selects the template_fill layout: false -> dense parent grid
     // (nchannels, Nf, Nt); true -> active-band (nchannels, Nf_active, Nt_active),
     // mirroring WDMDomain so a settings-path AnalysisContainer buffer is
-    // written/subtracted directly. Check the length matching the chosen layout.
-    const size_t templ_len = active_band
+    // written/subtracted directly. per_template is one template slab; the
+    // buffer holds num_templates such slabs and data_index[bin] routes each
+    // binary into its own slab (0 -> offset 0, backward compatible).
+    const size_t per_template = active_band
         ? (size_t) nchannels * wdm_settings_wrap->wdm_settings->Nf_active
                              * wdm_settings_wrap->wdm_settings->Nt_active
         : (size_t) nchannels * Nf * Nt;
+    // The template_fill buffer length must be an integer multiple of one
+    // template slab. Compute num_templates and check divisibility here (the
+    // per-slab exact check below then confirms the length). data_index is
+    // validated buffer-local (0..num_templates-1) so routing stays in-bounds.
+    const size_t templ_total = template_fill.size();
+    if (per_template == 0 || (templ_total % per_template) != 0) {
+        throw std::invalid_argument(
+            std::string("template_fill: length ") + std::to_string(templ_total)
+            + " is not an integer multiple of one template slab ("
+            + std::to_string(per_template) + ").");
+    }
+    const int num_templates = (int) (templ_total / per_template);
     gb_wdm_het_fill_global_wrap(
         return_pointer_and_check_length(template_fill, "template_fill",
-                                        templ_len, 1),
+                                        (int) per_template, num_templates),
         orbits_wrap->orbits, tdi_config_wrap->tdi_config,
         wdm_settings_wrap->wdm_settings,
         return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
         return_pointer_and_check_length(factors_all, "factors_all", num_bin, 1),
+        return_pointer_and_check_length(data_index, "data_index", num_bin, 1),
         return_pointer_and_check_length(chunk_t_starts, "chunk_t_starts", n_chunks, 1),
         return_pointer_and_check_length(chunk_keep_lo, "chunk_keep_lo", n_chunks, 1),
         return_pointer_and_check_length(chunk_keep_hi, "chunk_keep_hi", n_chunks, 1),
@@ -276,15 +304,23 @@ void GBComputationGroupWrap::gb_wdm_het_get_ll(
         return_pointer_and_check_length(chunk_keep_hi, "chunk_keep_hi", n_chunks, 1),
         return_pointer_and_check_length(chunk_n_global_offset, "chunk_n_global_offset", n_chunks, 1),
         return_pointer_and_check_length(wdm_window, "wdm_window", Nt_sub, 1),
-        return_pointer_and_check_length(
-            data_d, "data_d",
-            (size_t) nchannels * Nf_active * Nt_active, 1),
-        return_pointer_and_check_length(
-            invC, "invC",
-            ((tdi_type == TDI_XYZ)
-                 ? (size_t) nchannels * nchannels * Nf_active * Nt_active
-                 : (size_t) nchannels * Nf_active * Nt_active),
-            1),
+        // data_d / invC may hold ANY whole number of (walker, band) slabs --
+        // the kernels stride into them via data_index / noise_index. Require
+        // whole slabs only (per-slab strides below).
+        (data_d.size() % ((size_t) nchannels * Nf_active * Nt_active) == 0
+             && data_d.size() > 0
+             ? return_pointer(data_d, "data_d")
+             : throw std::invalid_argument(
+                   "data_d: length must be a positive multiple of "
+                   "nchannels * Nf_active * Nt_active.")),
+        (invC.size() % ((tdi_type == TDI_XYZ)
+                            ? (size_t) nchannels * nchannels * Nf_active * Nt_active
+                            : (size_t) nchannels * Nf_active * Nt_active) == 0
+             && invC.size() > 0
+             ? return_pointer(invC, "invC")
+             : throw std::invalid_argument(
+                   "invC: length must be a positive multiple of the "
+                   "per-slab inverse-covariance size.")),
         n_chunks, num_bin, nparams,
         Nt_sub, log2_Nt_sub,
         N_sparse, log2_N_sparse,
@@ -342,15 +378,23 @@ void GBComputationGroupWrap::gb_wdm_het_swap_ll(
         return_pointer_and_check_length(chunk_keep_hi,     "chunk_keep_hi",     n_chunks, 1),
         return_pointer_and_check_length(chunk_n_global_offset, "chunk_n_global_offset", n_chunks, 1),
         return_pointer_and_check_length(wdm_window, "wdm_window", Nt_sub, 1),
-        return_pointer_and_check_length(
-            data_d, "data_d",
-            (size_t) nchannels * Nf_active * Nt_active, 1),
-        return_pointer_and_check_length(
-            invC, "invC",
-            ((tdi_type == TDI_XYZ)
-                 ? (size_t) nchannels * nchannels * Nf_active * Nt_active
-                 : (size_t) nchannels * Nf_active * Nt_active),
-            1),
+        // data_d / invC may hold ANY whole number of (walker, band) slabs --
+        // the kernels stride into them via data_index / noise_index. Require
+        // whole slabs only (per-slab strides below).
+        (data_d.size() % ((size_t) nchannels * Nf_active * Nt_active) == 0
+             && data_d.size() > 0
+             ? return_pointer(data_d, "data_d")
+             : throw std::invalid_argument(
+                   "data_d: length must be a positive multiple of "
+                   "nchannels * Nf_active * Nt_active.")),
+        (invC.size() % ((tdi_type == TDI_XYZ)
+                            ? (size_t) nchannels * nchannels * Nf_active * Nt_active
+                            : (size_t) nchannels * Nf_active * Nt_active) == 0
+             && invC.size() > 0
+             ? return_pointer(invC, "invC")
+             : throw std::invalid_argument(
+                   "invC: length must be a positive multiple of the "
+                   "per-slab inverse-covariance size.")),
         n_chunks, num_bin, nparams,
         Nt_sub, log2_Nt_sub,
         N_sparse, log2_N_sparse,
@@ -403,15 +447,23 @@ void GBComputationGroupWrap::gb_wdm_het_get_fstat_ll(
         return_pointer_and_check_length(chunk_keep_hi, "chunk_keep_hi", n_chunks, 1),
         return_pointer_and_check_length(chunk_n_global_offset, "chunk_n_global_offset", n_chunks, 1),
         return_pointer_and_check_length(wdm_window, "wdm_window", Nt_sub, 1),
-        return_pointer_and_check_length(
-            data_d, "data_d",
-            (size_t) nchannels * Nf_active * Nt_active, 1),
-        return_pointer_and_check_length(
-            invC, "invC",
-            ((tdi_type == TDI_XYZ)
-                 ? (size_t) nchannels * nchannels * Nf_active * Nt_active
-                 : (size_t) nchannels * Nf_active * Nt_active),
-            1),
+        // data_d / invC may hold ANY whole number of (walker, band) slabs --
+        // the kernels stride into them via data_index / noise_index. Require
+        // whole slabs only (per-slab strides below).
+        (data_d.size() % ((size_t) nchannels * Nf_active * Nt_active) == 0
+             && data_d.size() > 0
+             ? return_pointer(data_d, "data_d")
+             : throw std::invalid_argument(
+                   "data_d: length must be a positive multiple of "
+                   "nchannels * Nf_active * Nt_active.")),
+        (invC.size() % ((tdi_type == TDI_XYZ)
+                            ? (size_t) nchannels * nchannels * Nf_active * Nt_active
+                            : (size_t) nchannels * Nf_active * Nt_active) == 0
+             && invC.size() > 0
+             ? return_pointer(invC, "invC")
+             : throw std::invalid_argument(
+                   "invC: length must be a positive multiple of the "
+                   "per-slab inverse-covariance size.")),
         n_chunks, num_bin, nparams,
         Nt_sub, log2_Nt_sub,
         N_sparse, log2_N_sparse,

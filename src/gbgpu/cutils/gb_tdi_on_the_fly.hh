@@ -273,6 +273,7 @@ class GBComputationGroup{
         Orbits *orbits, TDIConfig *tdi_config,
         WDMSettings *wdm_settings,
         double *params_all, double *factors_all,
+        int *data_index_all,
         double *chunk_t_starts, int *chunk_keep_lo, int *chunk_keep_hi,
         int *chunk_n_global_offset,
         double *wdm_window,
@@ -407,9 +408,14 @@ class GBComputationGroup{
     //
     // All three share the same per-source heterodyne FD pass that
     // GBFDTDIonTheFly already uses.  N_sparse must be a power of two.
+    // template_start_inds: per-TEMPLATE-row absolute start bin (length =
+    // number of template rows, indexed by data_index). The template buffer
+    // is caller-provided and independent of fd's data rows, so it carries
+    // its own window offsets (pass zeros for the legacy full-grid layout).
     void gb_fd_fill_global_wrap(cmplx *template_fill,
         Orbits* orbits, TDIConfig *tdi_config, FDDomain *fd,
         double *params_all, int *data_index_all, double *factors_all,
+        int *template_start_inds,
         int num_bin, int nparams, double T, double t_start, double t_ref,
         int N_sparse, int nchannels, double tukey_alpha, double edge_frac);
 

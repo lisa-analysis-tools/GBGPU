@@ -943,8 +943,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         if num_per_gpu is None:
             assert len(_gpus_iter) == 1
-            num_per_gpu = int(1e15)
-            # make really high so just keeps
+            num_per_gpu = int(2**31 - 1)
+            # make really high so just keeps (int32-safe: numpy 2 rejects
+            # int32 arrays modulo a Python int beyond the int32 range)
 
         inputs_in = []
         for nnn, N_here in enumerate(unique_N):
@@ -1245,8 +1246,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         if num_per_gpu is None:
             assert len(_gpus_iter) == 1
-            num_per_gpu = int(1e15)
-            # make really high so just keeps
+            num_per_gpu = int(2**31 - 1)
+            # make really high so just keeps (int32-safe: numpy 2 rejects
+            # int32 arrays modulo a Python int beyond the int32 range)
 
         inputs_in = []
         for nnn, N_here in enumerate(unique_N):
@@ -1811,10 +1813,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         unique_N, inverse = self.xp.unique(self.xp.asarray(N), return_inverse=True)
         N_groups = self.xp.arange(len(unique_N))[inverse]
         
-        if factors is not None:
-            if use_c_implementation is False:
-                raise NotImplementedError("Currently factors is not implemented for use_c_implementation=False.")
-        else:
+        if factors is None:
             factors = self.xp.ones(self.num_bin, dtype=self.xp.float64)
         
         # setup window mapping
@@ -2039,6 +2038,12 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 num_split_here = keep_bool.sum().item()
                 if num_split_here == 0:
                     continue
+
+                # spacecraft positions on the same per-N grid the GPU branch uses
+                tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
+                tm_abs = tm_rel + self.t0_abs
+                Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()
+
                 params_here = self.xp.asarray(params)[keep_bool]
                 group_index_here = (group_index[keep_bool] % num_per_gpu).astype(np.int32)
                 factors_here = factors[keep_bool]
@@ -2058,7 +2063,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     (templates_here, group_index_here, factors_here)
                     + params_N_tuple
                     + (T, dt, N_here, num_split_here, start_freq_ind_tmp, data_length,
-                       tdi_channel_setup_map[tdi_channel_setup], gpu, do_synchronize)
+                       tdi_channel_setup_map[tdi_channel_setup], gpu, do_synchronize,
+                       Ps_arr, self.orbits.armlength, tdi2,
+                       window_type, window_alpha)
                 )
                 self.backend.sharedmem.SharedMemoryGenerateGlobal_wrap(*tuple_in)
 
