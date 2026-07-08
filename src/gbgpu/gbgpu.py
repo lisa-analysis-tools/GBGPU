@@ -154,7 +154,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             )
         else:
             self._orbits = orbits
-        self.orbits.configure(linear_interp_setup=True)
+        self.orbits._ensure_configured()
 
     @property
     def citation(self):
