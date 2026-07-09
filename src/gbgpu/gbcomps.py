@@ -429,6 +429,17 @@ class GBFDComputations(FastLISAResponseParallelModule):
         like_rem = -0.5 * (self.d_d + rr - 2.0 * d_h_r)
         return like_add, like_rem, d_h_a, d_h_r, aa, rr, ar
 
+    def setup_in_model(self, buffer_aca, params_ref_phys, data_index,
+                       N_vals=None) -> None:
+        """No-op per-source in-model setup hook (mirrors
+        WDMComputationsBase.setup_in_model; the FD kernels score directly
+        against the residual, no per-source preparation needed)."""
+        return None
+
+    def clear_in_model(self) -> None:
+        """No-op in-model teardown hook."""
+        return None
+
     def get_fstat_ll_fd(self, params, fd_holder, data_index=None,
                         noise_index=None,
                         convert_to_ra_dec: Optional[bool] = None):

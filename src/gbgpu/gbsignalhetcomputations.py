@@ -154,6 +154,213 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     def xp(self):
         return self.backend.xp
 
+    # ------------------------------------------------------------------
+    # Band-engine mode: sig-het scoring INSIDE the GB special move.
+    #
+    # Constructed via :meth:`for_band_engine` around a chunked-het
+    # GBWDMComputations delegate. Everything the WDM band engine touches
+    # (fill_global_wdm / get_ll_wdm / get_swap_ll_wdm / grads) routes to
+    # the chunked delegate, EXCEPT get_ll_wdm while an in-model reference
+    # is active: setup_in_model() -- called by the move once per picked
+    # source batch, at the friends/info-matrix stage, AFTER the sources
+    # are removed from their cell residuals -- builds the heterodyne
+    # reference (backend c0 producer + lisatools bin-fold) against the
+    # source-free residual slabs, and every repeat proposal then scores
+    # through the fast sig-het kernel against that CONSTANT reference.
+    # clear_in_model() (after the repeat block) reverts get_ll_wdm to the
+    # chunked delegate. Dispatch is purely by comp type: settings hand
+    # the move THIS class instead of GBWDMComputations, nothing else
+    # changes (chunked comps inherit no-op hooks from
+    # WDMComputationsBase).
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def for_band_engine(cls, chunked_comp, *, nt_layer=64, n_sparse_fd=1024,
+                        m_active_half_width=2, max_r=5.0):
+        """Build a data-less engine-mode instance around ``chunked_comp``.
+
+        Grid, orbits, TDI configuration, phase reference time, window and
+        taper all come from the chunked delegate's ``wdm_settings`` (the
+        run's active-band WDM grid), so the two likelihoods are defined on
+        identical grids. CPU-only (the sig-het kernels are CPU for now),
+        like the plain constructor.
+        """
+        wdm = chunked_comp.wdm_settings
+        self = cls.__new__(cls)
+        FastLISAResponseParallelModule.__init__(self, force_backend="cpu")
+        self.cpp = self.backend.GBComputationGroupWrap()
+        self.chunked = chunked_comp
+        self.m_half = int(m_active_half_width)
+
+        Nf, Nt = int(wdm.Nf), int(wdm.Nt)
+        dt = float(wdm.data_dt)
+        t0 = float(wdm.t0)
+        Tobs = float(wdm.Tobs)
+        Nobs = Nf * Nt
+
+        ind_min_t = int(wdm.ind_min_t)
+        ind_min_f = int(wdm.ind_min_f)
+        Nt_active = int(wdm.Nt_active)
+        Nf_active = int(wdm.ind_max_f - wdm.ind_min_f + 1)
+        stride, N_sparse_t, n_sparse_local = sparse_time_grid(
+            Nt, Nt_active, nt_layer)
+        self.window_full = np.asarray(wdm.window, dtype=np.float64)
+        self.n_sparse_local = n_sparse_local
+
+        # The chunked comp stores the raw ctor value (possibly the -1 AUTO
+        # sentinel); the kernels consume the RESOLVED alpha.
+        tukey_alpha = float(getattr(
+            chunked_comp, "resolved_tukey_alpha",
+            getattr(chunked_comp, "tukey_alpha", 0.0)))
+        if tukey_alpha < 0.0:
+            tukey_alpha = 0.0
+
+        tdi_config = chunked_comp.tdi_config
+        orbits = chunked_comp.orbits
+        t_tdi = np.linspace(t0, t0 + (Nobs - 1) * dt, 16384)
+        gb_gen = GBTDIonTheFly(t_tdi, Tobs, float(chunked_comp.t_ref),
+                               1.0 / dt, 1, tdi_config=tdi_config,
+                               orbits=orbits, tdi_chan="XYZ",
+                               force_backend="cpu")
+        self.tdi_wrap = gb_gen.wave_gen
+        self._keep_alive = dict(gb_gen=gb_gen, orbits=orbits,
+                                tdi_config=tdi_config)
+
+        self._g = dict(Nf=Nf, Nt=Nt, Nf_active=Nf_active, Nt_active=Nt_active,
+                       nt_layer=int(nt_layer), N_sparse_t=N_sparse_t,
+                       stride=stride, ind_min_t=ind_min_t,
+                       ind_min_f=ind_min_f, layer_df=float(wdm.layer_df),
+                       dt=dt, Tobs=Tobs, t0=t0,
+                       n_sparse_fd=int(n_sparse_fd),
+                       tukey_alpha=tukey_alpha, max_r=float(max_r),
+                       m_half=self.m_half)
+        # Deltas are what the in-model repeats consume; keep the chunked
+        # delegate's d_d convention so absolute ll values line up too.
+        self.d_d = float(getattr(chunked_comp, "d_d", 0.0))
+        self._in_model = None
+        self._slot_to_ref = None
+        return self
+
+    def setup_in_model(self, buffer_aca, params_ref_phys, data_index,
+                       N_vals=None) -> None:
+        """Build the per-source heterodyne references for one repeat block.
+
+        ``params_ref_phys`` (n, 9): the picked sources' CURRENT physical
+        parameters (the heterodyne expansion points). ``data_index`` (n,):
+        their buffer slots; the slot's residual slab -- which at this point
+        CONTAINS the source's signal (the move removed the template from
+        the model just before calling this) -- plus its inverse-PSD slab
+        feed the bin-fold. Only the REAL part of the WDM data enters the
+        real-projection bin-fold, so the buffer's real residual is the
+        exact data-side input. The reference then stays constant for the
+        whole repeat block (see clear_in_model)."""
+        g = self._g
+        nch = 3
+        slots = np.asarray(
+            data_index.get() if hasattr(data_index, "get") else data_index,
+            dtype=int)
+        refs = np.ascontiguousarray(
+            np.asarray(
+                params_ref_phys.get() if hasattr(params_ref_phys, "get")
+                else params_ref_phys, dtype=float
+            ).reshape(-1, 9))
+        n = refs.shape[0]
+
+        slab_shape = (-1, nch, g["Nf_active"], g["Nt_active"])
+        res = np.asarray(buffer_aca.linear_data_arr[0]).reshape(slab_shape)[slots]
+        psd_flat = np.asarray(buffer_aca.linear_psd_arr[0])
+        expected_xyz = psd_flat.size // (nch * nch * g["Nf_active"] * g["Nt_active"])
+        if expected_xyz * nch * nch * g["Nf_active"] * g["Nt_active"] != psd_flat.size:
+            raise NotImplementedError(
+                "sig-het in-model setup currently supports the XYZ "
+                "cross-channel inverse covariance layout only.")
+        invC = psd_flat.reshape(-1, nch, nch, g["Nf_active"], g["Nt_active"])[slots]
+
+        c0_sparse = np.zeros((n, nch, g["Nf_active"], g["N_sparse_t"]),
+                             dtype=np.complex128)
+        c0_dense = np.zeros((n, nch, g["Nf_active"], g["Nt_active"]),
+                            dtype=np.complex128)
+        self.cpp.gb_signal_het_make_reference(
+            self.tdi_wrap, c0_sparse, c0_dense, self.window_full,
+            self.n_sparse_local, refs, n, 9, 1, 2,
+            g["Nf"], g["Nt"], g["Nf_active"], g["Nt_active"],
+            g["nt_layer"], g["N_sparse_t"], g["stride"],
+            g["ind_min_t"], g["ind_min_f"], g["layer_df"],
+            g["dt"], g["Tobs"], g["t0"],
+            3, g["n_sparse_fd"], g["tukey_alpha"])
+
+        A0l, A1l, B0l, B1l, B0ncl, B1ncl = [], [], [], [], [], []
+        for i in range(n):
+            A0, A1, B0, B1, B0nc, B1nc = bin_fold_real(
+                res[i].astype(np.complex128), c0_dense[i], invC[i],
+                self.n_sparse_local, g["stride"], g["Nt_active"],
+                tdi_type="XYZ")
+            A0l.append(A0); A1l.append(A1); B0l.append(B0)
+            B1l.append(B1); B0ncl.append(B0nc); B1ncl.append(B1nc)
+
+        self.c0_sparse_all = np.ascontiguousarray(c0_sparse)
+        self.A0_all = np.ascontiguousarray(np.stack(A0l))
+        self.A1_all = np.ascontiguousarray(np.stack(A1l))
+        self.B0_all = np.ascontiguousarray(np.stack(B0l))
+        self.B1_all = np.ascontiguousarray(np.stack(B1l))
+        self.B0nc_all = np.ascontiguousarray(np.stack(B0ncl))
+        self.B1nc_all = np.ascontiguousarray(np.stack(B1ncl))
+        self.params_ref_all = refs
+
+        slot_map = np.full(int(slots.max()) + 1, -1, dtype=int)
+        slot_map[slots] = np.arange(n)
+        self._slot_to_ref = slot_map
+        self._in_model = True
+
+    def clear_in_model(self) -> None:
+        """Deactivate the in-model reference: get_ll_wdm routes back to the
+        chunked delegate (RJ / removal / any out-of-block scoring)."""
+        self._in_model = None
+        self._slot_to_ref = None
+
+    # ---- band-engine surface (chunked delegate + in-model routing) -------
+
+    def fill_global_wdm(self, *args, **kwargs):
+        return self.chunked.fill_global_wdm(*args, **kwargs)
+
+    def get_swap_ll_wdm(self, *args, **kwargs):
+        return self.chunked.get_swap_ll_wdm(*args, **kwargs)
+
+    def get_ll_grad_wdm(self, *args, **kwargs):
+        return self.chunked.get_ll_grad_wdm(*args, **kwargs)
+
+    def hessian_wdm(self, *args, **kwargs):
+        return self.chunked.hessian_wdm(*args, **kwargs)
+
+    def information_matrix(self, *args, **kwargs):
+        return self.chunked.information_matrix(*args, **kwargs)
+
+    def get_ll_wdm(self, params, wdm_holder, data_index=None,
+                   noise_index=None, **kwargs):
+        """Chunked-het scoring, EXCEPT while an in-model reference is active:
+        then candidates score through the sig-het kernel against the fixed
+        reference of their buffer slot (``data_index`` maps slot -> ref)."""
+        if self._in_model is None:
+            ll = self.chunked.get_ll_wdm(
+                params, wdm_holder, data_index=data_index,
+                noise_index=noise_index, **kwargs)
+            self.d_h_out = self.chunked.d_h_out
+            self.h_h_out = self.chunked.h_h_out
+            return ll
+        slots = np.asarray(
+            data_index.get() if hasattr(data_index, "get") else data_index,
+            dtype=int)
+        ref_idx = self._slot_to_ref[slots]
+        if np.any(ref_idx < 0):
+            raise RuntimeError(
+                "sig-het in-model scoring hit a buffer slot with no "
+                "reference; setup_in_model was not run for it.")
+        p = params.get() if hasattr(params, "get") else params
+        ll = self.get_ll(np.asarray(p, dtype=float), data_index=ref_idx)
+        self.d_h_out = self.last_d_h
+        self.h_h_out = self.last_h_h
+        return ll
+
     def get_ll(self, params, data_index=None, phase_maximize=False):
         """logL for candidate ``params`` (length-9 or ``(N,9)``); ``data_index``
         ``(N,)`` selects the reference (default all-zero -> single reference).

@@ -526,6 +526,18 @@ class FDBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             return ll, self.d_h_out, self.h_h_out, self.phase_angle
         return ll
 
+    # ---------- in-model likelihood setup hooks ------------------------------
+
+    def setup_in_model(self, buffer_aca, params_phys, data_index,
+                       N_vals=None) -> None:
+        """Per-source in-model setup hook (no-op for the FD comps; see the
+        WDM engine's version for the sig-het behavior)."""
+        return self.gb_fd_comp.setup_in_model(
+            buffer_aca, params_phys, data_index, N_vals=N_vals)
+
+    def clear_in_model(self) -> None:
+        return self.gb_fd_comp.clear_in_model()
+
     # ---------- get_swap_ll --------------------------------------------------
 
     def get_swap_ll(
@@ -729,6 +741,7 @@ class WDMBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             data_index=data_index,
             noise_index=noise_index,
         )
+        ll = self.xp.asarray(ll)
         # Inner products stashed for callers that need them (mirrors the
         # gb_comps d_h_out / h_h_out convention). The WDM kernel internally
         # skips out-of-band layers, so kept_out is all-True here.
@@ -739,6 +752,22 @@ class WDMBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         if return_inner_products:
             return ll, self.d_h_out, self.h_h_out, self.phase_angle
         return ll
+
+    # ---------- in-model likelihood setup hooks ------------------------------
+
+    def setup_in_model(self, buffer_aca, params_phys, data_index,
+                       N_vals=None) -> None:
+        """Per-source in-model setup: forwards to the computation object.
+
+        Chunked-het comps inherit the no-op from WDMComputationsBase;
+        sig-het comps (GBSignalHetComputations.for_band_engine) build the
+        heterodyne reference against the source-free cell residuals here
+        and hold it constant until :meth:`clear_in_model`."""
+        return self.gb_comps.setup_in_model(
+            buffer_aca, params_phys, data_index, N_vals=N_vals)
+
+    def clear_in_model(self) -> None:
+        return self.gb_comps.clear_in_model()
 
     # ---------- get_swap_ll --------------------------------------------------
 
