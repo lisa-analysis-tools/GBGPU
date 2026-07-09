@@ -242,8 +242,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         return self
 
     def setup_in_model(self, buffer_aca, params_ref_phys, data_index,
-                       N_vals=None) -> None:
-        """Build the per-source heterodyne references for one repeat block.
+                       N_vals=None) -> bool:
+        """Build (or patch) the per-source heterodyne references.
 
         ``params_ref_phys`` (n, 9): the picked sources' CURRENT physical
         parameters (the heterodyne expansion points). ``data_index`` (n,):
@@ -252,18 +252,28 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         the model just before calling this) -- plus its inverse-PSD slab
         feed the bin-fold. Only the REAL part of the WDM data enters the
         real-projection bin-fold, so the buffer's real residual is the
-        exact data-side input. The reference then stays constant for the
-        whole repeat block (see clear_in_model)."""
+        exact data-side input.
+
+        INCREMENTAL semantics: with no reference active (block start,
+        after clear_in_model) this builds fresh for all given slots. While
+        a reference IS active, the given slots must be a subset of the
+        existing ones and only THOSE slots' coefficient blocks are
+        rebuilt in place -- the move's mid-block drift refresh uses this
+        to re-anchor only the sources that walked too far from their
+        expansion point. Returns True so callers can tell an active
+        sig-het setup from the no-op hooks (which return None)."""
         g = self._g
         nch = 3
         slots = np.asarray(
             data_index.get() if hasattr(data_index, "get") else data_index,
             dtype=int)
-        refs = np.ascontiguousarray(
-            np.asarray(
-                params_ref_phys.get() if hasattr(params_ref_phys, "get")
-                else params_ref_phys, dtype=float
-            ).reshape(-1, 9))
+        # FORCED copy: ascontiguousarray(asarray(...)) returns a VIEW for
+        # float64-contiguous input, and params_ref_all must never alias
+        # the caller's array (the mid-block patch writes into it).
+        refs = np.array(
+            params_ref_phys.get() if hasattr(params_ref_phys, "get")
+            else params_ref_phys, dtype=float, copy=True
+        ).reshape(-1, 9)
         n = refs.shape[0]
 
         slab_shape = (-1, nch, g["Nf_active"], g["Nt_active"])
@@ -298,6 +308,28 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             A0l.append(A0); A1l.append(A1); B0l.append(B0)
             B1l.append(B1); B0ncl.append(B0nc); B1ncl.append(B1nc)
 
+        if self._in_model is not None:
+            # Mid-block PATCH: re-anchor only the given slots (the move's
+            # drift refresh). They must already carry a reference.
+            if int(slots.max()) >= len(self._slot_to_ref):
+                raise RuntimeError(
+                    "sig-het in-model patch hit a slot outside the "
+                    "block's reference set.")
+            ref_idx = self._slot_to_ref[slots]
+            if np.any(ref_idx < 0):
+                raise RuntimeError(
+                    "sig-het in-model patch hit a slot with no reference; "
+                    "mid-block refreshes must target the block's slots.")
+            self.c0_sparse_all[ref_idx] = c0_sparse
+            self.A0_all[ref_idx] = np.stack(A0l)
+            self.A1_all[ref_idx] = np.stack(A1l)
+            self.B0_all[ref_idx] = np.stack(B0l)
+            self.B1_all[ref_idx] = np.stack(B1l)
+            self.B0nc_all[ref_idx] = np.stack(B0ncl)
+            self.B1nc_all[ref_idx] = np.stack(B1ncl)
+            self.params_ref_all[ref_idx] = refs
+            return True
+
         self.c0_sparse_all = np.ascontiguousarray(c0_sparse)
         self.A0_all = np.ascontiguousarray(np.stack(A0l))
         self.A1_all = np.ascontiguousarray(np.stack(A1l))
@@ -311,6 +343,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         slot_map[slots] = np.arange(n)
         self._slot_to_ref = slot_map
         self._in_model = True
+        return True
 
     def clear_in_model(self) -> None:
         """Deactivate the in-model reference: get_ll_wdm routes back to the
@@ -376,8 +409,9 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         if phase_maximize:
             ll_0 = self.get_ll(params, data_index=data_index)
             d_h_0, h_h = self.last_d_h.copy(), self.last_h_h.copy()
-            x_q = np.ascontiguousarray(
-                np.atleast_2d(np.asarray(params, dtype=float)))
+            # FORCED copy: the quadrature shift must not mutate the
+            # caller's params through an ascontiguousarray view.
+            x_q = np.atleast_2d(np.array(params, dtype=float, copy=True))
             x_q[:, 4] = x_q[:, 4] + np.pi / 2
             self.get_ll(x_q, data_index=data_index)
             d_h_90 = self.last_d_h.copy()
