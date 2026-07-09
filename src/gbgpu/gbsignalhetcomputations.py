@@ -154,9 +154,34 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     def xp(self):
         return self.backend.xp
 
-    def get_ll(self, params, data_index=None):
+    def get_ll(self, params, data_index=None, phase_maximize=False):
         """logL for candidate ``params`` (length-9 or ``(N,9)``); ``data_index``
-        ``(N,)`` selects the reference (default all-zero -> single reference)."""
+        ``(N,)`` selects the reference (default all-zero -> single reference).
+
+        ``phase_maximize=True`` analytically maximises over the initial
+        phase via the two-quadrature trick (second kernel call at
+        ``phi0 + pi/2``; physical column 4): ``d_h -> |d_h_0 + i d_h_90|``,
+        with the maximising PHYSICAL phi0 shift stashed on
+        ``self.phase_angle`` (``None`` otherwise) and the un-maximised d_h on
+        ``self.non_marg_d_h``. Same convention as
+        ``gb_likelihood.TwoQuadraturePhaseMaxMixin``.
+        """
+        if phase_maximize:
+            ll_0 = self.get_ll(params, data_index=data_index)
+            d_h_0, h_h = self.last_d_h.copy(), self.last_h_h.copy()
+            x_q = np.ascontiguousarray(
+                np.atleast_2d(np.asarray(params, dtype=float)))
+            x_q[:, 4] = x_q[:, 4] + np.pi / 2
+            self.get_ll(x_q, data_index=data_index)
+            d_h_90 = self.last_d_h.copy()
+            D = d_h_0 + 1j * d_h_90
+            d_h_max = np.abs(D)
+            self.non_marg_d_h = d_h_0
+            self.phase_angle = np.arctan2(D.imag, D.real)
+            self.last_d_h = d_h_max
+            self.last_h_h = h_h
+            return ll_0 + (d_h_max - d_h_0)
+        self.phase_angle = None
         x = np.ascontiguousarray(np.atleast_2d(np.asarray(params, dtype=float)))
         N = x.shape[0]
         di = (np.zeros(N, dtype=np.int32) if data_index is None

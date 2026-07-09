@@ -774,7 +774,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         dt=10.0,
         data_length=None,
         data_splits=None,
-        phase_marginalize=False,
+        phase_maximize=False,
         tdi_channel_setup="AE",
         num_per_gpu=None,
         oversample=1,
@@ -1039,14 +1039,20 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         self._xp_set_device(main_device)
         self._xp_sync()
         
-        if phase_marginalize:
+        if phase_maximize:
             self.non_marg_d_h = d_h.copy()
+            # Maximising rotation (matches swap_likelihood_difference's
+            # convention): d_h * exp(-1j * phase_angle) is real-positive.
+            # Callers subtract this from the sampling-basis phi0 on accept.
+            self.phase_angle = self.xp.arctan2(d_h.imag, d_h.real)
             try:
                 self.non_marg_d_h = self.non_marg_d_h.get()
             except AttributeError:
                 pass
 
             d_h = self.xp.abs(d_h)
+        else:
+            self.phase_angle = None
 
         # store these likelihood terms for later if needed
         self.h_h = h_h
@@ -1081,7 +1087,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         dt=10.0,
         data_length=None,
         data_splits=None,
-        phase_marginalize=False,
+        phase_maximize=False,
         tdi_channel_setup="AE",
         num_per_gpu=None,
         oversample=1,
@@ -1381,7 +1387,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         self,
         params,
         psd,
-        phase_marginalize=False,
+        phase_maximize=False,
         start_freq_ind=0,
         noise_index=None,
         use_c_implementation=True,
@@ -1413,7 +1419,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 Should be 1D if only one PSD is analyzed. If 2D, shape is
                 ``(number of PSDs, data_length)``. If 2D,
                 user must also provide ``noise_index`` kwarg.
-            phase_marginalize (bool, optional): If True, marginalize over the initial phase.
+            phase_maximize (bool, optional): If True, marginalize over the initial phase.
                 Default is False.
             start_freq_ind (int, optional): Starting index into the frequency-domain data stream
                 for the first entry of ``data``/``psd``. This is used if a subset of a full data stream
@@ -1510,7 +1516,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
     #     self,
     #     params,
     #     psd,
-    #     phase_marginalize=False,
+    #     phase_maximize=False,
     #     start_freq_ind=0,
     #     noise_index=None,
     #     use_c_implementation=True,
@@ -1617,7 +1623,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
     #     )
 
 
-    #     if phase_marginalize:
+    #     if phase_maximize:
     #         self.non_marg_h1_h2 = h1_h2.copy()
     #         try:
     #             self.non_marg_h1_h2 = self.non_marg_h1_h2.get()
@@ -2115,7 +2121,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         oversample=1,
         data_length=None,
         data_splits=None,
-        phase_marginalize=False,
+        phase_maximize=False,
         tdi_channel_setup="AE",
         num_per_gpu=None,
         tdi2: bool = False,
@@ -2441,7 +2447,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             self.E_add = E_add.reshape(-1, num_bin).T
             self.start_inds_add = start_inds_add
 
-        if phase_marginalize:
+        if phase_maximize:
             self.phase_angle = self.xp.arctan2(d_h_add.imag + add_remove.imag, d_h_add.real + add_remove.real)  
             self.non_marg_d_h_add = d_h_add.copy()
             self.non_marg_add_remove = add_remove.copy()

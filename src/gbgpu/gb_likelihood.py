@@ -47,7 +47,7 @@ class SwapLLResult:
         Optimal SNR of the proposed (added) template: ``sqrt(<h_add|h_add>)``.
         Used by :meth:`Buffer.get_swap_ll` for the rejection-sampling clamp.
     phase_angle
-        When ``phase_marginalize=True``, the per-proposal phase rotation that
+        When ``phase_maximize=True``, the per-proposal phase rotation that
         the engine applied to maximise over phase. Otherwise ``None``. Callers
         subtract this from the proposed ``phi0`` parameter when an accept lands
         on a phase-maximised draw.
@@ -66,6 +66,144 @@ class SwapLLResult:
     opt_snr_add: Any
     phase_angle: Optional[Any]
     kept: Any
+
+
+# Physical GB parameter layout shared by every fast-computation wrap:
+# (amp, f0[Hz], fdot, fddot, phi0, inc, psi, lam, beta).
+PHYS_IDX_PHI0 = 4
+
+
+class TwoQuadraturePhaseMaxMixin:
+    """Analytic phase maximisation for engines whose kernels return REAL d_h.
+
+    The GB waveform depends on the initial phase ``phi0`` as a pure carrier
+    rotation, so for any linear-in-template functional ``g`` (``<d|h>``,
+    ``<h_add|h_remove>``, ...) the dependence on a physical phase shift
+    ``delta`` is sinusoidal: ``g(phi0 + delta) = R cos(delta ± theta)``.
+    Two evaluations at ``phi0`` and ``phi0 + pi/2`` therefore determine the
+    whole curve:
+
+        D = g(phi0) + 1j * g(phi0 + pi/2)
+        max_delta g = |D|      at    delta* = arg(D)
+        g(delta*)   = Re[conj(D) * exp(1j * delta*)]   (any other functional)
+
+    and -- the key property -- ``delta* = arg(D)`` holds for EITHER carrier
+    sign convention (``cos(delta + theta)`` or ``cos(delta - theta)``), so
+    this mixin needs no knowledge of the kernel's internal phase convention.
+
+    ``phase_angle`` returned to callers is ``delta*``: the shift to ADD to
+    the PHYSICAL ``phi0`` to sit at the maximum. The sampling basis stores
+    ``-phi0`` (the transform container flips the sign, JaxGB convention), so
+    the move-side contract "subtract ``phase_angle`` from sampling column 3"
+    lands on exactly this maximum. Validated end-to-end by
+    ``LISAanalysistools/scripts/gb_chunked_het/gb_phase_max_validate.py``.
+
+    Cost: one extra kernel call per phase-maximised batch (the quadrature
+    evaluation); ``h_h`` is phase-invariant so it is not recomputed.
+    """
+
+    def _get_ll_phase_max(
+        self,
+        buffer_aca,
+        params_phys,
+        *,
+        data_index,
+        noise_index,
+        N_vals,
+        return_inner_products,
+        waveform_kwargs,
+    ):
+        xp = self.xp
+        ll_0 = self.get_ll(
+            buffer_aca, params_phys,
+            data_index=data_index, noise_index=noise_index, N_vals=N_vals,
+            phase_maximize=False, waveform_kwargs=waveform_kwargs,
+        )
+        d_h_0 = self.d_h_out.copy()
+        h_h = self.h_h_out.copy()
+        kept = self.kept_out.copy()
+
+        params_q = params_phys.copy()
+        params_q[:, PHYS_IDX_PHI0] = params_q[:, PHYS_IDX_PHI0] + np.pi / 2
+        self.get_ll(
+            buffer_aca, params_q,
+            data_index=data_index, noise_index=noise_index, N_vals=N_vals,
+            phase_maximize=False, waveform_kwargs=waveform_kwargs,
+        )
+        d_h_90 = self.d_h_out.copy()
+
+        D = d_h_0 + 1j * d_h_90
+        d_h_max = xp.abs(D)
+        # The likelihood is linear in d_h (ll = -0.5*(d_d + h_h - 2 d_h)),
+        # so the maximised ll is the base ll shifted by the d_h gain. The
+        # -1e300 bounds sentinel stays put (gain is 0 on rejected rows).
+        ll = xp.where(ll_0 > -1e290, ll_0 + (d_h_max - d_h_0), ll_0)
+
+        self.non_marg_d_h = d_h_0
+        self.d_h_out = d_h_max
+        self.h_h_out = h_h
+        self.phase_angle = xp.arctan2(D.imag, D.real)
+        self.kept_out = kept
+        if return_inner_products:
+            return ll, self.d_h_out, self.h_h_out, self.phase_angle
+        return ll
+
+    def _get_swap_ll_phase_max(
+        self,
+        buffer_aca,
+        params_remove_phys,
+        params_add_phys,
+        *,
+        data_index,
+        noise_index,
+        N_vals,
+        waveform_kwargs,
+    ) -> "SwapLLResult":
+        xp = self.xp
+        res_0 = self.get_swap_ll(
+            buffer_aca, params_remove_phys, params_add_phys,
+            data_index=data_index, noise_index=noise_index, N_vals=N_vals,
+            phase_maximize=False, waveform_kwargs=waveform_kwargs,
+        )
+        params_q = params_add_phys.copy()
+        params_q[:, PHYS_IDX_PHI0] = params_q[:, PHYS_IDX_PHI0] + np.pi / 2
+        res_90 = self.get_swap_ll(
+            buffer_aca, params_remove_phys, params_q,
+            data_index=data_index, noise_index=noise_index, N_vals=N_vals,
+            phase_maximize=False, waveform_kwargs=waveform_kwargs,
+        )
+
+        # Only the ADD template's phase is maximised; the terms linear in
+        # h_add are d_h_add and hh_cross, entering ll_diff as
+        # G = d_h_add - hh_cross. Maximise G, then evaluate each linear
+        # functional at the same delta*.
+        D_g = (res_0.d_h_add - res_0.hh_cross) + 1j * (
+            res_90.d_h_add - res_90.hh_cross
+        )
+        delta = xp.arctan2(D_g.imag, D_g.real)
+        rot = xp.exp(1j * delta)
+
+        def _at_max(g_0, g_90):
+            return (xp.conj(g_0 + 1j * g_90) * rot).real
+
+        d_h_add = _at_max(res_0.d_h_add, res_90.d_h_add)
+        hh_cross = _at_max(res_0.hh_cross, res_90.hh_cross)
+        gain = (d_h_add - hh_cross) - (res_0.d_h_add - res_0.hh_cross)
+        ll_diff = xp.where(
+            res_0.ll_diff > -1e290, res_0.ll_diff + gain, res_0.ll_diff
+        )
+
+        return SwapLLResult(
+            ll_diff=ll_diff,
+            d_h_add=d_h_add,
+            d_h_remove=res_0.d_h_remove,
+            hh_add=res_0.hh_add,
+            hh_remove=res_0.hh_remove,
+            hh_cross=hh_cross,
+            opt_snr_add=res_0.opt_snr_add,
+            phase_angle=delta,
+            kept=res_0.kept,
+        )
 
 
 class BandLikelihoodEngine(Protocol):
@@ -113,7 +251,7 @@ class BandLikelihoodEngine(Protocol):
         data_index,
         noise_index,
         N_vals,
-        phase_marginalize: bool = False,
+        phase_maximize: bool = False,
         return_inner_products: bool = False,
         waveform_kwargs: dict,
     ):
@@ -129,7 +267,7 @@ class BandLikelihoodEngine(Protocol):
 
         The raw inner products are also stashed on the engine as
         ``d_h_out`` / ``h_h_out``, and ``phase_angle`` holds the per-source
-        maximising rotation when ``phase_marginalize=True`` (``None``
+        maximising rotation when ``phase_maximize=True`` (``None``
         otherwise).
         """
         ...
@@ -143,7 +281,7 @@ class BandLikelihoodEngine(Protocol):
         data_index,
         noise_index,
         N_vals,
-        phase_marginalize: bool,
+        phase_maximize: bool,
         waveform_kwargs: dict,
     ) -> SwapLLResult:
         """Compute the five swap inner products and the resulting
@@ -203,7 +341,7 @@ class BandLikelihoodEngine(Protocol):
 # ---------------------------------------------------------------------------
 
 
-class FDBandLikelihoodEngine:
+class FDBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
     """FD engine wrapping :class:`gbgpu.gbcomps.GBFDComputations`.
 
     2026-07 rework: the legacy ``SharedMemory*`` GBGPU kernel calls
@@ -335,16 +473,18 @@ class FDBandLikelihoodEngine:
         data_index,
         noise_index,
         N_vals,
-        phase_marginalize: bool = False,
+        phase_maximize: bool = False,
         return_inner_products: bool = False,
         waveform_kwargs: dict,
     ):
-        if phase_marginalize:
-            raise NotImplementedError(
-                "FDBandLikelihoodEngine.get_ll does not support "
-                "phase_marginalize=True: the gb_fd kernels have no "
-                "phase-maximisation pass yet (the legacy SharedMemory path "
-                "did; port it when needed)."
+        if phase_maximize:
+            # Two-quadrature analytic maximisation (Python-level; the gb_fd
+            # kernels return real d_h). See TwoQuadraturePhaseMaxMixin.
+            return self._get_ll_phase_max(
+                buffer_aca, params_phys,
+                data_index=data_index, noise_index=noise_index, N_vals=N_vals,
+                return_inner_products=return_inner_products,
+                waveform_kwargs=waveform_kwargs,
             )
         comp = self.gb_fd_comp
         xp = self.xp
@@ -397,13 +537,14 @@ class FDBandLikelihoodEngine:
         data_index,
         noise_index,
         N_vals,
-        phase_marginalize: bool,
+        phase_maximize: bool,
         waveform_kwargs: dict,
     ) -> SwapLLResult:
-        if phase_marginalize:
-            raise NotImplementedError(
-                "FDBandLikelihoodEngine.get_swap_ll does not support "
-                "phase_marginalize=True (see get_ll note)."
+        if phase_maximize:
+            return self._get_swap_ll_phase_max(
+                buffer_aca, params_remove_phys, params_add_phys,
+                data_index=data_index, noise_index=noise_index, N_vals=N_vals,
+                waveform_kwargs=waveform_kwargs,
             )
         comp = self.gb_fd_comp
         xp = self.xp
@@ -496,7 +637,7 @@ class FDBandLikelihoodEngine:
 # ---------------------------------------------------------------------------
 
 
-class WDMBandLikelihoodEngine:
+class WDMBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
     """WDM engine wrapping a
     :class:`gbgpu.gbcomps.GBWDMComputations` instance.
 
@@ -568,15 +709,19 @@ class WDMBandLikelihoodEngine:
         data_index,
         noise_index,
         N_vals,
-        phase_marginalize: bool = False,
+        phase_maximize: bool = False,
         return_inner_products: bool = False,
         waveform_kwargs: dict,
     ):
-        if phase_marginalize:
-            raise NotImplementedError(
-                "WDMBandLikelihoodEngine.get_ll does not yet support "
-                "phase_marginalize=True. The WDM get_ll kernel needs a "
-                "phase-maximisation pass first."
+        if phase_maximize:
+            # Two-quadrature analytic maximisation (Python-level; the WDM
+            # chunked-het kernel returns real d_h). See
+            # TwoQuadraturePhaseMaxMixin.
+            return self._get_ll_phase_max(
+                buffer_aca, params_phys,
+                data_index=data_index, noise_index=noise_index, N_vals=N_vals,
+                return_inner_products=return_inner_products,
+                waveform_kwargs=waveform_kwargs,
             )
         ll = self.gb_comps.get_ll_wdm(
             params_phys,
@@ -606,19 +751,16 @@ class WDMBandLikelihoodEngine:
         data_index,
         noise_index,
         N_vals,
-        phase_marginalize: bool,
+        phase_maximize: bool,
         waveform_kwargs: dict,
     ) -> SwapLLResult:
         xp = self.gb_comps.xp
 
-        if phase_marginalize:
-            # The current WDM kernel does not implement phase maximisation;
-            # surfacing this loudly is better than silently returning the
-            # un-maximised result.
-            raise NotImplementedError(
-                "WDMBandLikelihoodEngine.get_swap_ll does not yet support "
-                "phase_marginalize=True. The WDM swap_ll kernel needs a phase-"
-                "maximisation pass first."
+        if phase_maximize:
+            return self._get_swap_ll_phase_max(
+                buffer_aca, params_remove_phys, params_add_phys,
+                data_index=data_index, noise_index=noise_index, N_vals=N_vals,
+                waveform_kwargs=waveform_kwargs,
             )
 
         # WDM bounds-keep: each source's central frequency layer must sit in
