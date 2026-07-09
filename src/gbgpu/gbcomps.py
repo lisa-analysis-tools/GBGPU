@@ -80,7 +80,63 @@ class _FDHolderBinding:
                  "num_rows", "num_noise", "n_rfft", "windowed", "token")
 
 
-class GBFDComputations(FastLISAResponseParallelModule):
+class _GBGradEpsMixin:
+    """Shared finite-difference step / rescaling resolution for the GB
+    gradient paths (:meth:`GBFDComputations.get_ll_grad_fd`,
+    :meth:`STFTGBComputations.get_ll_grad_stft`, and the swap variants).
+
+    Same convention as ``GBWDMComputations.get_ll_grad_wdm``: supplying
+    ``param_scales`` returns the gradient in rescaled coordinates
+    ``eta = theta / Delta_theta`` and uses a uniform relative step
+    ``eps_theta_k = param_eps_relative * Delta_theta_k``.
+    """
+
+    _DEFAULT_PARAM_EPS = (
+        1.0e-25,   # amp
+        2.0e-14,   # f0    (Hz)
+        1.0e-21,   # fdot  (Hz/s)
+        1.0e-28,   # fddot (Hz/s^2)
+        1.0e-6,    # phi0
+        1.0e-6,    # iota
+        1.0e-6,    # psi
+        1.0e-6,    # lam (or RA after convert)
+        1.0e-6,    # beta (or DEC after convert)
+    )
+
+    def _default_param_eps(self, nparams=9):
+        eps = self.xp.asarray(self._DEFAULT_PARAM_EPS[:nparams],
+                              dtype=self.xp.float64)
+        if eps.shape[0] != nparams:
+            extra = self.xp.full(nparams - eps.shape[0],
+                                 eps[-1].item(), dtype=self.xp.float64)
+            eps = self.xp.concatenate([eps, extra])
+        return eps
+
+    def _resolve_eps_and_scales(self, nparams,
+                                param_eps, param_scales, param_eps_relative):
+        if param_scales is not None:
+            scales = self.xp.asarray(param_scales, dtype=self.xp.float64)
+            assert scales.shape[0] == nparams, (
+                f"param_scales length {scales.shape[0]} != nparams {nparams}"
+            )
+            if param_eps is None:
+                eps_theta = scales * float(param_eps_relative)
+            else:
+                eps_theta = self.xp.asarray(param_eps, dtype=self.xp.float64)
+                assert eps_theta.shape[0] == nparams
+            return eps_theta, scales
+
+        if param_eps is None:
+            eps_theta = self._default_param_eps(nparams)
+        else:
+            eps_theta = self.xp.asarray(param_eps, dtype=self.xp.float64)
+            assert eps_theta.shape[0] == nparams, (
+                f"param_eps length {eps_theta.shape[0]} != nparams {nparams}"
+            )
+        return eps_theta, None
+
+
+class GBFDComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
     """Frequency-domain heterodyne analog of :class:`GBWDMComputations`.
 
     Mirrors the WDM ``get_ll_wdm`` / ``get_swap_ll_wdm`` / ``fill_global``
@@ -636,54 +692,9 @@ class GBFDComputations(FastLISAResponseParallelModule):
     #
     # Mirrors GBWDMComputations.get_ll_grad_wdm / get_swap_ll_grad_wdm at the
     # API surface: same _DEFAULT_PARAM_EPS table, same _resolve_eps_and_scales
-    # logic (param_eps + param_scales + param_eps_relative), same convention
-    # that supplying param_scales returns the gradient in rescaled coordinates
-    # eta = theta / Delta_theta.
+    # logic (param_eps + param_scales + param_eps_relative) — both shared with
+    # STFTGBComputations via _GBGradEpsMixin.
     # ------------------------------------------------------------------
-    _DEFAULT_PARAM_EPS = (
-        1.0e-25,   # amp
-        2.0e-14,   # f0    (Hz)
-        1.0e-21,   # fdot  (Hz/s)
-        1.0e-28,   # fddot (Hz/s^2)
-        1.0e-6,    # phi0
-        1.0e-6,    # iota
-        1.0e-6,    # psi
-        1.0e-6,    # lam (or RA after convert)
-        1.0e-6,    # beta (or DEC after convert)
-    )
-
-    def _default_param_eps(self, nparams=9):
-        eps = self.xp.asarray(self._DEFAULT_PARAM_EPS[:nparams],
-                              dtype=self.xp.float64)
-        if eps.shape[0] != nparams:
-            extra = self.xp.full(nparams - eps.shape[0],
-                                 eps[-1].item(), dtype=self.xp.float64)
-            eps = self.xp.concatenate([eps, extra])
-        return eps
-
-    def _resolve_eps_and_scales(self, nparams,
-                                param_eps, param_scales, param_eps_relative):
-        if param_scales is not None:
-            scales = self.xp.asarray(param_scales, dtype=self.xp.float64)
-            assert scales.shape[0] == nparams, (
-                f"param_scales length {scales.shape[0]} != nparams {nparams}"
-            )
-            if param_eps is None:
-                eps_theta = scales * float(param_eps_relative)
-            else:
-                eps_theta = self.xp.asarray(param_eps, dtype=self.xp.float64)
-                assert eps_theta.shape[0] == nparams
-            return eps_theta, scales
-
-        if param_eps is None:
-            eps_theta = self._default_param_eps(nparams)
-        else:
-            eps_theta = self.xp.asarray(param_eps, dtype=self.xp.float64)
-            assert eps_theta.shape[0] == nparams, (
-                f"param_eps length {eps_theta.shape[0]} != nparams {nparams}"
-            )
-        return eps_theta, None
-
     def get_ll_grad_fd(self, params, fd_holder,
                        param_eps=None,
                        param_scales=None,
@@ -923,7 +934,7 @@ class GBFDComputations(FastLISAResponseParallelModule):
         return info
 
 
-class STFTGBComputations(FastLISAResponseParallelModule):
+class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
     """Source-side STFT/Fresnel-domain GB likelihood (Fresnel transform path).
 
     On-the-fly analog of :class:`GBFDComputations` / :class:`GBWDMComputations`
@@ -1193,6 +1204,17 @@ class STFTGBComputations(FastLISAResponseParallelModule):
             self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
             active_band,
         )
+
+    def setup_in_model(self, buffer_aca, params_ref_phys, data_index,
+                       N_vals=None) -> None:
+        """No-op per-source in-model setup hook (mirrors
+        GBFDComputations.setup_in_model; the STFT kernels score directly
+        against the residual, no per-source preparation needed)."""
+        return None
+
+    def clear_in_model(self) -> None:
+        """No-op in-model teardown hook."""
+        return None
 
     # ------------------------------------------------------------------
     # Gradients (Stage 3): central finite difference over the 9 params,
