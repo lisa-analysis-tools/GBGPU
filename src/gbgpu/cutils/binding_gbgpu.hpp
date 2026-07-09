@@ -52,6 +52,7 @@
 #include "binding_lat_spline_tdi.hpp" // LISATDIonTheFlyWrap (parent of GBTDIonTheFlyWrap)
 
 #include <string>
+#include <stdexcept>
 #include <iostream>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -571,6 +572,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         FDDomainWrap *fd_wrap,
         array_type<double> params_all, array_type<int> data_index_all,
         array_type<double> factors_all,
+        array_type<int> template_start_inds,
         int num_bin, int nparams, double T, double t_start, double t_ref,
         int N_sparse, int nchannels, double tukey_alpha, double edge_frac);
 
@@ -630,6 +632,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
         WDMSettingsWrap *wdm_settings_wrap,
         array_type<double> params_all, array_type<double> factors_all,
+        array_type<int> data_index,
         array_type<double> chunk_t_starts,
         array_type<int> chunk_keep_lo, array_type<int> chunk_keep_hi,
         array_type<int> chunk_n_global_offset,
@@ -887,6 +890,27 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         double T_obs, double t_start,
         int nchannels,
         int N_sparse_fd, double tukey_alpha, double max_r);
+
+    // Reference producer: emit the reference WDM c0 (sparse + dense complex) from
+    // the REFERENCE params via the backend FD-gen + polyphase -- replaces the
+    // Python polyphase. c0_sparse_out (num_data,nch,Nf_active,N_sparse_t);
+    // c0_dense_out (num_data,nch,Nf_active,Nt_active).
+    void gb_signal_het_make_reference(
+        GBTDIonTheFlyWrap *tdi_wrap,
+        array_type<std::complex<double>> c0_sparse_out,
+        array_type<std::complex<double>> c0_dense_out,
+        array_type<double> wdm_window,
+        array_type<int> n_sparse_local_arr,
+        array_type<double> params_ref_all,
+        int num_data,
+        int nparams, int f0_idx, int fdot_idx,
+        int Nf, int Nt, int Nf_active, int Nt_active,
+        int Nt_layer, int N_sparse_t, int stride,
+        int ind_min_t, int ind_min_f,
+        double layer_df, double dt,
+        double T_obs, double t_start,
+        int nchannels,
+        int N_sparse_fd, double tukey_alpha);
 
     // Signal-het central-difference gradient of logL = d_h - 0.5*h_h. Per
     // binary, performs 1 central + 2*nparams perturbed get_ll_in_kernel

@@ -673,7 +673,8 @@ inline void gbfd_accumulate_ll(double *d_h_acc, double *h_h_acc,
         for (int m = THREAD_START_X; m < N; m += BLOCK_INCR_X)
         {
             int k = gbfd_dense_bin(m, N, kf0);
-            if (!fd->in_band(k)) continue;
+            if (!fd->in_band(k) || !fd->in_row(k, data_index)
+                || !fd->in_row(k, noise_index)) continue;
             for (int c1 = 0; c1 < C; ++c1)
             {
                 cmplx d_c1 = fd->get_data(k, c1, data_index);
@@ -697,7 +698,8 @@ inline void gbfd_accumulate_ll(double *d_h_acc, double *h_h_acc,
         for (int m = THREAD_START_X; m < N; m += BLOCK_INCR_X)
         {
             int k = gbfd_dense_bin(m, N, kf0);
-            if (!fd->in_band(k)) continue;
+            if (!fd->in_band(k) || !fd->in_row(k, data_index)
+                || !fd->in_row(k, noise_index)) continue;
             for (int c = 0; c < Cd; ++c)
             {
                 cmplx d_c = fd->get_data(k, c, data_index);
@@ -860,6 +862,7 @@ CUDA_KERNEL
 void gb_fd_fill_global_kernel(cmplx *template_fill,
     GBTDIonTheFly *tdi_on_fly_handle, FDDomain *fd,
     double *params, int *data_index_all, double *factors_all,
+    int *template_start_inds,
     double t_start, double Tobs,
     int N, int num_bin, int n_params, int nchannels, int log2N,
     double tukey_alpha, double edge_frac)
@@ -879,15 +882,18 @@ void gb_fd_fill_global_kernel(cmplx *template_fill,
 
         int data_index = data_index_all[bin_i];
         double factor  = factors_all[bin_i];
+        int row_start  = template_start_inds[data_index];
         for (int m = THREAD_START_X; m < N; m += BLOCK_INCR_X)
         {
             int k = gbfd_dense_bin(m, N, kf0);
-            if (!fd->in_band(k)) continue;
+            int k_loc = k - row_start;
+            if (!fd->in_band(k) || k_loc < 0 || k_loc >= fd->n_rfft) continue;
             for (int c = 0; c < nchannels; ++c)
             {
                 cmplx v = tdi_chan[c * N + m];
                 size_t idx = (size_t) data_index * nchannels * fd->n_rfft
-                             + (size_t) c * fd->n_rfft + k;
+                             + (size_t) c * fd->n_rfft
+                             + k_loc;
                 double re = factor * v.real();
                 double im = factor * v.imag();
                 atomicAdd(((double*)&template_fill[idx]) + 0, re);
@@ -902,6 +908,7 @@ void gb_fd_fill_global_kernel(cmplx *template_fill,
 void GBComputationGroup::gb_fd_fill_global_wrap(cmplx *template_fill,
     Orbits* orbits, TDIConfig *tdi_config, FDDomain *fd,
     double *params_all, int *data_index_all, double *factors_all,
+    int *template_start_inds,
     int num_bin, int nparams, double T, double t_start, double t_ref,
     int N_sparse, int nchannels, double tukey_alpha, double edge_frac)
 {
@@ -941,6 +948,7 @@ void GBComputationGroup::gb_fd_fill_global_wrap(cmplx *template_fill,
     }
     gb_fd_fill_global_kernel<<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(
         template_fill, d_gb, d_fd, params_all, data_index_all, factors_all,
+        template_start_inds,
         t_start, T, N_sparse, num_bin, nparams, nchannels, log2N, tukey_alpha,
         edge_frac);
     cudaDeviceSynchronize();
@@ -967,14 +975,17 @@ void GBComputationGroup::gb_fd_fill_global_wrap(cmplx *template_fill,
 
         int data_index = data_index_all[bin_i];
         double factor  = factors_all[bin_i];
+        int row_start  = template_start_inds[data_index];
         for (int m = 0; m < N_sparse; ++m)
         {
             int k = gbfd_dense_bin(m, N_sparse, kf0);
-            if (!fd->in_band(k)) continue;
+            int k_loc = k - row_start;
+            if (!fd->in_band(k) || k_loc < 0 || k_loc >= fd->n_rfft) continue;
             for (int c = 0; c < nchannels; ++c)
             {
                 size_t idx = (size_t) data_index * nchannels * fd->n_rfft
-                             + (size_t) c * fd->n_rfft + k;
+                             + (size_t) c * fd->n_rfft
+                             + k_loc;
                 template_fill[idx] = template_fill[idx]
                     + cmplx(factor * tdi_chan[c * N_sparse + m].real(),
                             factor * tdi_chan[c * N_sparse + m].imag());
@@ -1076,7 +1087,8 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
             for (int m = 0; m < N; ++m)
             {
                 int k = gbfd_dense_bin(m, N, kf0_a);
-                if (!fd->in_band(k)) continue;
+                if (!fd->in_band(k)
+                    || !fd->in_row(k, noise_index_all[bin_i])) continue;
                 // matching m on remove side: (k - kf0_r) mod N
                 int mr_signed = k - kf0_r;
                 int mr = ((mr_signed % N) + N) % N;
@@ -1102,7 +1114,8 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
             for (int m = 0; m < N; ++m)
             {
                 int k = gbfd_dense_bin(m, N, kf0_a);
-                if (!fd->in_band(k)) continue;
+                if (!fd->in_band(k)
+                    || !fd->in_row(k, noise_index_all[bin_i])) continue;
                 int mr_signed = k - kf0_r;
                 int mr = ((mr_signed % N) + N) % N;
                 int kr = gbfd_dense_bin(mr, N, kf0_r);
@@ -1177,7 +1190,8 @@ inline double gbfd_grad_one_sided_partial(
     for (int mp = 0; mp < N; ++mp)
     {
         int kk = gbfd_dense_bin(mp, N, kf0_pert);
-        if (!fd->in_band(kk)) continue;
+        if (!fd->in_band(kk) || !fd->in_row(kk, data_index)
+            || !fd->in_row(kk, noise_index)) continue;
 
         int ma_signed = kk - kf0_add_C;
         int ma = ((ma_signed % N) + N) % N;
@@ -1531,6 +1545,7 @@ void GBComputationGroup::gb_wdm_het_fill_global_wrap(
     double *template_fill, Orbits *orbits, TDIConfig *tdi_config,
     WDMSettings *wdm_settings,
     double *params_all, double *factors_all,
+    int *data_index_all,
     double *chunk_t_starts, int *chunk_keep_lo, int *chunk_keep_hi,
     int *chunk_n_global_offset, double *wdm_window,
     int n_chunks, int num_bin, int nparams,
@@ -1545,6 +1560,7 @@ void GBComputationGroup::gb_wdm_het_fill_global_wrap(
         template_fill, orbits, tdi_config,
         wdm_settings,
         params_all, factors_all,
+        data_index_all,
         chunk_t_starts, chunk_keep_lo, chunk_keep_hi, chunk_n_global_offset,
         wdm_window, n_chunks, num_bin, nparams,
         Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
@@ -2506,6 +2522,173 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
         layer_df, dt,
         nchannels, tdi_type,
         N_sparse_fd, max_r, project_real);
+}
+
+
+// ============================================================================
+// Signal-heterodyne (v2 polyphase) -- REFERENCE PRODUCER.
+//
+// Emits the reference WDM c0 FROM THE BACKEND (replaces the Python polyphase
+// _compute_sparse_complex_wdm). Runs gb_run_fd_wave_tdi on the REFERENCE params,
+// then the SAME polyphase fold + iFFT as gb_signal_het_get_ll_sparse_wrap, but
+// over ALL Nf_active layers and at BOTH the sparse grid (c0_sparse_out, consumed
+// by get_ll) and full Nt resolution (c0_dense_out, consumed by the bin-fold /
+// fill_global). CPU-only (GPU TODO, like the sibling sig-het wraps).
+// ============================================================================
+void GBComputationGroup::gb_signal_het_make_reference_wrap(
+    GBTDIonTheFly *tdi_on_fly,
+    cmplx  *c0_sparse_out,
+    cmplx  *c0_dense_out,
+    double *wdm_window,
+    int    *n_sparse_local_arr,
+    double *params_ref_all,
+    int     num_data,
+    int     nparams, int f0_idx, int fdot_idx,
+    int     Nf, int Nt, int Nf_active, int Nt_active,
+    int     Nt_layer, int N_sparse_t, int stride,
+    int     ind_min_t, int ind_min_f,
+    double  layer_df, double dt,
+    double  T_obs, double t_start,
+    int     nchannels,
+    int     N_sparse_fd, double tukey_alpha)
+{
+    (void) f0_idx; (void) fdot_idx; (void) layer_df;
+
+#ifdef __CUDACC__
+    throw std::runtime_error(
+        "[gb_signal_het_make_reference_wrap] GPU implementation is a TODO -- the v2 "
+        "signal-het CUDA kernels are not implemented yet. Construct the Python class "
+        "with force_backend=\"cpu\" until then.");
+#endif
+
+    const double TWO_PI  = 2.0 * M_PI;
+    const cmplx  I_c     = cmplx(0.0, 1.0);
+    const int    half_Nt = Nt / 2;
+    const int    half_NS = N_sparse_fd / 2;
+    const double kappa   = 2.0 * std::sqrt(M_PI * dt) / (double) Nf;
+    const int    n_start = ind_min_t + n_sparse_local_arr[0];   // sparse grid origin
+
+    // length-Nt twiddle table exp(i 2pi k / Nt): reused for the dense prephase +
+    // dense iFFT so the O(Nt^2) dense transform avoids per-element gcmplx::exp.
+    std::vector<cmplx> tw(Nt);
+    for (int k = 0; k < Nt; ++k)
+        tw[k] = gcmplx::exp(I_c * (TWO_PI * (double) k / (double) Nt));
+    auto twn = [&](long a) -> cmplx { long m = a % Nt; if (m < 0) m += Nt; return tw[m]; };
+
+    // (1) FD-heterodyne of the REFERENCE sources via the chunked-het front-end.
+    std::vector<cmplx>  X_het_raw((size_t) num_data * nchannels * N_sparse_fd);
+    std::vector<int>    k_f0_buf(num_data);
+    std::vector<double> f0_grid_buf(num_data);
+    gb_run_fd_wave_tdi_wrap(
+        tdi_on_fly,
+        X_het_raw.data(), k_f0_buf.data(), f0_grid_buf.data(),
+        params_ref_all, t_start, T_obs,
+        N_sparse_fd, num_data, nparams, nchannels,
+        tukey_alpha);
+
+    // (2) fftshift + 1/dt -> centered absolute-rfft slice (matches get_ll path).
+    std::vector<cmplx> X_het((size_t) num_data * nchannels * N_sparse_fd);
+    const double dt_inv = 1.0 / dt;
+    for (int d = 0; d < num_data; ++d)
+        for (int c = 0; c < nchannels; ++c) {
+            const size_t base = ((size_t) d * nchannels + c) * N_sparse_fd;
+            for (int i = 0; i < N_sparse_fd; ++i) {
+                const int m_signed = i - half_NS;
+                const int m_fft = (m_signed >= 0) ? m_signed : (m_signed + N_sparse_fd);
+                X_het[base + i] = X_het_raw[base + m_fft] * dt_inv;
+            }
+        }
+
+    // (3) polyphase fold + iDFT, restricted per reference to the layers whose
+    // +-half_Nt bin window intersects the sparse band
+    // [k_f0 - half_NS, k_f0 + half_NS - 1]. Every other layer folds pure
+    // zeros, so skipping it (and pre-zeroing the outputs) is exact. Within a
+    // window layer, fold_d is nonzero only at the <= N_sparse_fd folded bins
+    // (nz_j, collected in increasing j = same summation order as a full
+    // 0..Nt-1 sweep), and each sparse bin lands in exactly TWO layer windows
+    // (window width Nt, layer stride half_Nt), so the dense iDFT totals
+    // O(2 * N_sparse_fd * Nt_active) per (d, c) instead of the previous
+    // O(Nf_active * Nt * Nt_active) full sweep.
+    const size_t n_sparse_tot = (size_t) num_data * nchannels * Nf_active * N_sparse_t;
+    const size_t n_dense_tot  = (size_t) num_data * nchannels * Nf_active * Nt_active;
+    std::fill(c0_sparse_out, c0_sparse_out + n_sparse_tot, cmplx(0.0, 0.0));
+    std::fill(c0_dense_out,  c0_dense_out  + n_dense_tot,  cmplx(0.0, 0.0));
+
+    std::vector<cmplx> fold_s(Nt_layer);
+    std::vector<cmplx> fold_d(Nt);
+    std::vector<int>   nz_j;
+    nz_j.reserve(N_sparse_fd);
+    for (int d = 0; d < num_data; ++d) {
+        const int k_f0 = k_f0_buf[d];
+        // conservative +-1-layer slack; slack layers fold nothing and are
+        // skipped by the nz_j emptiness guard below.
+        const int m_lo = std::max(0, (k_f0 - half_NS) / half_Nt - 1 - ind_min_f);
+        const int m_hi = std::min(Nf_active - 1,
+                                  (k_f0 + half_NS - 1) / half_Nt + 1 - ind_min_f);
+        for (int c = 0; c < nchannels; ++c) {
+            const cmplx *X_chan = X_het.data() + ((size_t) d * nchannels + c) * N_sparse_fd;
+            for (int m_local = m_lo; m_local <= m_hi; ++m_local) {
+                const int m_global = ind_min_f + m_local;
+                std::fill(fold_s.begin(), fold_s.end(), cmplx(0.0, 0.0));
+                for (int jj : nz_j) fold_d[jj] = cmplx(0.0, 0.0);
+                nz_j.clear();
+                // fold the N_sparse_fd nonzero bins into BOTH the sparse (mod
+                // Nt_layer) and dense (index j) accumulators, each with its own
+                // prephase origin (n_start for sparse, ind_min_t for dense).
+                for (int i = 0; i < N_sparse_fd; ++i) {
+                    const cmplx Xi = X_chan[i];
+                    if (Xi.real() == 0.0 && Xi.imag() == 0.0) continue;
+                    const int k_abs = k_f0 + (i - half_NS);
+                    const int j = k_abs - m_global * half_Nt + half_Nt;
+                    if (j < 0 || j >= Nt) continue;
+                    const int    j_off = j - half_Nt;
+                    const double win   = wdm_window[j];
+                    const cmplx  ph_s  = gcmplx::exp(I_c * (TWO_PI * (double) j_off
+                                                    * (double) n_start / (double) Nt));
+                    fold_s[j % Nt_layer] += Xi * win * ph_s;
+                    // DENSE uses the transform (Python _compute_sparse_complex_wdm)
+                    // convention: NATURAL-index prephase (j, not centered j_off) +
+                    // sign_scale = 1/stride with NO (-1)^n_global. (The get_ll sparse
+                    // convention above -- j_off + (-1)^n_global -- is equivalent ONLY on
+                    // the always-odd sparse grid, so it must NOT be reused for the dense
+                    // full-Nt grid; doing so adds a spurious (-1)^n.)
+                    fold_d[j]            += Xi * win * twn((long) j * (long) ind_min_t);
+                    nz_j.push_back(j);   // j strictly increasing in i, no dups
+                }
+                if (nz_j.empty()) continue;   // outputs stay pre-zeroed
+                // SPARSE iFFT (length Nt_layer, N_sparse_t outputs).
+                for (int n_layer = 0; n_layer < N_sparse_t; ++n_layer) {
+                    cmplx acc(0.0, 0.0);
+                    for (int rr = 0; rr < Nt_layer; ++rr)
+                        acc += fold_s[rr] * gcmplx::exp(I_c * (TWO_PI * (double) rr
+                                            * (double) n_layer / (double) Nt_layer));
+                    acc *= (1.0 / (double) Nt_layer);
+                    const int    n_global   = n_start + n_layer * stride;
+                    const double sign_scale = ((n_global & 1) ? -1.0 : 1.0) / (double) stride;
+                    const int    m_plus_n   = (m_global + n_global) & 1;
+                    const cmplx  conj_cmn   = (m_plus_n == 0) ? cmplx(1.0, 0.0) : cmplx(0.0, -1.0);
+                    const double sign_mn    = (((m_global + 1) * n_global) & 1) ? -1.0 : 1.0;
+                    c0_sparse_out[(((size_t) d * nchannels + c) * Nf_active + m_local)
+                                  * N_sparse_t + n_layer] = acc * sign_scale * (kappa * sign_mn * conj_cmn);
+                }
+                // DENSE iDFT (Nt_active outputs, origin ind_min_t) over the
+                // folded bins only -- all other fold_d entries are exact zeros.
+                for (int n = 0; n < Nt_active; ++n) {
+                    cmplx acc(0.0, 0.0);
+                    for (int jj : nz_j)
+                        acc += fold_d[jj] * twn((long) jj * (long) n);
+                    acc *= (1.0 / (double) Nt);       // 1/Nt = (1/Nt_layer)*(1/stride), stride_dense=1
+                    const int    n_global   = ind_min_t + n;
+                    const int    m_plus_n   = (m_global + n_global) & 1;
+                    const cmplx  conj_cmn   = (m_plus_n == 0) ? cmplx(1.0, 0.0) : cmplx(0.0, -1.0);
+                    const double sign_mn    = (((m_global + 1) * n_global) & 1) ? -1.0 : 1.0;
+                    // no (-1)^n_global for the dense grid (transform convention).
+                    c0_dense_out[(((size_t) d * nchannels + c) * Nf_active + m_local)
+                                 * Nt_active + n] = acc * (kappa * sign_mn * conj_cmn);
+                }
+            }
+        }
+    }
 }
 
 

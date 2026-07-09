@@ -154,7 +154,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             )
         else:
             self._orbits = orbits
-        self.orbits.configure(linear_interp_setup=True)
+        self.orbits._ensure_configured()
 
     @property
     def citation(self):
@@ -774,7 +774,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         dt=10.0,
         data_length=None,
         data_splits=None,
-        phase_marginalize=False,
+        phase_maximize=False,
         tdi_channel_setup="AE",
         num_per_gpu=None,
         oversample=1,
@@ -943,8 +943,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         if num_per_gpu is None:
             assert len(_gpus_iter) == 1
-            num_per_gpu = int(1e15)
-            # make really high so just keeps
+            num_per_gpu = int(2**31 - 1)
+            # make really high so just keeps (int32-safe: numpy 2 rejects
+            # int32 arrays modulo a Python int beyond the int32 range)
 
         inputs_in = []
         for nnn, N_here in enumerate(unique_N):
@@ -1038,14 +1039,20 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         self._xp_set_device(main_device)
         self._xp_sync()
         
-        if phase_marginalize:
+        if phase_maximize:
             self.non_marg_d_h = d_h.copy()
+            # Maximising rotation (matches swap_likelihood_difference's
+            # convention): d_h * exp(-1j * phase_angle) is real-positive.
+            # Callers subtract this from the sampling-basis phi0 on accept.
+            self.phase_angle = self.xp.arctan2(d_h.imag, d_h.real)
             try:
                 self.non_marg_d_h = self.non_marg_d_h.get()
             except AttributeError:
                 pass
 
             d_h = self.xp.abs(d_h)
+        else:
+            self.phase_angle = None
 
         # store these likelihood terms for later if needed
         self.h_h = h_h
@@ -1080,7 +1087,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         dt=10.0,
         data_length=None,
         data_splits=None,
-        phase_marginalize=False,
+        phase_maximize=False,
         tdi_channel_setup="AE",
         num_per_gpu=None,
         oversample=1,
@@ -1245,8 +1252,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         if num_per_gpu is None:
             assert len(_gpus_iter) == 1
-            num_per_gpu = int(1e15)
-            # make really high so just keeps
+            num_per_gpu = int(2**31 - 1)
+            # make really high so just keeps (int32-safe: numpy 2 rejects
+            # int32 arrays modulo a Python int beyond the int32 range)
 
         inputs_in = []
         for nnn, N_here in enumerate(unique_N):
@@ -1379,7 +1387,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         self,
         params,
         psd,
-        phase_marginalize=False,
+        phase_maximize=False,
         start_freq_ind=0,
         noise_index=None,
         use_c_implementation=True,
@@ -1411,7 +1419,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 Should be 1D if only one PSD is analyzed. If 2D, shape is
                 ``(number of PSDs, data_length)``. If 2D,
                 user must also provide ``noise_index`` kwarg.
-            phase_marginalize (bool, optional): If True, marginalize over the initial phase.
+            phase_maximize (bool, optional): If True, marginalize over the initial phase.
                 Default is False.
             start_freq_ind (int, optional): Starting index into the frequency-domain data stream
                 for the first entry of ``data``/``psd``. This is used if a subset of a full data stream
@@ -1508,7 +1516,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
     #     self,
     #     params,
     #     psd,
-    #     phase_marginalize=False,
+    #     phase_maximize=False,
     #     start_freq_ind=0,
     #     noise_index=None,
     #     use_c_implementation=True,
@@ -1615,7 +1623,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
     #     )
 
 
-    #     if phase_marginalize:
+    #     if phase_maximize:
     #         self.non_marg_h1_h2 = h1_h2.copy()
     #         try:
     #             self.non_marg_h1_h2 = self.non_marg_h1_h2.get()
@@ -1811,10 +1819,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         unique_N, inverse = self.xp.unique(self.xp.asarray(N), return_inverse=True)
         N_groups = self.xp.arange(len(unique_N))[inverse]
         
-        if factors is not None:
-            if use_c_implementation is False:
-                raise NotImplementedError("Currently factors is not implemented for use_c_implementation=False.")
-        else:
+        if factors is None:
             factors = self.xp.ones(self.num_bin, dtype=self.xp.float64)
         
         # setup window mapping
@@ -2039,6 +2044,12 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 num_split_here = keep_bool.sum().item()
                 if num_split_here == 0:
                     continue
+
+                # spacecraft positions on the same per-N grid the GPU branch uses
+                tm_rel = self.xp.linspace(0, T, num=N_here, endpoint=False)
+                tm_abs = tm_rel + self.t0_abs
+                Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()
+
                 params_here = self.xp.asarray(params)[keep_bool]
                 group_index_here = (group_index[keep_bool] % num_per_gpu).astype(np.int32)
                 factors_here = factors[keep_bool]
@@ -2058,7 +2069,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     (templates_here, group_index_here, factors_here)
                     + params_N_tuple
                     + (T, dt, N_here, num_split_here, start_freq_ind_tmp, data_length,
-                       tdi_channel_setup_map[tdi_channel_setup], gpu, do_synchronize)
+                       tdi_channel_setup_map[tdi_channel_setup], gpu, do_synchronize,
+                       Ps_arr, self.orbits.armlength, tdi2,
+                       window_type, window_alpha)
                 )
                 self.backend.sharedmem.SharedMemoryGenerateGlobal_wrap(*tuple_in)
 
@@ -2108,7 +2121,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         oversample=1,
         data_length=None,
         data_splits=None,
-        phase_marginalize=False,
+        phase_maximize=False,
         tdi_channel_setup="AE",
         num_per_gpu=None,
         tdi2: bool = False,
@@ -2434,7 +2447,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             self.E_add = E_add.reshape(-1, num_bin).T
             self.start_inds_add = start_inds_add
 
-        if phase_marginalize:
+        if phase_maximize:
             self.phase_angle = self.xp.arctan2(d_h_add.imag + add_remove.imag, d_h_add.real + add_remove.real)  
             self.non_marg_d_h_add = d_h_add.copy()
             self.non_marg_add_remove = add_remove.copy()

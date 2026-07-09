@@ -275,6 +275,7 @@ class GBComputationGroup{
         Orbits *orbits, TDIConfig *tdi_config,
         WDMSettings *wdm_settings,
         double *params_all, double *factors_all,
+        int *data_index_all,
         double *chunk_t_starts, int *chunk_keep_lo, int *chunk_keep_hi,
         int *chunk_n_global_offset,
         double *wdm_window,
@@ -486,9 +487,14 @@ class GBComputationGroup{
     //
     // All three share the same per-source heterodyne FD pass that
     // GBFDTDIonTheFly already uses.  N_sparse must be a power of two.
+    // template_start_inds: per-TEMPLATE-row absolute start bin (length =
+    // number of template rows, indexed by data_index). The template buffer
+    // is caller-provided and independent of fd's data rows, so it carries
+    // its own window offsets (pass zeros for the legacy full-grid layout).
     void gb_fd_fill_global_wrap(cmplx *template_fill,
         Orbits* orbits, TDIConfig *tdi_config, FDDomain *fd,
         double *params_all, int *data_index_all, double *factors_all,
+        int *template_start_inds,
         int num_bin, int nparams, double T, double t_start, double t_ref,
         int N_sparse, int nchannels, double tukey_alpha, double edge_frac);
 
@@ -615,6 +621,31 @@ class GBComputationGroup{
         double  layer_df, double dt,
         int     nchannels, int tdi_type,
         int     N_sparse_fd, double max_r, int project_real);
+
+    // Reference producer (V2 sig-het) -- EMIT the reference WDM ``c0`` from the
+    // backend (replaces the Python polyphase ``_compute_sparse_complex_wdm``).
+    // Runs ``gb_run_fd_wave_tdi`` on the REFERENCE params + the SAME polyphase as
+    // ``gb_signal_het_get_ll_*``, but over ALL ``Nf_active`` layers and at BOTH the
+    // sparse grid (``c0_sparse_out``, what get_ll consumes) and full ``Nt``
+    // resolution (``c0_dense_out``, what the bin-fold / fill_global need). One call
+    // per reference set; ``data_index`` selects them downstream. CPU-only (GPU TODO,
+    // like the sibling sig-het wraps).
+    void gb_signal_het_make_reference_wrap(
+        GBTDIonTheFly *tdi_on_fly,
+        cmplx  *c0_sparse_out,
+        cmplx  *c0_dense_out,
+        double *wdm_window,
+        int    *n_sparse_local_arr,
+        double *params_ref_all,
+        int     num_data,
+        int     nparams, int f0_idx, int fdot_idx,
+        int     Nf, int Nt, int Nf_active, int Nt_active,
+        int     Nt_layer, int N_sparse_t, int stride,
+        int     ind_min_t, int ind_min_f,
+        double  layer_df, double dt,
+        double  T_obs, double t_start,
+        int     nchannels,
+        int     N_sparse_fd, double tukey_alpha);
 
     // Stage 2b -- in-kernel sparse-FD signal-het. Fuses the existing
     // ``gb_run_fd_wave_tdi`` (sparse heterodyned rfft) with the polyphase +
