@@ -2487,17 +2487,39 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
             }
         }
 
-    // (3) polyphase fold + iFFT over ALL Nf_active layers, sparse + dense.
+    // (3) polyphase fold + iDFT, restricted per reference to the layers whose
+    // +-half_Nt bin window intersects the sparse band
+    // [k_f0 - half_NS, k_f0 + half_NS - 1]. Every other layer folds pure
+    // zeros, so skipping it (and pre-zeroing the outputs) is exact. Within a
+    // window layer, fold_d is nonzero only at the <= N_sparse_fd folded bins
+    // (nz_j, collected in increasing j = same summation order as a full
+    // 0..Nt-1 sweep), and each sparse bin lands in exactly TWO layer windows
+    // (window width Nt, layer stride half_Nt), so the dense iDFT totals
+    // O(2 * N_sparse_fd * Nt_active) per (d, c) instead of the previous
+    // O(Nf_active * Nt * Nt_active) full sweep.
+    const size_t n_sparse_tot = (size_t) num_data * nchannels * Nf_active * N_sparse_t;
+    const size_t n_dense_tot  = (size_t) num_data * nchannels * Nf_active * Nt_active;
+    std::fill(c0_sparse_out, c0_sparse_out + n_sparse_tot, cmplx(0.0, 0.0));
+    std::fill(c0_dense_out,  c0_dense_out  + n_dense_tot,  cmplx(0.0, 0.0));
+
     std::vector<cmplx> fold_s(Nt_layer);
     std::vector<cmplx> fold_d(Nt);
+    std::vector<int>   nz_j;
+    nz_j.reserve(N_sparse_fd);
     for (int d = 0; d < num_data; ++d) {
         const int k_f0 = k_f0_buf[d];
+        // conservative +-1-layer slack; slack layers fold nothing and are
+        // skipped by the nz_j emptiness guard below.
+        const int m_lo = std::max(0, (k_f0 - half_NS) / half_Nt - 1 - ind_min_f);
+        const int m_hi = std::min(Nf_active - 1,
+                                  (k_f0 + half_NS - 1) / half_Nt + 1 - ind_min_f);
         for (int c = 0; c < nchannels; ++c) {
             const cmplx *X_chan = X_het.data() + ((size_t) d * nchannels + c) * N_sparse_fd;
-            for (int m_local = 0; m_local < Nf_active; ++m_local) {
+            for (int m_local = m_lo; m_local <= m_hi; ++m_local) {
                 const int m_global = ind_min_f + m_local;
                 std::fill(fold_s.begin(), fold_s.end(), cmplx(0.0, 0.0));
-                std::fill(fold_d.begin(), fold_d.end(), cmplx(0.0, 0.0));
+                for (int jj : nz_j) fold_d[jj] = cmplx(0.0, 0.0);
+                nz_j.clear();
                 // fold the N_sparse_fd nonzero bins into BOTH the sparse (mod
                 // Nt_layer) and dense (index j) accumulators, each with its own
                 // prephase origin (n_start for sparse, ind_min_t for dense).
@@ -2519,7 +2541,9 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
                     // the always-odd sparse grid, so it must NOT be reused for the dense
                     // full-Nt grid; doing so adds a spurious (-1)^n.)
                     fold_d[j]            += Xi * win * twn((long) j * (long) ind_min_t);
+                    nz_j.push_back(j);   // j strictly increasing in i, no dups
                 }
+                if (nz_j.empty()) continue;   // outputs stay pre-zeroed
                 // SPARSE iFFT (length Nt_layer, N_sparse_t outputs).
                 for (int n_layer = 0; n_layer < N_sparse_t; ++n_layer) {
                     cmplx acc(0.0, 0.0);
@@ -2535,11 +2559,12 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
                     c0_sparse_out[(((size_t) d * nchannels + c) * Nf_active + m_local)
                                   * N_sparse_t + n_layer] = acc * sign_scale * (kappa * sign_mn * conj_cmn);
                 }
-                // DENSE iFFT (length Nt, Nt_active outputs, stride 1, origin ind_min_t).
+                // DENSE iDFT (Nt_active outputs, origin ind_min_t) over the
+                // folded bins only -- all other fold_d entries are exact zeros.
                 for (int n = 0; n < Nt_active; ++n) {
                     cmplx acc(0.0, 0.0);
-                    for (int rr = 0; rr < Nt; ++rr)
-                        acc += fold_d[rr] * twn((long) rr * (long) n);
+                    for (int jj : nz_j)
+                        acc += fold_d[jj] * twn((long) jj * (long) n);
                     acc *= (1.0 / (double) Nt);       // 1/Nt = (1/Nt_layer)*(1/stride), stride_dense=1
                     const int    n_global   = ind_min_t + n;
                     const int    m_plus_n   = (m_global + n_global) & 1;
