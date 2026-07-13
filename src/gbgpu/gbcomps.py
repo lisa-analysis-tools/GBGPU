@@ -958,7 +958,8 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
 
     def __init__(self, stft_comps, T, t_ref=0.0, orbits=None, tdi_config=None,
                  force_backend=None, n_side_bins=2, window_factor=1.0,
-                 freq_from_tdi_phase=True, window_alpha=None, use_midpoint=None):
+                 freq_from_tdi_phase=True, window_alpha=None, use_midpoint=None,
+                 linear_envelope=None):
         super().__init__(force_backend=force_backend)
         self.stft_comps = stft_comps
         self.T = float(T)
@@ -974,7 +975,8 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         # window_alpha / use_midpoint here is an optional cross-check so the
         # two surfaces cannot drift silently.
         for _name, _val in (("window_alpha", window_alpha),
-                            ("use_midpoint", use_midpoint)):
+                            ("use_midpoint", use_midpoint),
+                            ("linear_envelope", linear_envelope)):
             if _val is not None:
                 _group_val = getattr(stft_comps, _name, None)
                 if _group_val is not None and _group_val != _val:
@@ -986,6 +988,7 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
                         "data STFT was built with.")
         self.window_alpha = window_alpha
         self.use_midpoint = use_midpoint
+        self.linear_envelope = linear_envelope
         self.orbits = orbits
         self.tdi_config = tdi_config
 
