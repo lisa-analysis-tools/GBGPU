@@ -284,7 +284,8 @@ class GBComputationGroup{
         double T_chunk, double dt, double T, double t_ref,
         double tukey_alpha,
         int grid_dim, int N_cp_sig, int N_cp_orbit,
-        int m_band_half_width, bool active_band = false);
+        int m_band_half_width, bool active_band = false,
+        int Nf_slab = 0, int *slab_min_f = nullptr);  // task-b per-band slab
 
     void gb_wdm_het_get_ll_wrap(
         double *d_h_out, double *h_h_out,
@@ -305,7 +306,8 @@ class GBComputationGroup{
         int grid_dim, int N_cp_sig, int N_cp_orbit,
         int *binary_perm, int *group_starts, int *group_ends,
         int *group_m_lo, int *group_m_hi, int n_groups,
-        int m_band_half_width);
+        int m_band_half_width,
+        int Nf_slab = 0, int *slab_min_f = nullptr);  // task-b per-band slab
 
     void gb_wdm_het_swap_ll_wrap(
         double *d_h_add_out, double *d_h_remove_out,
@@ -328,7 +330,8 @@ class GBComputationGroup{
         int *binary_perm, int *group_starts, int *group_ends,
         int *group_m_lo, int *group_m_hi, int n_groups,
         int *pair_m_lo_b, int *pair_m_hi_b,
-        int m_band_half_width);
+        int m_band_half_width,
+        int Nf_slab = 0, int *slab_min_f = nullptr);  // task-b per-band slab
 
     // F-stat (chunked-heterodyne). Builds the 4 Cornish & Crowder '05 basis
     // filters per binary and writes:
@@ -352,7 +355,8 @@ class GBComputationGroup{
         int nchannels, int n_rfft_chunk,
         double T_chunk, double dt, double T, double t_ref, int tdi_type,
         double tukey_alpha,
-        int grid_dim, int m_band_half_width);
+        int grid_dim, int m_band_half_width,
+        int Nf_slab = 0, int *slab_min_f = nullptr);  // task-b per-band slab
 
     // Spline-path mirrors. `coarse_dt` (seconds) sets the coarse-grid spacing
     // for the cubic-spline window builder (smaller -> more accurate / more

@@ -1,6 +1,5 @@
 [build-system]
 requires = [
-  "Cython",
   "numpy",
   "lisaanalysistools>=1.0.17",
   "scikit_build_core",
@@ -57,7 +56,6 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
   "Natural Language :: English",
   "Programming Language :: C++",
-  "Programming Language :: Cython",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",

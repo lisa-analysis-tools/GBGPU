@@ -691,6 +691,8 @@ class WDMBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         *,
         factor: int,
         waveform_kwargs: dict,
+        band_slab_Nf=None,
+        slab_min_f=None,
     ) -> None:
         assert factor in (-1, +1)
         # GBWDMComputations.fill_global_wdm needs the params in the layout it
@@ -704,11 +706,16 @@ class WDMBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         # Post-Phase-3L.7p, ``fill_global_wdm`` signature is
         # ``(params, templates, ...)`` -- the flat WDM-template buffer is the
         # only positional after params, no third ``wdm_holder`` slot.
+        # Task-b: band_slab_Nf / slab_min_f (sourced from the SubBandBuffer,
+        # which owns both the residual + template-twin slabs) size the narrow
+        # per-band write; None/None is the full-active-band (off) default.
         self.gb_comps.fill_global_wdm(
             params_phys,
             buffer_aca.linear_data_arr[0],
             data_index=params_index,
             factors=factors_arr,
+            band_slab_Nf=band_slab_Nf,
+            slab_min_f=slab_min_f,
         )
 
     # ---------- get_ll -------------------------------------------------------

@@ -3,9 +3,11 @@
 This file provides guidance to Claude Code (claude.ai/code) when working
 with code in this repository.
 
-## Sprint reorg state (post-Phase-3F, 2026-06-02)
+**LISA Analysis Tools–wide conventions:** [`../LISAanalysistools/docs/conventions.md`](../LISAanalysistools/docs/conventions.md) (canonical). **This repo's map:** [`docs/codebase-map.md`](docs/codebase-map.md).
 
-GBGPU is the **GB-physics owner** in the sprint's layered architecture.
+## LISA Analysis Tools reorg state (post-Phase-3F, 2026-06-02)
+
+GBGPU is the **GB-physics owner** in the LISA Analysis Tools layered architecture.
 LISAanalysistools (LAT) owns generic LISA infrastructure; GBGPU owns
 GB-specific physics on top of it.
 
@@ -64,17 +66,17 @@ These import generic infrastructure absolutely from `lisatools.jax.{response,wdm
   `LISAanalysistools/scripts/gb_chunked_het/gb_signal_het_wdm_v2*.py`
   (mm5 ≈ 1.6e-9 median, ~130× faster than v1 dense path).
 
-**Single-registrant rule (sprint-wide)**: GBGPU's binding TUs MUST NOT
+**Single-registrant rule (LISA Analysis Tools–wide)**: GBGPU's binding TUs MUST NOT
 register `OrbitsWrap`, `LISAResponseWrap`, `TDIConfigWrap`, or
 `CubicSplineWrap`. The first three are owned by LAT's `pycppdetector`;
 `CubicSplineWrap` is owned by GBT's `interp` module (2026-06-10). When GBGPU receives its tdionthefly
 module, add `#include "lisatools_header_abi.hpp"` +
 `static_assert(!LISATOOLS_IS_WRAPPER_OWNER, ...)` to its binding source
 (see `lisa-on-gpu/src/fastlisaresponse/cutils/binding_tof.cxx` for the
-pattern). Sprint-root `tools/check_single_registrant.sh` is the CI
+pattern). The umbrella workspace's `tools/check_single_registrant.sh` is the CI
 grep complement.
 
-## Backend implementation hierarchy (sprint-wide rule)
+## Backend implementation hierarchy (LISA Analysis Tools–wide rule)
 
 When implementing or modifying an algorithm that exists across multiple
 backends (GPU C++ / CPU C++ / JAX), follow this hierarchy:
