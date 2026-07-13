@@ -958,14 +958,34 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
 
     def __init__(self, stft_comps, T, t_ref=0.0, orbits=None, tdi_config=None,
                  force_backend=None, n_side_bins=2, window_factor=1.0,
-                 freq_from_tdi_phase=True):
+                 freq_from_tdi_phase=True, window_alpha=None, use_midpoint=None):
         super().__init__(force_backend=force_backend)
         self.stft_comps = stft_comps
         self.T = float(T)
         self.t_ref = float(t_ref)
         self.n_side_bins = int(n_side_bins)
+        # window_factor acts ONLY on the unwindowed (window_alpha == 0) Fresnel
+        # path; once the bound group's STFTFresnel has window_alpha > 0 it is
+        # intentionally ignored (see domains.cu::get_fourier_value).
         self.window_factor = float(window_factor)
         self.freq_from_tdi_phase = bool(freq_from_tdi_phase)
+        # The per-segment window/anchoring live on the bound group's
+        # STFTFresnel (set via domain_group_kwargs), NOT on this comp. Passing
+        # window_alpha / use_midpoint here is an optional cross-check so the
+        # two surfaces cannot drift silently.
+        for _name, _val in (("window_alpha", window_alpha),
+                            ("use_midpoint", use_midpoint)):
+            if _val is not None:
+                _group_val = getattr(stft_comps, _name, None)
+                if _group_val is not None and _group_val != _val:
+                    raise ValueError(
+                        f"STFTGBComputations({_name}={_val!r}) does not match "
+                        f"the bound computation group's {_name}={_group_val!r} "
+                        "(set via its domain_group_kwargs) -- the evaluator "
+                        "would model a different window/anchoring than the "
+                        "data STFT was built with.")
+        self.window_alpha = window_alpha
+        self.use_midpoint = use_midpoint
         self.orbits = orbits
         self.tdi_config = tdi_config
 
