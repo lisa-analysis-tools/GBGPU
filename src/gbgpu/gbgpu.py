@@ -129,6 +129,23 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         import contextlib
         return contextlib.nullcontext()
 
+    def _intra_split_index(self, index_arr, data_splits, gpu, num_per_gpu):
+        """Intra-shard row index for each entry of ``index_arr`` on shard ``gpu``.
+
+        The per-GPU buffers hold their rows in ascending global order, so the
+        intra-shard index is the *rank* of the row among all rows that
+        ``data_splits`` assigns to ``gpu``. Exact for uneven contiguous splits
+        (``np.array_split`` with ``n % ngpus != 0``), where the legacy
+        ``% num_per_gpu`` block trick misindexes every shard after the first.
+        The modulo fallback only remains for callers passing no
+        ``data_splits`` (single-buffer path, where rank == global index).
+        """
+        xp = self.xp
+        if data_splits is None:
+            return (index_arr % num_per_gpu).astype(np.int32)
+        shard_rows = xp.where(xp.asarray(data_splits) == gpu)[0]
+        return xp.searchsorted(shard_rows, xp.asarray(index_arr)).astype(np.int32)
+
     @property
     def get_ll_func(self):
         """get_ll c func."""
@@ -1897,9 +1914,11 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                     self._xp_set_device(gpu)
                     
                     params_here = self.xp.asarray(params)[keep_bool]
-                    group_index_here = (group_index[keep_bool] % num_per_gpu).astype(np.int32)
+                    group_index_here = self._intra_split_index(
+                        group_index[keep_bool], data_splits, gpu, num_per_gpu
+                    )
                     factors_here = factors[keep_bool]
-                    
+
                     # theta_add = np.pi / 2 - beta_add
                     params_here[:, 8] = np.pi / 2 - params_here[:, 8]
             
@@ -2051,7 +2070,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
                 Ps_arr = self.xp.array(self._spacecraft(tm_abs)).flatten()
 
                 params_here = self.xp.asarray(params)[keep_bool]
-                group_index_here = (group_index[keep_bool] % num_per_gpu).astype(np.int32)
+                group_index_here = self._intra_split_index(
+                    group_index[keep_bool], data_splits, gpu, num_per_gpu
+                )
                 factors_here = factors[keep_bool]
                 params_here[:, 8] = np.pi / 2 - params_here[:, 8]
 

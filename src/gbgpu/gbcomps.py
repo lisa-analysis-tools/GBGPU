@@ -346,8 +346,10 @@ class GBFDComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         holder = self._as_fd_holder(fd_holder)
         if len(holder.linear_data_arr) != 1:
             raise NotImplementedError(
-                "GBFDComputations supports single-shard (single-GPU / CPU) "
-                "holders only; multi-shard FD holders are a follow-on.")
+                "GBFDComputations is single-shard by contract. Multi-shard "
+                "holders must go through the LAT shard router "
+                "(lisatools.globalfit.moves.gbbands._RoutedBandEngine), "
+                "which presents one per-split view per call.")
         data_flat = holder.linear_data_arr[0]
         psd_flat = holder.linear_psd_arr[0]
         num_rows = int(holder.acs_total_entries)
