@@ -16,8 +16,13 @@ coefficients in ``__init__``, taken from installed infrastructure only:
   reference params) -- NOT a Python polyphase.
 
 ``get_ll(params, data_index)`` calls the backend ``gb_signal_het_get_ll_in_kernel``.
-CPU-only for now (the sig-het CUDA kernels are a TODO -- construct with
-``force_backend="cpu"``).
+
+Backends: the in-model band-engine path (``for_band_engine`` ->
+``setup_in_model`` / ``get_ll``) runs on CPU and CUDA -- the fused
+``gb_signal_het_get_ll_in_kernel`` kernel evaluates each candidate entirely in
+per-block shared memory, and ``gb_signal_het_make_reference`` builds the
+per-source reference coefficients on-device. The full data-loading constructor
+below stays CPU-only (offline/validation use).
 """
 from __future__ import annotations
 
@@ -55,12 +60,18 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
 
     @classmethod
     def supported_backends(cls):
-        return ["cpu"]           # sig-het CUDA kernels are a TODO
+        return ["cpu", "cuda11x", "cuda12x", "cuda13x"]
 
     def __init__(self, data_td, ref_params, *, Nf, Nt, dt, t0, t_ref,
                  orbits, tdi_config, min_freq, max_freq, sens_model="scirdv1",
                  edge_cut=None, nt_layer=64, n_sparse_fd=1024, m_active_half_width=2,
                  max_r=5.0, tukey_alpha=0.05, force_backend="cpu"):
+        if isinstance(force_backend, str) and force_backend not in ("cpu", "gbgpu_cpu"):
+            raise NotImplementedError(
+                "GBSignalHetComputations' full data-loading constructor is the "
+                "CPU offline/validation path (numpy TDSignal transforms). For "
+                "GPU in-model scoring use for_band_engine(), which inherits "
+                "the chunked delegate's backend.")
         super().__init__(force_backend=force_backend)
         self.cpp = self.backend.GBComputationGroupWrap()
 
@@ -182,12 +193,18 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         Grid, orbits, TDI configuration, phase reference time, window and
         taper all come from the chunked delegate's ``wdm_settings`` (the
         run's active-band WDM grid), so the two likelihoods are defined on
-        identical grids. CPU-only (the sig-het kernels are CPU for now),
-        like the plain constructor.
+        identical grids. The compute backend is INHERITED from the chunked
+        delegate (cpu or cudaXXx) so in-model scoring runs where the run
+        runs; on CUDA the reference coefficients live on-device and every
+        repeat proposal scores through the fused shared-memory kernel with
+        zero H2D traffic.
         """
         wdm = chunked_comp.wdm_settings
         self = cls.__new__(cls)
-        FastLISAResponseParallelModule.__init__(self, force_backend="cpu")
+        # backend name is "gbgpu_<flavor>"; re-passing the plain flavor
+        # through our ctor re-prefixes it.
+        _flavor = chunked_comp.backend.name.split("_", 1)[1]
+        FastLISAResponseParallelModule.__init__(self, force_backend=_flavor)
         self.cpp = self.backend.GBComputationGroupWrap()
         self.chunked = chunked_comp
         self.m_half = int(m_active_half_width)
@@ -202,10 +219,28 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         ind_min_f = int(wdm.ind_min_f)
         Nt_active = int(wdm.Nt_active)
         Nf_active = int(wdm.ind_max_f - wdm.ind_min_f + 1)
+        # The polyphase fold identity requires nt_layer to DIVIDE Nt exactly
+        # (Nt == nt_layer * stride); the C++ wraps now hard-error otherwise.
+        # Production grids need not be power-of-two-friendly (mojito Nt=2160),
+        # so SNAP the requested value to the nearest divisor of Nt (ties ->
+        # the larger, i.e. denser/more accurate, side).
+        nt_layer = int(nt_layer)
+        if Nt % nt_layer != 0:
+            divisors = [d for d in range(2, Nt + 1) if Nt % d == 0]
+            snapped = min(divisors, key=lambda d: (abs(d - nt_layer), -d))
+            import logging
+            logging.getLogger(__name__).warning(
+                "sig-het nt_layer=%d does not divide Nt=%d; snapping to %d "
+                "(stride %d).", nt_layer, Nt, snapped, Nt // snapped)
+            nt_layer = snapped
         stride, N_sparse_t, n_sparse_local = sparse_time_grid(
             Nt, Nt_active, nt_layer)
-        self.window_full = np.asarray(wdm.window, dtype=np.float64)
-        self.n_sparse_local = n_sparse_local
+        # window + sparse grid go straight into the kernels -> device-resident
+        # on CUDA (self.xp follows the inherited backend).
+        self.window_full = self.xp.asarray(
+            np.asarray(wdm.window.get() if hasattr(wdm.window, "get")
+                       else wdm.window, dtype=np.float64))
+        self.n_sparse_local = self.xp.asarray(n_sparse_local)
 
         # The chunked comp stores the raw ctor value (possibly the -1 AUTO
         # sentinel); the kernels consume the RESOLVED alpha.
@@ -221,7 +256,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         gb_gen = GBTDIonTheFly(t_tdi, Tobs, float(chunked_comp.t_ref),
                                1.0 / dt, 1, tdi_config=tdi_config,
                                orbits=orbits, tdi_chan="XYZ",
-                               force_backend="cpu")
+                               force_backend=_flavor)
         self.tdi_wrap = gb_gen.wave_gen
         self._keep_alive = dict(gb_gen=gb_gen, orbits=orbits,
                                 tdi_config=tdi_config)
@@ -264,21 +299,24 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         sig-het setup from the no-op hooks (which return None)."""
         g = self._g
         nch = 3
+        xp = self.xp
+        # host copy of the slot ids for the slot->ref map bookkeeping.
         slots = np.asarray(
             data_index.get() if hasattr(data_index, "get") else data_index,
             dtype=int)
-        # FORCED copy: ascontiguousarray(asarray(...)) returns a VIEW for
-        # float64-contiguous input, and params_ref_all must never alias
-        # the caller's array (the mid-block patch writes into it).
-        refs = np.array(
-            params_ref_phys.get() if hasattr(params_ref_phys, "get")
-            else params_ref_phys, dtype=float, copy=True
-        ).reshape(-1, 9)
+        # FORCED device-side copy: params_ref_all must never alias the
+        # caller's array (the mid-block patch writes into it). xp.asarray
+        # of a host array uploads on CUDA; xp.array(copy=True) covers the
+        # already-on-device case.
+        refs = xp.array(xp.asarray(params_ref_phys), dtype=float,
+                        copy=True).reshape(-1, 9)
         n = refs.shape[0]
 
+        # Residual/inverse-PSD slabs stay on their resident device (cupy on
+        # the CUDA path -- no host round-trip).
         slab_shape = (-1, nch, g["Nf_active"], g["Nt_active"])
-        res = np.asarray(buffer_aca.linear_data_arr[0]).reshape(slab_shape)[slots]
-        psd_flat = np.asarray(buffer_aca.linear_psd_arr[0])
+        res = xp.asarray(buffer_aca.linear_data_arr[0]).reshape(slab_shape)[slots]
+        psd_flat = xp.asarray(buffer_aca.linear_psd_arr[0])
         expected_xyz = psd_flat.size // (nch * nch * g["Nf_active"] * g["Nt_active"])
         if expected_xyz * nch * nch * g["Nf_active"] * g["Nt_active"] != psd_flat.size:
             raise NotImplementedError(
@@ -286,10 +324,10 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 "cross-channel inverse covariance layout only.")
         invC = psd_flat.reshape(-1, nch, nch, g["Nf_active"], g["Nt_active"])[slots]
 
-        c0_sparse = np.zeros((n, nch, g["Nf_active"], g["N_sparse_t"]),
-                             dtype=np.complex128)
-        c0_dense = np.zeros((n, nch, g["Nf_active"], g["Nt_active"]),
-                            dtype=np.complex128)
+        c0_sparse = xp.zeros((n, nch, g["Nf_active"], g["N_sparse_t"]),
+                             dtype=xp.complex128)
+        c0_dense = xp.zeros((n, nch, g["Nf_active"], g["Nt_active"]),
+                            dtype=xp.complex128)
         self.cpp.gb_signal_het_make_reference(
             self.tdi_wrap, c0_sparse, c0_dense, self.window_full,
             self.n_sparse_local, refs, n, 9, 1, 2,
@@ -302,7 +340,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         A0l, A1l, B0l, B1l, B0ncl, B1ncl = [], [], [], [], [], []
         for i in range(n):
             A0, A1, B0, B1, B0nc, B1nc = bin_fold_real(
-                res[i].astype(np.complex128), c0_dense[i], invC[i],
+                res[i].astype(xp.complex128), c0_dense[i], invC[i],
                 self.n_sparse_local, g["stride"], g["Nt_active"],
                 tdi_type="XYZ")
             A0l.append(A0); A1l.append(A1); B0l.append(B0)
@@ -321,22 +359,25 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                     "sig-het in-model patch hit a slot with no reference; "
                     "mid-block refreshes must target the block's slots.")
             self.c0_sparse_all[ref_idx] = c0_sparse
-            self.A0_all[ref_idx] = np.stack(A0l)
-            self.A1_all[ref_idx] = np.stack(A1l)
-            self.B0_all[ref_idx] = np.stack(B0l)
-            self.B1_all[ref_idx] = np.stack(B1l)
-            self.B0nc_all[ref_idx] = np.stack(B0ncl)
-            self.B1nc_all[ref_idx] = np.stack(B1ncl)
+            self.A0_all[ref_idx] = xp.stack(A0l)
+            self.A1_all[ref_idx] = xp.stack(A1l)
+            self.B0_all[ref_idx] = xp.stack(B0l)
+            self.B1_all[ref_idx] = xp.stack(B1l)
+            self.B0nc_all[ref_idx] = xp.stack(B0ncl)
+            self.B1nc_all[ref_idx] = xp.stack(B1ncl)
             self.params_ref_all[ref_idx] = refs
             return True
 
-        self.c0_sparse_all = np.ascontiguousarray(c0_sparse)
-        self.A0_all = np.ascontiguousarray(np.stack(A0l))
-        self.A1_all = np.ascontiguousarray(np.stack(A1l))
-        self.B0_all = np.ascontiguousarray(np.stack(B0l))
-        self.B1_all = np.ascontiguousarray(np.stack(B1l))
-        self.B0nc_all = np.ascontiguousarray(np.stack(B0ncl))
-        self.B1nc_all = np.ascontiguousarray(np.stack(B1ncl))
+        # The coefficient stash is the per-block CACHE: built once here (on
+        # the run's device), then reused by every repeat-proposal get_ll
+        # with no further host<->device traffic.
+        self.c0_sparse_all = xp.ascontiguousarray(c0_sparse)
+        self.A0_all = xp.ascontiguousarray(xp.stack(A0l))
+        self.A1_all = xp.ascontiguousarray(xp.stack(A1l))
+        self.B0_all = xp.ascontiguousarray(xp.stack(B0l))
+        self.B1_all = xp.ascontiguousarray(xp.stack(B1l))
+        self.B0nc_all = xp.ascontiguousarray(xp.stack(B0ncl))
+        self.B1nc_all = xp.ascontiguousarray(xp.stack(B1ncl))
         self.params_ref_all = refs
 
         slot_map = np.full(int(slots.max()) + 1, -1, dtype=int)
@@ -388,8 +429,9 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             raise RuntimeError(
                 "sig-het in-model scoring hit a buffer slot with no "
                 "reference; setup_in_model was not run for it.")
-        p = params.get() if hasattr(params, "get") else params
-        ll = self.get_ll(np.asarray(p, dtype=float), data_index=ref_idx)
+        # params stay on their resident device (cupy on the CUDA path).
+        ll = self.get_ll(self.xp.asarray(params, dtype=float),
+                         data_index=ref_idx)
         self.d_h_out = self.last_d_h
         self.h_h_out = self.last_h_h
         return ll
@@ -406,29 +448,35 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         ``self.non_marg_d_h``. Same convention as
         ``gb_likelihood.TwoQuadraturePhaseMaxMixin``.
         """
+        xp = self.xp
         if phase_maximize:
             ll_0 = self.get_ll(params, data_index=data_index)
             d_h_0, h_h = self.last_d_h.copy(), self.last_h_h.copy()
             # FORCED copy: the quadrature shift must not mutate the
             # caller's params through an ascontiguousarray view.
-            x_q = np.atleast_2d(np.array(params, dtype=float, copy=True))
+            x_q = xp.atleast_2d(xp.array(xp.asarray(params), dtype=float,
+                                         copy=True))
             x_q[:, 4] = x_q[:, 4] + np.pi / 2
             self.get_ll(x_q, data_index=data_index)
             d_h_90 = self.last_d_h.copy()
             D = d_h_0 + 1j * d_h_90
-            d_h_max = np.abs(D)
+            d_h_max = xp.abs(D)
             self.non_marg_d_h = d_h_0
-            self.phase_angle = np.arctan2(D.imag, D.real)
+            self.phase_angle = xp.arctan2(D.imag, D.real)
             self.last_d_h = d_h_max
             self.last_h_h = h_h
             return ll_0 + (d_h_max - d_h_0)
         self.phase_angle = None
-        x = np.ascontiguousarray(np.atleast_2d(np.asarray(params, dtype=float)))
+        # Arrays live on the run's device (cupy on CUDA): candidate params
+        # are typically already device-resident, the coefficient stash always
+        # is (built by setup_in_model), so a repeat-proposal call moves
+        # nothing across the PCIe bus.
+        x = xp.ascontiguousarray(xp.atleast_2d(xp.asarray(params, dtype=float)))
         N = x.shape[0]
-        di = (np.zeros(N, dtype=np.int32) if data_index is None
-              else np.asarray(data_index, dtype=np.int32))
-        d_h = np.zeros(N, dtype=np.float64)
-        h_h = np.zeros(N, dtype=np.float64)
+        di = (xp.zeros(N, dtype=xp.int32) if data_index is None
+              else xp.ascontiguousarray(xp.asarray(data_index, dtype=xp.int32)))
+        d_h = xp.zeros(N, dtype=xp.float64)
+        h_h = xp.zeros(N, dtype=xp.float64)
         num_data = int(self.params_ref_all.shape[0])
         g = self._g
         self.cpp.gb_signal_het_get_ll_in_kernel(
@@ -444,6 +492,6 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             g["layer_df"], g["dt"], g["Tobs"], g["t0"],
             3, 0, g["n_sparse_fd"],
             g["tukey_alpha"], g["max_r"], 1)     # project_real=1
-        self.last_d_h = np.asarray(d_h).copy()
-        self.last_h_h = np.asarray(h_h).copy()
-        return -0.5 * self.d_d + np.asarray(d_h) - 0.5 * np.asarray(h_h)
+        self.last_d_h = d_h.copy()
+        self.last_h_h = h_h.copy()
+        return -0.5 * self.d_d + d_h - 0.5 * h_h

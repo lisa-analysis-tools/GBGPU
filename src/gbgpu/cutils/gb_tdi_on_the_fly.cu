@@ -1846,6 +1846,297 @@ static void signal_het_polyphase_one_channel(
 
 }  // anonymous namespace
 
+
+// ============================================================================
+// Signal-heterodyne (v2 polyphase) -- SHARED per-source consumer.
+//
+// The single CPU+GPU implementation of the sparse-FD sig-het likelihood
+// consumer (fold -> length-Nt_layer iFFT -> r = c1/c0 -> dr/dn -> bin-fold
+// inner products). Compiled both ways via the gbt_global.h cooperative
+// macros, exactly like `gbfd_build_one_source`:
+//   * CPU  (THREAD_START_X=0 / BLOCK_INCR_X=1 / NUM_THREADS_HERE=1): a
+//     serial sweep whose arithmetic ORDER matches the previous host-loop
+//     implementation bit-for-bit (fold contributions arrive in the same
+//     increasing-i order; the naive iFFT keeps its rr-inner loop; the
+//     accumulators keep the (c[,c2],im,b) nesting).
+//   * GPU: cooperative threads stride the flattened loops; the caller
+//     block-reduces the per-thread partials (`block_reduce` from LAT's
+//     lat_chunked_het_kernels.hh, same pattern as gb_fd_get_ll_kernel).
+//
+// The naive O(Nt_layer^2) iFFT is kept deliberately (NOT swapped for the
+// radix-2 gbfd_radix2_fft_inplace): the polyphase identity requires
+// Nt_layer to DIVIDE Nt exactly, and production WDM grids (e.g. mojito
+// Nt=2160) have no useful power-of-two divisors -- a radix-2 constraint
+// would forbid every valid Nt_layer > 16 there. At Nt_layer <= 128 the
+// DFT is a negligible ~Nt_layer^2 * M * nch complex ops per source.
+//
+// X input conventions (`fft_order_scale`):
+//   <= 0 : `X_all` is the CENTERED slice of the absolute dense rfft,
+//          already scaled (the gb_signal_het_get_ll_sparse_wrap input
+//          convention): X_all[c*X_len + i] = rfft[k_f0 + (i - X_len/2)].
+//   >  0 : `X_all` is in FFT ORDER as produced by gbfd_build_one_source
+//          (0.5*dts scale absorbed); each read applies the fftshift index
+//          map and multiplies by fft_order_scale (= 1/dt), folding the
+//          previous two-pass reorder buffer into the read itself.
+//
+// Fold uses a GATHER formulation -- per (c, im, r) sum the <= Nt/Nt_layer
+// candidate bins j = r + q*Nt_layer inside the sparse support -- so
+// cooperative threads never collide (no atomics), while visiting the
+// contributions of each fold slot in the same increasing-j order as the
+// previous scatter loop (FP-identical sums).
+//
+// Outputs: *dh_partial / *hh_partial receive THIS thread's RAW partial
+// sums of the complex accumulators' real parts (no 0.5 factor) -- the
+// caller reduces across threads and applies the final 0.5.
+// ============================================================================
+
+CUDA_DEVICE
+void gb_signal_het_consume_one_source(
+    double *dh_partial, double *hh_partial,
+    cmplx  *X_all, int X_len, double fft_order_scale,
+    int     k_f0, double f0_cand,
+    cmplx  *c0_sparse_all,
+    cmplx  *A0_all, cmplx *A1_all,
+    cmplx  *B0_all, cmplx *B1_all,
+    cmplx  *B0nc_all, cmplx *B1nc_all,
+    double *wdm_window, int *n_sparse_local_arr,
+    int     data_idx,
+    int     Nf, int Nt, int Nf_active,
+    int     Nt_layer, int N_sparse_t, int stride,
+    int     ind_min_t, int ind_min_f,
+    int     m_active_half_width,
+    double  layer_df, double dt,
+    int     nchannels, int tdi_type,
+    double  max_r, int project_real,
+    cmplx  *fold_s,      // (nchannels * M * Nt_layer) scratch
+    cmplx  *c1_sparse,   // (nchannels * M * N_sparse_t) scratch
+    cmplx  *r_sparse,    // (nchannels * M * N_sparse_t) scratch
+    cmplx  *dr_sparse)   // (nchannels * M * N_sparse_t) scratch
+{
+    const int    M        = 2 * m_active_half_width + 1;
+    const double FLOOR_EPS = 1e-12;
+    const double TWO_PI   = 2.0 * M_PI;
+    const cmplx  I_c      = cmplx(0.0, 1.0);
+    const int    half_Nt  = Nt / 2;
+    const int    half_NS  = X_len / 2;
+    const double kappa    = 2.0 * sqrt(M_PI * dt) / (double) Nf;
+    const int    n_start  = ind_min_t + n_sparse_local_arr[0];
+
+    // Active m-band (every thread computes the same tiny array).
+    const int Nf_active_idx_max = Nf_active - 1;
+    const int m_floor = (int) floor(f0_cand / layer_df);
+    int m_active[16];
+    for (int im = 0; im < M; ++im) {
+        int m_g = m_floor + (im - m_active_half_width);
+        if (m_g < ind_min_f) m_g = ind_min_f;
+        if (m_g > ind_min_f + Nf_active_idx_max) m_g = ind_min_f + Nf_active_idx_max;
+        m_active[im] = m_g;
+    }
+
+    // ---- (1) polyphase fold: GATHER over j = r + q*Nt_layer ---------------
+    // j valid when its absolute bin k_abs = k_f0 + (i - half_NS) lies in the
+    // sparse support, i.e. i = j - j_base in [0, X_len).
+    const int n_fold = nchannels * M * Nt_layer;
+    for (int idx = THREAD_START_X; idx < n_fold; idx += BLOCK_INCR_X)
+    {
+        const int c  = idx / (M * Nt_layer);
+        const int im = (idx / Nt_layer) % M;
+        const int r  = idx % Nt_layer;
+        const int m_g    = m_active[im];
+        const int j_base = k_f0 - half_NS + half_Nt - m_g * half_Nt;
+        cmplx acc(0.0, 0.0);
+        for (int j = r; j < Nt; j += Nt_layer)
+        {
+            const int i = j - j_base;
+            if (i < 0 || i >= X_len) continue;
+            cmplx Xi;
+            if (fft_order_scale > 0.0) {
+                const int m_signed = i - half_NS;
+                const int m_fft = (m_signed >= 0) ? m_signed
+                                                  : (m_signed + X_len);
+                Xi = X_all[(size_t) c * X_len + m_fft] * fft_order_scale;
+            } else {
+                Xi = X_all[(size_t) c * X_len + i];
+            }
+            if (Xi.real() == 0.0 && Xi.imag() == 0.0) continue;
+            const int    j_off     = j - half_Nt;
+            const double phase_arg = TWO_PI * (double) j_off
+                                     * (double) n_start / (double) Nt;
+            const cmplx  prephase  = gcmplx::exp(I_c * phase_arg);
+            acc += Xi * wdm_window[j] * prephase;
+        }
+        fold_s[idx] = acc;
+    }
+    CUDA_SYNC_THREADS;
+
+    // ---- (2) naive iFFT of length Nt_layer (first N_sparse_t outputs) -----
+    const int n_ifft = nchannels * M * N_sparse_t;
+    for (int idx = THREAD_START_X; idx < n_ifft; idx += BLOCK_INCR_X)
+    {
+        const int c       = idx / (M * N_sparse_t);
+        const int im      = (idx / N_sparse_t) % M;
+        const int n_layer = idx % N_sparse_t;
+        const cmplx *fold_cm = fold_s + (size_t) c * M * Nt_layer
+                                      + (size_t) im * Nt_layer;
+        cmplx acc(0.0, 0.0);
+        for (int rr = 0; rr < Nt_layer; ++rr)
+        {
+            const double pa = TWO_PI * (double) rr
+                              * (double) n_layer / (double) Nt_layer;
+            acc += fold_cm[rr] * gcmplx::exp(I_c * pa);
+        }
+        acc *= (1.0 / (double) Nt_layer);
+        const int    n_global   = n_start + n_layer * stride;
+        const double sign_scale = ((n_global & 1) ? -1.0 : 1.0)
+                                  / (double) stride;
+        const cmplx  after_ifft_lt = acc * sign_scale;
+        const int    m_global   = m_active[im];
+        const int    m_plus_n   = (m_global + n_global) & 1;
+        const cmplx  conj_cmn   = (m_plus_n == 0) ? cmplx(1.0, 0.0)
+                                                  : cmplx(0.0, -1.0);
+        const int    sign_mn_int = ((m_global + 1) * n_global) & 1;
+        const double sign_mn     = sign_mn_int ? -1.0 : 1.0;
+        c1_sparse[idx] = after_ifft_lt * (kappa * sign_mn * conj_cmn);
+    }
+    CUDA_SYNC_THREADS;
+
+    // ---- (3) r = c1/c0 (floor + max_r clip) + dr/dn, one thread per row ---
+    // dr only reads r within its own (c, im) row, so no sync between them.
+    const int n_rows = nchannels * M;
+    for (int row = THREAD_START_X; row < n_rows; row += BLOCK_INCR_X)
+    {
+        const int c  = row / M;
+        const int im = row % M;
+        const int m_local = m_active[im] - ind_min_f;
+        const cmplx *c0_row = c0_sparse_all
+            + ((size_t) data_idx * nchannels + c) * Nf_active * N_sparse_t
+            + (size_t) m_local * N_sparse_t;
+        cmplx *c1_row = c1_sparse + (size_t) row * N_sparse_t;
+        cmplx *r_row  = r_sparse  + (size_t) row * N_sparse_t;
+        cmplx *dr_row = dr_sparse + (size_t) row * N_sparse_t;
+
+        double max_mag = 0.0;
+        for (int b = 0; b < N_sparse_t; ++b)
+        {
+            const double mag = gcmplx::abs(c0_row[b]);
+            if (mag > max_mag) max_mag = mag;
+        }
+        const double floor_th_a = FLOOR_EPS * max_mag;
+        const double floor_th   = (floor_th_a > 1e-300) ? floor_th_a : 1e-300;
+
+        for (int b = 0; b < N_sparse_t; ++b)
+        {
+            if (gcmplx::abs(c0_row[b]) > floor_th) {
+                cmplx r_val = c1_row[b] / c0_row[b];
+                // Amp/phase clip: cap |r| at max_r (direction preserved).
+                if (max_r > 0.0) {
+                    const double abs_r = gcmplx::abs(r_val);
+                    if (abs_r > max_r) r_val = r_val * (max_r / abs_r);
+                }
+                r_row[b] = r_val;
+            } else {
+                r_row[b] = cmplx(0.0, 0.0);
+            }
+        }
+
+        const double Dn = (double) stride;
+        for (int b = 0; b < N_sparse_t; ++b)
+        {
+            cmplx d(0.0, 0.0);
+            if (N_sparse_t >= 3) {
+                if (b == 0) d = (r_row[1] - r_row[0]) / Dn;
+                else if (b == N_sparse_t - 1) d = (r_row[b] - r_row[b - 1]) / Dn;
+                else d = (r_row[b + 1] - r_row[b - 1]) / (2.0 * Dn);
+            } else if (N_sparse_t == 2) {
+                d = (r_row[1] - r_row[0]) / Dn;
+            }
+            dr_row[b] = d;
+        }
+    }
+    CUDA_SYNC_THREADS;
+
+    // ---- (4) bin-fold inner products: per-thread RAW partials -------------
+    cmplx d_h_raw(0.0, 0.0);
+    cmplx h_h_raw(0.0, 0.0);
+
+    const int n_dh = nchannels * M * N_sparse_t;
+    for (int idx = THREAD_START_X; idx < n_dh; idx += BLOCK_INCR_X)
+    {
+        const int c  = idx / (M * N_sparse_t);
+        const int im = (idx / N_sparse_t) % M;
+        const int b  = idx % N_sparse_t;
+        const int m_local = m_active[im] - ind_min_f;
+        const size_t coef_i = ((size_t) data_idx * nchannels + c)
+                              * Nf_active * N_sparse_t
+                              + (size_t) m_local * N_sparse_t + b;
+        d_h_raw += A0_all[coef_i] * r_sparse[idx]
+                 + A1_all[coef_i] * dr_sparse[idx];
+    }
+
+    if (tdi_type == 0)
+    {
+        // XYZ: cross-channel B0/B1 (num_data, nch, nch, Nf_active, N_sparse_t)
+        const int n_hh = nchannels * nchannels * M * N_sparse_t;
+        for (int idx = THREAD_START_X; idx < n_hh; idx += BLOCK_INCR_X)
+        {
+            const int c  = idx / (nchannels * M * N_sparse_t);
+            const int c2 = (idx / (M * N_sparse_t)) % nchannels;
+            const int im = (idx / N_sparse_t) % M;
+            const int b  = idx % N_sparse_t;
+            const int m_local = m_active[im] - ind_min_f;
+            const size_t rc_i  = ((size_t) c  * M + im) * N_sparse_t + b;
+            const size_t rc2_i = ((size_t) c2 * M + im) * N_sparse_t + b;
+            const cmplx r_c   = r_sparse[rc_i];
+            const cmplx r_c2  = r_sparse[rc2_i];
+            const cmplx dr_c  = dr_sparse[rc_i];
+            const cmplx dr_c2 = dr_sparse[rc2_i];
+            const size_t coef_i =
+                (((size_t) data_idx * nchannels + c) * nchannels + c2)
+                * Nf_active * N_sparse_t
+                + (size_t) m_local * N_sparse_t + b;
+            const cmplx r_outer   = gcmplx::conj(r_c) * r_c2;
+            const cmplx cross_drr = gcmplx::conj(r_c)  * dr_c2
+                                  + gcmplx::conj(dr_c) * r_c2;
+            h_h_raw += B0_all[coef_i] * r_outer + B1_all[coef_i] * cross_drr;
+            if (project_real) {
+                // nonconj pairing r_c*r_c2 (NOT conj) -> with the conj term,
+                // 0.5*Re(...) is the real WDM projection.
+                h_h_raw += B0nc_all[coef_i] * (r_c * r_c2)
+                         + B1nc_all[coef_i] * (r_c * dr_c2 + dr_c * r_c2);
+            }
+        }
+    }
+    else
+    {
+        // AE / AET: diagonal B0/B1 (num_data, nch, Nf_active, N_sparse_t)
+        const int n_hh = nchannels * M * N_sparse_t;
+        for (int idx = THREAD_START_X; idx < n_hh; idx += BLOCK_INCR_X)
+        {
+            const int c  = idx / (M * N_sparse_t);
+            const int im = (idx / N_sparse_t) % M;
+            const int b  = idx % N_sparse_t;
+            const int m_local = m_active[im] - ind_min_f;
+            const cmplx r  = r_sparse[idx];
+            const cmplx dr = dr_sparse[idx];
+            const size_t coef_i = ((size_t) data_idx * nchannels + c)
+                                  * Nf_active * N_sparse_t
+                                  + (size_t) m_local * N_sparse_t + b;
+            const double rsq = (gcmplx::conj(r) * r).real();
+            const cmplx cross_drr = gcmplx::conj(r) * dr
+                                  + gcmplx::conj(dr) * r;
+            h_h_raw += B0_all[coef_i] * rsq + B1_all[coef_i] * cross_drr;
+            if (project_real) {
+                h_h_raw += B0nc_all[coef_i] * (r * r)
+                         + B1nc_all[coef_i] * (r * dr + dr * r);
+            }
+        }
+    }
+
+    *dh_partial = d_h_raw.real();
+    *hh_partial = h_h_raw.real();
+}
+
+
 void GBComputationGroup::gb_signal_het_get_ll_wrap(
     double *d_h_out,
     double *h_h_out,
@@ -2106,210 +2397,45 @@ void GBComputationGroup::gb_signal_het_get_ll_sparse_wrap(
 
 #ifdef __CUDACC__
     throw std::runtime_error(
-        "[gb_signal_het_get_ll_sparse_wrap] GPU implementation is a TODO -- the v2 signal-het CUDA "
-        "kernels are not implemented yet. Construct the Python class with "
-        "force_backend=\"cpu\" until then. (Silent zero-return previously "
-        "masqueraded as a successful call -- see the audit at GBGPU 2026-06-06.)");
-#endif
-
+        "[gb_signal_het_get_ll_sparse_wrap] GPU entry not exposed -- this is the "
+        "CPU validation entry point (pre-materialized X_het). The production GPU "
+        "path is gb_signal_het_get_ll_in_kernel_wrap, which shares the same "
+        "gb_signal_het_consume_one_source implementation.");
+#else
+    // CPU host loop over the shared per-source consumer (single "thread":
+    // THREAD_START_X=0 / BLOCK_INCR_X=1, so the partials are the full sums
+    // and the arithmetic order matches the pre-refactor implementation).
     const int M = 2 * m_active_half_width + 1;
-    const int Nf_active_idx_max = Nf_active - 1;
-    const double FLOOR_EPS = 1e-12;
-    const double TWO_PI = 2.0 * M_PI;
-    const cmplx I_c = cmplx(0.0, 1.0);
-    const int   half_Nt = Nt / 2;
-    const int   half_NS = N_sparse_fd / 2;
-    const double kappa = 2.0 * std::sqrt(M_PI * dt) / (double) Nf;
-    const int   n_start = ind_min_t + n_sparse_local_arr[0];
-
-    std::vector<cmplx> fold((size_t) nchannels * M * Nt_layer);
+    std::vector<cmplx> fold_s((size_t) nchannels * M * Nt_layer);
     std::vector<cmplx> c1_sparse((size_t) nchannels * M * N_sparse_t);
     std::vector<cmplx> r_sparse((size_t)  nchannels * M * N_sparse_t);
     std::vector<cmplx> dr_sparse((size_t) nchannels * M * N_sparse_t);
 
     for (int bin = 0; bin < num_bin; ++bin) {
-        const double f0_cand = params_cand_all[(size_t) bin * nparams + f0_idx];
-        const int    m_floor = (int) std::floor(f0_cand / layer_df);
-        int m_active[16];
-        for (int im = 0; im < M; ++im) {
-            int m_g = m_floor + (im - m_active_half_width);
-            if (m_g < ind_min_f) m_g = ind_min_f;
-            if (m_g > ind_min_f + Nf_active_idx_max) m_g = ind_min_f + Nf_active_idx_max;
-            m_active[im] = m_g;
-        }
-        const int data_idx = data_index_all[bin];
-        const int k_f0     = k_f0_all[bin];
-
-        // Polyphase fold: iterate only N_sparse_fd nonzero bins.
-        std::fill(fold.begin(), fold.end(), cmplx(0.0, 0.0));
-        for (int c = 0; c < nchannels; ++c) {
-            const cmplx *X_chan = X_het_all + (size_t) bin * nchannels * N_sparse_fd
-                                            + (size_t) c * N_sparse_fd;
-            for (int i = 0; i < N_sparse_fd; ++i) {
-                const cmplx Xi = X_chan[i];
-                if (Xi.real() == 0.0 && Xi.imag() == 0.0) continue;
-                const int k_abs = k_f0 + (i - half_NS);
-                for (int im = 0; im < M; ++im) {
-                    const int j = k_abs - m_active[im] * half_Nt + half_Nt;
-                    if (j < 0 || j >= Nt) continue;
-                    const int j_off = j - half_Nt;
-                    const double phase_arg = TWO_PI * (double) j_off
-                                             * (double) n_start / (double) Nt;
-                    const cmplx prephase = gcmplx::exp(I_c * phase_arg);
-                    const cmplx weighted = Xi * wdm_window[j] * prephase;
-                    const int r = j % Nt_layer;
-                    fold[(size_t) c * M * Nt_layer
-                       + (size_t) im * Nt_layer + r] += weighted;
-                }
-            }
-        }
-
-        // iFFT of length Nt_layer (naive DFT; keep first N_sparse_t outputs).
-        for (int c = 0; c < nchannels; ++c) {
-            for (int im = 0; im < M; ++im) {
-                const cmplx *fold_cm = fold.data()
-                    + (size_t) c * M * Nt_layer + (size_t) im * Nt_layer;
-                for (int n_layer = 0; n_layer < N_sparse_t; ++n_layer) {
-                    cmplx acc(0.0, 0.0);
-                    for (int rr = 0; rr < Nt_layer; ++rr) {
-                        const double pa = TWO_PI * (double) rr
-                                          * (double) n_layer / (double) Nt_layer;
-                        acc += fold_cm[rr] * gcmplx::exp(I_c * pa);
-                    }
-                    acc *= (1.0 / (double) Nt_layer);
-                    const int n_global = n_start + n_layer * stride;
-                    const double sign_scale = ((n_global & 1) ? -1.0 : 1.0)
-                                              / (double) stride;
-                    const cmplx after_ifft_lt = acc * sign_scale;
-                    const int  m_global = m_active[im];
-                    const int  m_plus_n = (m_global + n_global) & 1;
-                    const cmplx conj_cmn = (m_plus_n == 0) ? cmplx(1.0, 0.0)
-                                                           : cmplx(0.0, -1.0);
-                    const int  sign_mn_int = ((m_global + 1) * n_global) & 1;
-                    const double sign_mn = sign_mn_int ? -1.0 : 1.0;
-                    const cmplx coef = kappa * sign_mn * conj_cmn;
-                    c1_sparse[(size_t) c * M * N_sparse_t
-                            + (size_t) im * N_sparse_t + n_layer] = after_ifft_lt * coef;
-                }
-            }
-        }
-
-        // r, dr, inner products: same as Stage 1.
-        for (int c = 0; c < nchannels; ++c) {
-            for (int im = 0; im < M; ++im) {
-                const int m_local = m_active[im] - ind_min_f;
-                double max_mag = 0.0;
-                for (int b = 0; b < N_sparse_t; ++b) {
-                    const cmplx c0v = c0_sparse_all[
-                        ((size_t) data_idx * nchannels + c) * Nf_active * N_sparse_t
-                        + (size_t) m_local * N_sparse_t + b];
-                    const double mag = gcmplx::abs(c0v);
-                    if (mag > max_mag) max_mag = mag;
-                }
-                const double floor_th = std::max(FLOOR_EPS * max_mag, 1e-300);
-                for (int b = 0; b < N_sparse_t; ++b) {
-                    const cmplx c0v = c0_sparse_all[
-                        ((size_t) data_idx * nchannels + c) * Nf_active * N_sparse_t
-                        + (size_t) m_local * N_sparse_t + b];
-                    const cmplx c1v = c1_sparse[
-                        (size_t) c * M * N_sparse_t + (size_t) im * N_sparse_t + b];
-                    const size_t r_idx = (size_t) c * M * N_sparse_t
-                                       + (size_t) im * N_sparse_t + b;
-                    if (gcmplx::abs(c0v) > floor_th) {
-                        cmplx r_val = c1v / c0v;
-                        // Amp/phase clip: cap |r| at max_r (preserve dir).
-                        if (max_r > 0.0) {
-                            const double abs_r = gcmplx::abs(r_val);
-                            if (abs_r > max_r) r_val = r_val * (max_r / abs_r);
-                        }
-                        r_sparse[r_idx] = r_val;
-                    } else {
-                        r_sparse[r_idx] = cmplx(0.0, 0.0);
-                    }
-                }
-            }
-        }
-
-        const double Dn = (double) stride;
-        for (int c = 0; c < nchannels; ++c) {
-            for (int im = 0; im < M; ++im) {
-                for (int b = 0; b < N_sparse_t; ++b) {
-                    const size_t i_cmb = (size_t) c * M * N_sparse_t
-                                       + (size_t) im * N_sparse_t + b;
-                    cmplx d(0.0, 0.0);
-                    if (N_sparse_t >= 3) {
-                        if (b == 0) d = (r_sparse[i_cmb + 1] - r_sparse[i_cmb]) / Dn;
-                        else if (b == N_sparse_t - 1) d = (r_sparse[i_cmb] - r_sparse[i_cmb - 1]) / Dn;
-                        else d = (r_sparse[i_cmb + 1] - r_sparse[i_cmb - 1]) / (2.0 * Dn);
-                    } else if (N_sparse_t == 2) {
-                        const size_t i0 = (size_t) c * M * N_sparse_t + (size_t) im * N_sparse_t;
-                        d = (r_sparse[i0 + 1] - r_sparse[i0]) / Dn;
-                    }
-                    dr_sparse[i_cmb] = d;
-                }
-            }
-        }
-
-        cmplx d_h_raw(0.0, 0.0), h_h_raw(0.0, 0.0);
-        for (int c = 0; c < nchannels; ++c) {
-            for (int im = 0; im < M; ++im) {
-                const int m_local = m_active[im] - ind_min_f;
-                for (int b = 0; b < N_sparse_t; ++b) {
-                    const cmplx r  = r_sparse[ (size_t) c * M * N_sparse_t + (size_t) im * N_sparse_t + b];
-                    const cmplx dr = dr_sparse[(size_t) c * M * N_sparse_t + (size_t) im * N_sparse_t + b];
-                    const cmplx a0 = A0_all[((size_t) data_idx * nchannels + c) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
-                    const cmplx a1 = A1_all[((size_t) data_idx * nchannels + c) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
-                    d_h_raw += a0 * r + a1 * dr;
-                }
-            }
-        }
-        if (tdi_type == 0) {
-            for (int c = 0; c < nchannels; ++c) for (int c2 = 0; c2 < nchannels; ++c2)
-                for (int im = 0; im < M; ++im) {
-                    const int m_local = m_active[im] - ind_min_f;
-                    for (int b = 0; b < N_sparse_t; ++b) {
-                        const cmplx r_c  = r_sparse[(size_t) c  * M * N_sparse_t + (size_t) im * N_sparse_t + b];
-                        const cmplx r_c2 = r_sparse[(size_t) c2 * M * N_sparse_t + (size_t) im * N_sparse_t + b];
-                        const cmplx dr_c  = dr_sparse[(size_t) c  * M * N_sparse_t + (size_t) im * N_sparse_t + b];
-                        const cmplx dr_c2 = dr_sparse[(size_t) c2 * M * N_sparse_t + (size_t) im * N_sparse_t + b];
-                        const cmplx b0 = B0_all[(((size_t) data_idx * nchannels + c) * nchannels + c2) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
-                        const cmplx b1 = B1_all[(((size_t) data_idx * nchannels + c) * nchannels + c2) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
-                        const cmplx r_outer = gcmplx::conj(r_c) * r_c2;
-                        const cmplx cross_drr = gcmplx::conj(r_c) * dr_c2 + gcmplx::conj(dr_c) * r_c2;
-                        h_h_raw += b0 * r_outer + b1 * cross_drr;
-                        if (project_real) {
-                            const cmplx b0nc = B0nc_all[(((size_t) data_idx * nchannels + c) * nchannels + c2) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
-                            const cmplx b1nc = B1nc_all[(((size_t) data_idx * nchannels + c) * nchannels + c2) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
-                            // nonconj pairing r_c*r_c2 (NOT conj) -> with the conj
-                            // term, 0.5*Re(...) is the real WDM projection.
-                            h_h_raw += b0nc * (r_c * r_c2)
-                                     + b1nc * (r_c * dr_c2 + dr_c * r_c2);
-                        }
-                    }
-                }
-        } else {
-            for (int c = 0; c < nchannels; ++c) for (int im = 0; im < M; ++im) {
-                const int m_local = m_active[im] - ind_min_f;
-                for (int b = 0; b < N_sparse_t; ++b) {
-                    const cmplx r  = r_sparse[ (size_t) c * M * N_sparse_t + (size_t) im * N_sparse_t + b];
-                    const cmplx dr = dr_sparse[(size_t) c * M * N_sparse_t + (size_t) im * N_sparse_t + b];
-                    const cmplx b0 = B0_all[((size_t) data_idx * nchannels + c) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
-                    const cmplx b1 = B1_all[((size_t) data_idx * nchannels + c) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
-                    const double rsq = (gcmplx::conj(r) * r).real();
-                    const cmplx cross_drr = gcmplx::conj(r) * dr + gcmplx::conj(dr) * r;
-                    h_h_raw += b0 * rsq + b1 * cross_drr;
-                    if (project_real) {
-                        const cmplx b0nc = B0nc_all[((size_t) data_idx * nchannels + c) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
-                        const cmplx b1nc = B1nc_all[((size_t) data_idx * nchannels + c) * Nf_active * N_sparse_t + (size_t) m_local * N_sparse_t + b];
-                        h_h_raw += b0nc * (r * r) + b1nc * (r * dr + dr * r);
-                    }
-                }
-            }
-        }
-
-        d_h_out[bin] = 0.5 * d_h_raw.real();
-        h_h_out[bin] = 0.5 * h_h_raw.real();
+        double dh_partial = 0.0, hh_partial = 0.0;
+        gb_signal_het_consume_one_source(
+            &dh_partial, &hh_partial,
+            X_het_all + (size_t) bin * nchannels * N_sparse_fd,
+            N_sparse_fd, /*fft_order_scale=*/0.0,
+            k_f0_all[bin],
+            params_cand_all[(size_t) bin * nparams + f0_idx],
+            c0_sparse_all, A0_all, A1_all, B0_all, B1_all,
+            B0nc_all, B1nc_all,
+            wdm_window, n_sparse_local_arr,
+            data_index_all[bin],
+            Nf, Nt, Nf_active,
+            Nt_layer, N_sparse_t, stride,
+            ind_min_t, ind_min_f,
+            m_active_half_width,
+            layer_df, dt,
+            nchannels, tdi_type,
+            max_r, project_real,
+            fold_s.data(), c1_sparse.data(),
+            r_sparse.data(), dr_sparse.data());
+        d_h_out[bin] = 0.5 * dh_partial;
+        h_h_out[bin] = 0.5 * hh_partial;
     }
+#endif
 }
 
 
@@ -2317,17 +2443,116 @@ void GBComputationGroup::gb_signal_het_get_ll_sparse_wrap(
 // ============================================================================
 // Signal-heterodyne (v2 polyphase) -- Stage 2b: IN-KERNEL sparse-FD entry.
 //
-// Fuses the existing gb_run_fd_wave_tdi_wrap (sparse heterodyned rfft) with
-// the Stage 2a polyphase + bin-fold pipeline. Per-source X_het is allocated
-// transiently inside this call (heap on CPU; per-block shared memory on GPU
-// at Stage 3). NO per-source FD storage in global memory.
+// Fuses the existing gb_run_fd_wave_tdi machinery (sparse heterodyned rfft)
+// with the Stage 2a polyphase + bin-fold pipeline. NO per-source FD storage
+// in global memory.
 //
 // CPU implementation: two-pass for clarity --
 //   (1) gb_run_fd_wave_tdi_wrap fills X_het + k_f0 buffers
 //   (2) gb_signal_het_get_ll_sparse_wrap consumes those buffers
 //
-// GPU Stage 3 will fuse these into a single kernel with X_het in __shared__.
+// GPU implementation (Stage 3, the in-model hot path): ONE fused kernel,
+// block per candidate binary --
+//   (1) gbfd_build_one_source builds the heterodyned FD `tdi_chan` entirely
+//       in shared memory (the existing, validated producer);
+//   (2) gb_signal_het_consume_one_source reads `tdi_chan` DIRECTLY from
+//       shared with fft_order_scale = 1/dt (the fftshift + Riemann 1/dt
+//       conversion of the CPU two-pass folded into the read -- numerically
+//       the identical multiply), with its fold/c1/r/dr scratch OVERLAID on
+//       the amp/phase/phi_ref/get_tdi regions of the build slab, which are
+//       dead once the producer returns. `tdi_chan` itself (= X_het) is
+//       preserved. Shared budget = max(build slab, tdi_chan end + consumer
+//       scratch) -- at defaults this is exactly the existing FD kernel's
+//       footprint.
 // ============================================================================
+
+#ifdef __CUDACC__
+CUDA_KERNEL
+void gb_signal_het_get_ll_in_kernel_kernel(
+    GBTDIonTheFly *tdi_on_fly,
+    double *d_h_out, double *h_h_out,
+    cmplx  *c0_sparse_all,
+    cmplx  *A0_all, cmplx *A1_all,
+    cmplx  *B0_all, cmplx *B1_all,
+    cmplx  *B0nc_all, cmplx *B1nc_all,
+    double *wdm_window, int *n_sparse_local_arr,
+    double *params_cand_all, int *data_index_all,
+    int num_bin, int nparams, int f0_idx,
+    int Nf, int Nt, int Nf_active,
+    int Nt_layer, int N_sparse_t, int stride,
+    int ind_min_t, int ind_min_f, int m_active_half_width,
+    double layer_df, double dt, double T_obs, double t_start,
+    int nchannels, int tdi_type,
+    int N_sparse_fd, int log2N,
+    double tukey_alpha, double max_r, int project_real,
+    size_t consumer_offset)
+{
+    extern CUDA_SHARED char shared_mem[];
+    CUDA_SHARED double d_h_tmp[NUM_THREADS_HERE];
+    CUDA_SHARED double h_h_tmp[NUM_THREADS_HERE];
+
+    GBTDIonTheFly tof(tdi_on_fly->orbits, tdi_on_fly->tdi_config,
+                      tdi_on_fly->T, tdi_on_fly->t_ref);
+
+    const int M = 2 * m_active_half_width + 1;
+
+    for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X)
+    {
+        cmplx *tdi_chan = NULL;
+        int    kf0      = 0;
+        double f0g      = 0.0;
+        double dts      = 0.0;
+        gbfd_build_one_source(&tof, (void*) shared_mem, params_cand_all,
+                              t_start, T_obs,
+                              N_sparse_fd, nchannels, nparams, bin_i, log2N,
+                              &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, 0.0);
+
+        // Consumer scratch: overlay onto the build slab right after
+        // tdi_chan (amp/phase/phi_ref/get_tdi scratch are dead now).
+        char  *cur    = shared_mem + consumer_offset;
+        cmplx *fold_s = (cmplx*) cur;
+        cur += (size_t) nchannels * M * Nt_layer * sizeof(cmplx);
+        cmplx *c1_s   = (cmplx*) cur;
+        cur += (size_t) nchannels * M * N_sparse_t * sizeof(cmplx);
+        cmplx *r_s    = (cmplx*) cur;
+        cur += (size_t) nchannels * M * N_sparse_t * sizeof(cmplx);
+        cmplx *dr_s   = (cmplx*) cur;
+
+        double dh_partial = 0.0, hh_partial = 0.0;
+        gb_signal_het_consume_one_source(
+            &dh_partial, &hh_partial,
+            tdi_chan, N_sparse_fd, /*fft_order_scale=*/1.0 / dt,
+            kf0,
+            params_cand_all[(size_t) bin_i * nparams + f0_idx],
+            c0_sparse_all, A0_all, A1_all, B0_all, B1_all,
+            B0nc_all, B1nc_all,
+            wdm_window, n_sparse_local_arr,
+            data_index_all[bin_i],
+            Nf, Nt, Nf_active,
+            Nt_layer, N_sparse_t, stride,
+            ind_min_t, ind_min_f,
+            m_active_half_width,
+            layer_df, dt,
+            nchannels, tdi_type,
+            max_r, project_real,
+            fold_s, c1_s, r_s, dr_s);
+
+        const int tid = threadIdx.x;
+        d_h_tmp[tid] = dh_partial;
+        h_h_tmp[tid] = hh_partial;
+        CUDA_SYNC_THREADS;
+
+        const double dh_sum = block_reduce(d_h_tmp);
+        const double hh_sum = block_reduce(h_h_tmp);
+        if (THREAD_ZERO)
+        {
+            d_h_out[bin_i] = 0.5 * dh_sum;
+            h_h_out[bin_i] = 0.5 * hh_sum;
+        }
+        CUDA_SYNC_THREADS;
+    }
+}
+#endif
 
 void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
     GBTDIonTheFly *tdi_on_fly,
@@ -2352,13 +2577,105 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
     int     nchannels, int tdi_type,
     int     N_sparse_fd, double tukey_alpha, double max_r, int project_real)
 {
+    // Validate the polyphase divisibility contract in ONE place for both
+    // builds: the fold identity `iFFT_Nt sub-sampled at stride == fold mod
+    // Nt_layer + iFFT_Nt_layer` requires Nt == Nt_layer * stride exactly.
+    if (Nt_layer * stride != Nt) {
+        throw std::invalid_argument(
+            "[gb_signal_het_get_ll_in_kernel_wrap] Nt_layer * stride != Nt -- "
+            "the polyphase fold requires Nt_layer to divide Nt exactly. "
+            "Snap nt_layer to a divisor of the WDM Nt.");
+    }
+
 #ifdef __CUDACC__
-    throw std::runtime_error(
-        "[gb_signal_het_get_ll_in_kernel_wrap] GPU implementation is a TODO -- the v2 signal-het CUDA "
-        "kernels are not implemented yet. Construct the Python class with "
-        "force_backend=\"cpu\" until then. (Silent zero-return previously "
-        "masqueraded as a successful call -- see the audit at GBGPU 2026-06-06.)");
-#endif
+    // Fused single kernel (see the header comment above). Same
+    // host->device upload + >48KB shared handling as gb_run_fd_wave_tdi_wrap.
+    int log2N = 0;
+    {
+        int m = N_sparse_fd;
+        while ((m & 1) == 0 && m > 1) { m >>= 1; ++log2N; }
+        if (m != 1) {
+            throw std::invalid_argument(
+                "[gb_signal_het_get_ll_in_kernel_wrap] N_sparse_fd must be a "
+                "power of two (radix-2 FFT in gbfd_build_one_source).");
+        }
+    }
+
+    GBTDIonTheFly *gb_host = new GBTDIonTheFly(
+        tdi_on_fly->orbits, tdi_on_fly->tdi_config,
+        tdi_on_fly->T, tdi_on_fly->t_ref);
+
+    Orbits *d_orbits;
+    cudaMalloc(&d_orbits, sizeof(Orbits));
+    gpuErrchk(cudaMemcpy(d_orbits, tdi_on_fly->orbits, sizeof(Orbits),
+                         cudaMemcpyHostToDevice));
+
+    TDIConfig *d_tdi_config;
+    cudaMalloc(&d_tdi_config, sizeof(TDIConfig));
+    gpuErrchk(cudaMemcpy(d_tdi_config, tdi_on_fly->tdi_config, sizeof(TDIConfig),
+                         cudaMemcpyHostToDevice));
+
+    gb_host->orbits     = d_orbits;
+    gb_host->tdi_config = d_tdi_config;
+
+    GBTDIonTheFly *d_gb;
+    cudaMalloc(&d_gb, sizeof(GBTDIonTheFly));
+    gpuErrchk(cudaMemcpy(d_gb, gb_host, sizeof(GBTDIonTheFly),
+                         cudaMemcpyHostToDevice));
+
+    // Shared budget: the build slab, with the consumer scratch OVERLAID on
+    // the dead post-tdi_chan region. consumer_offset = end of tdi_chan
+    // within gbfd_build_one_source's carve (params + t_arr + tdi_chan).
+    const int    M_here = 2 * m_active_half_width + 1;
+    const size_t consumer_offset =
+          (size_t) N_PARAMS_MAX * sizeof(double)
+        + (size_t) N_sparse_fd * sizeof(double)
+        + (size_t) nchannels * N_sparse_fd * sizeof(cmplx);
+    const size_t consumer_bytes =
+        ((size_t) nchannels * M_here * Nt_layer
+         + 3 * (size_t) nchannels * M_here * N_sparse_t) * sizeof(cmplx);
+    const int build_bytes =
+        tdi_on_fly->get_gb_fd_buffer_size(N_sparse_fd, nchannels);
+    int shared_bytes = build_bytes;
+    if ((int) (consumer_offset + consumer_bytes) > shared_bytes)
+        shared_bytes = (int) (consumer_offset + consumer_bytes);
+
+    if (shared_bytes > 48 * 1024)
+    {
+        cudaFuncSetAttribute(
+            gb_signal_het_get_ll_in_kernel_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+    }
+
+    gb_signal_het_get_ll_in_kernel_kernel<<<num_bin, NUM_THREADS_HERE,
+                                            shared_bytes>>>(
+        d_gb, d_h_out, h_h_out,
+        c0_sparse_all, A0_all, A1_all, B0_all, B1_all,
+        B0nc_all, B1nc_all,
+        wdm_window, n_sparse_local_arr,
+        params_cand_all, data_index_all,
+        num_bin, nparams, f0_idx,
+        Nf, Nt, Nf_active,
+        Nt_layer, N_sparse_t, stride,
+        ind_min_t, ind_min_f, m_active_half_width,
+        layer_df, dt, T_obs, t_start,
+        nchannels, tdi_type,
+        N_sparse_fd, log2N,
+        tukey_alpha, max_r, project_real,
+        consumer_offset);
+
+    cudaDeviceSynchronize();
+    gpuErrchk(cudaGetLastError());
+
+    gpuErrchk(cudaFree(d_orbits));
+    gpuErrchk(cudaFree(d_tdi_config));
+    gpuErrchk(cudaFree(d_gb));
+    delete gb_host;
+
+    (void) params_ref_all; (void) fdot_idx; (void) num_data; (void) Nt_active;
+    return;
+#else
 
     std::vector<cmplx>  X_het_raw((size_t) num_bin * nchannels * N_sparse_fd);
     std::vector<int>    k_f0_buf(num_bin);
@@ -2418,6 +2735,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
         layer_df, dt,
         nchannels, tdi_type,
         N_sparse_fd, max_r, project_real);
+#endif
 }
 
 
@@ -2427,10 +2745,180 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
 // Emits the reference WDM c0 FROM THE BACKEND (replaces the Python polyphase
 // _compute_sparse_complex_wdm). Runs gb_run_fd_wave_tdi on the REFERENCE params,
 // then the SAME polyphase fold + iFFT as gb_signal_het_get_ll_sparse_wrap, but
-// over ALL Nf_active layers and at BOTH the sparse grid (c0_sparse_out, consumed
+// over ALL window layers and at BOTH the sparse grid (c0_sparse_out, consumed
 // by get_ll) and full Nt resolution (c0_dense_out, consumed by the bin-fold /
-// fill_global). CPU-only (GPU TODO, like the sibling sig-het wraps).
+// fill_global).
+//
+// GPU implementation (setup path, once per in-model block + drift refresh):
+//   (1) gb_run_fd_wave_tdi_wrap (already GPU) -> X_het_raw / k_f0 in a
+//       transient device buffer;
+//   (2) gb_signal_het_make_reference_kernel: one block per
+//       (d, c, m_local) triple; blocks outside the reference's +-window
+//       exit immediately (outputs pre-zeroed with cudaMemset, matching the
+//       CPU std::fill contract). Each block mirrors the CPU loops: the
+//       raw->centered fftshift + 1/dt conversion is folded into the shared
+//       X-window load; the sparse fold uses the same gather-by-slot order
+//       (increasing j) and the same centered-j_off prephase; the dense iDFT
+//       uses the same length-Nt twiddle table (built cooperatively in
+//       shared) with the natural-j prephase and NO (-1)^n -- the two
+//       distinct conventions of the CPU implementation, kept exactly.
 // ============================================================================
+
+#ifdef __CUDACC__
+CUDA_KERNEL
+void gb_signal_het_make_reference_kernel(
+    cmplx  *c0_sparse_out,
+    cmplx  *c0_dense_out,
+    cmplx  *X_het_raw,          // (num_data, nch, N_sparse_fd) FFT-order
+    int    *k_f0_buf,           // (num_data,)
+    double *wdm_window,
+    int    *n_sparse_local_arr,
+    int     num_data,
+    int     Nf, int Nt, int Nf_active, int Nt_active,
+    int     Nt_layer, int N_sparse_t, int stride,
+    int     ind_min_t, int ind_min_f,
+    double  dt,
+    int     nchannels,
+    int     N_sparse_fd)
+{
+    extern CUDA_SHARED char shared_mem[];
+
+    const double TWO_PI  = 2.0 * M_PI;
+    const cmplx  I_c     = cmplx(0.0, 1.0);
+    const int    half_Nt = Nt / 2;
+    const int    half_NS = N_sparse_fd / 2;
+    const double kappa   = 2.0 * sqrt(M_PI * dt) / (double) Nf;
+    const int    n_start = ind_min_t + n_sparse_local_arr[0];
+    const double dt_inv  = 1.0 / dt;
+
+    // Shared carve: tw[Nt] twiddle table + Xw[N_sparse_fd] windowed
+    // X-slice + fold_s[Nt_layer] sparse fold.
+    char  *cur    = shared_mem;
+    cmplx *tw     = (cmplx*) cur;  cur += (size_t) Nt * sizeof(cmplx);
+    cmplx *Xw     = (cmplx*) cur;  cur += (size_t) N_sparse_fd * sizeof(cmplx);
+    cmplx *fold_s = (cmplx*) cur;
+
+    const long n_blocks = (long) num_data * nchannels * Nf_active;
+    for (long blk = BLOCK_START_X; blk < n_blocks; blk += GRID_INCR_X)
+    {
+        const int d       = (int) (blk / ((long) nchannels * Nf_active));
+        const int c       = (int) ((blk / Nf_active) % nchannels);
+        const int m_local = (int) (blk % Nf_active);
+
+        const int k_f0 = k_f0_buf[d];
+        // Same +-1-layer-slack window as the CPU loop (truncating integer
+        // division kept verbatim).
+        const int m_lo = max(0, (k_f0 - half_NS) / half_Nt - 1 - ind_min_f);
+        const int m_hi = min(Nf_active - 1,
+                             (k_f0 + half_NS - 1) / half_Nt + 1 - ind_min_f);
+        if (m_local < m_lo || m_local > m_hi) continue;
+
+        const int m_global = ind_min_f + m_local;
+        const int j_base   = k_f0 - half_NS + half_Nt - m_global * half_Nt;
+
+        // Any nonzero fold input at all? (CPU nz_j-emptiness guard.)
+        // j range intersect [0, Nt): i in [i_lo, i_hi].
+        const int i_lo = (j_base < 0) ? -j_base : 0;
+        const int i_hi = ((j_base + N_sparse_fd) > Nt ? Nt - j_base
+                                                      : N_sparse_fd) - 1;
+        if (i_lo > i_hi) continue;
+
+        // ---- cooperative shared setup --------------------------------
+        for (int k = THREAD_START_X; k < Nt; k += BLOCK_INCR_X)
+            tw[k] = gcmplx::exp(I_c * (TWO_PI * (double) k / (double) Nt));
+        // Xw[i] = centered/scaled X * window at j = j_base + i (zero
+        // outside the valid j range or where the raw X is zero).
+        for (int i = THREAD_START_X; i < N_sparse_fd; i += BLOCK_INCR_X)
+        {
+            cmplx v(0.0, 0.0);
+            const int j = j_base + i;
+            if (j >= 0 && j < Nt)
+            {
+                const int m_signed = i - half_NS;
+                const int m_fft    = (m_signed >= 0) ? m_signed
+                                                     : (m_signed + N_sparse_fd);
+                const cmplx Xi = X_het_raw[((size_t) d * nchannels + c)
+                                           * N_sparse_fd + m_fft] * dt_inv;
+                if (!(Xi.real() == 0.0 && Xi.imag() == 0.0))
+                    v = Xi * wdm_window[j];
+            }
+            Xw[i] = v;
+        }
+        // Sparse fold: gather per slot rr over j = rr + q*Nt_layer
+        // (increasing j = the CPU's increasing-i summation order), with
+        // the CPU's centered-j_off prephase.
+        for (int rr = THREAD_START_X; rr < Nt_layer; rr += BLOCK_INCR_X)
+        {
+            cmplx acc(0.0, 0.0);
+            for (int j = rr; j < Nt; j += Nt_layer)
+            {
+                const int i = j - j_base;
+                if (i < 0 || i >= N_sparse_fd) continue;
+                const cmplx w = Xw[i];
+                if (w.real() == 0.0 && w.imag() == 0.0) continue;
+                const int    j_off = j - half_Nt;
+                const cmplx  ph_s  = gcmplx::exp(I_c * (TWO_PI * (double) j_off
+                                        * (double) n_start / (double) Nt));
+                acc += w * ph_s;
+            }
+            fold_s[rr] = acc;
+        }
+        CUDA_SYNC_THREADS;
+
+        // ---- SPARSE iFFT (length Nt_layer, N_sparse_t outputs) -------
+        for (int n_layer = THREAD_START_X; n_layer < N_sparse_t;
+             n_layer += BLOCK_INCR_X)
+        {
+            cmplx acc(0.0, 0.0);
+            for (int rr = 0; rr < Nt_layer; ++rr)
+                acc += fold_s[rr] * gcmplx::exp(I_c * (TWO_PI * (double) rr
+                                    * (double) n_layer / (double) Nt_layer));
+            acc *= (1.0 / (double) Nt_layer);
+            const int    n_global   = n_start + n_layer * stride;
+            const double sign_scale = ((n_global & 1) ? -1.0 : 1.0)
+                                      / (double) stride;
+            const int    m_plus_n   = (m_global + n_global) & 1;
+            const cmplx  conj_cmn   = (m_plus_n == 0) ? cmplx(1.0, 0.0)
+                                                      : cmplx(0.0, -1.0);
+            const double sign_mn    = (((m_global + 1) * n_global) & 1)
+                                          ? -1.0 : 1.0;
+            c0_sparse_out[(((size_t) d * nchannels + c) * Nf_active + m_local)
+                          * N_sparse_t + n_layer]
+                = acc * sign_scale * (kappa * sign_mn * conj_cmn);
+        }
+
+        // ---- DENSE iDFT (Nt_active outputs, origin ind_min_t) --------
+        // CPU convention: fold_d[j] = Xw[i] * twn(j * ind_min_t), then
+        // acc = sum_j fold_d[j] * twn(j * n); natural-j prephase, no
+        // (-1)^n. Summation over increasing j = increasing i.
+        for (int n = THREAD_START_X; n < Nt_active; n += BLOCK_INCR_X)
+        {
+            cmplx acc(0.0, 0.0);
+            for (int i = i_lo; i <= i_hi; ++i)
+            {
+                const cmplx w = Xw[i];
+                if (w.real() == 0.0 && w.imag() == 0.0) continue;
+                const long j = (long) (j_base + i);
+                long a1 = (j * (long) ind_min_t) % Nt; if (a1 < 0) a1 += Nt;
+                long a2 = (j * (long) n) % Nt;         if (a2 < 0) a2 += Nt;
+                acc += w * tw[a1] * tw[a2];
+            }
+            acc *= (1.0 / (double) Nt);
+            const int    n_global = ind_min_t + n;
+            const int    m_plus_n = (m_global + n_global) & 1;
+            const cmplx  conj_cmn = (m_plus_n == 0) ? cmplx(1.0, 0.0)
+                                                    : cmplx(0.0, -1.0);
+            const double sign_mn  = (((m_global + 1) * n_global) & 1)
+                                        ? -1.0 : 1.0;
+            c0_dense_out[(((size_t) d * nchannels + c) * Nf_active + m_local)
+                         * Nt_active + n]
+                = acc * (kappa * sign_mn * conj_cmn);
+        }
+        CUDA_SYNC_THREADS;
+    }
+}
+#endif
+
 void GBComputationGroup::gb_signal_het_make_reference_wrap(
     GBTDIonTheFly *tdi_on_fly,
     cmplx  *c0_sparse_out,
@@ -2450,11 +2938,81 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
 {
     (void) f0_idx; (void) fdot_idx; (void) layer_df;
 
+    if (Nt_layer * stride != Nt) {
+        throw std::invalid_argument(
+            "[gb_signal_het_make_reference_wrap] Nt_layer * stride != Nt -- "
+            "the polyphase fold requires Nt_layer to divide Nt exactly. "
+            "Snap nt_layer to a divisor of the WDM Nt.");
+    }
+
 #ifdef __CUDACC__
-    throw std::runtime_error(
-        "[gb_signal_het_make_reference_wrap] GPU implementation is a TODO -- the v2 "
-        "signal-het CUDA kernels are not implemented yet. Construct the Python class "
-        "with force_backend=\"cpu\" until then.");
+    {
+        int m = N_sparse_fd;
+        while ((m & 1) == 0 && m > 1) m >>= 1;
+        if (m != 1) {
+            throw std::invalid_argument(
+                "[gb_signal_het_make_reference_wrap] N_sparse_fd must be a "
+                "power of two (radix-2 FFT in gbfd_build_one_source).");
+        }
+    }
+
+    // (1) FD-heterodyne of the reference sources -- transient device buffers.
+    cmplx  *d_X_het_raw;
+    int    *d_k_f0;
+    double *d_f0_grid;
+    gpuErrchk(cudaMalloc(&d_X_het_raw,
+        (size_t) num_data * nchannels * N_sparse_fd * sizeof(cmplx)));
+    gpuErrchk(cudaMalloc(&d_k_f0, (size_t) num_data * sizeof(int)));
+    gpuErrchk(cudaMalloc(&d_f0_grid, (size_t) num_data * sizeof(double)));
+
+    gb_run_fd_wave_tdi_wrap(
+        tdi_on_fly,
+        d_X_het_raw, d_k_f0, d_f0_grid,
+        params_ref_all, t_start, T_obs,
+        N_sparse_fd, num_data, nparams, nchannels,
+        tukey_alpha);
+
+    // (2) fold + iFFT/iDFT kernel. Pre-zero the outputs (the CPU branch's
+    // std::fill contract; window-external blocks never write).
+    const size_t n_sparse_tot = (size_t) num_data * nchannels
+                                * Nf_active * N_sparse_t;
+    const size_t n_dense_tot  = (size_t) num_data * nchannels
+                                * Nf_active * Nt_active;
+    gpuErrchk(cudaMemset(c0_sparse_out, 0, n_sparse_tot * sizeof(cmplx)));
+    gpuErrchk(cudaMemset(c0_dense_out,  0, n_dense_tot  * sizeof(cmplx)));
+
+    const int shared_bytes = (int) (((size_t) Nt + (size_t) N_sparse_fd
+                                     + (size_t) Nt_layer) * sizeof(cmplx));
+    if (shared_bytes > 48 * 1024)
+    {
+        cudaFuncSetAttribute(
+            gb_signal_het_make_reference_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+    }
+
+    const long n_blocks = (long) num_data * nchannels * Nf_active;
+    const int  grid_x   = (int) ((n_blocks < 65535L) ? n_blocks : 65535L);
+    gb_signal_het_make_reference_kernel<<<grid_x, NUM_THREADS_HERE,
+                                          shared_bytes>>>(
+        c0_sparse_out, c0_dense_out,
+        d_X_het_raw, d_k_f0,
+        wdm_window, n_sparse_local_arr,
+        num_data,
+        Nf, Nt, Nf_active, Nt_active,
+        Nt_layer, N_sparse_t, stride,
+        ind_min_t, ind_min_f,
+        dt,
+        nchannels,
+        N_sparse_fd);
+
+    cudaDeviceSynchronize();
+    gpuErrchk(cudaGetLastError());
+
+    gpuErrchk(cudaFree(d_X_het_raw));
+    gpuErrchk(cudaFree(d_k_f0));
+    gpuErrchk(cudaFree(d_f0_grid));
+    return;
 #endif
 
     const double TWO_PI  = 2.0 * M_PI;
