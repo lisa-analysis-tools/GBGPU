@@ -2976,6 +2976,11 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
     }
 
 #ifdef __CUDACC__
+    // GPU path — its own block scope so locals (n_sparse_tot, n_dense_tot, ...)
+    // don't collide with the identically-named CPU-tail locals below: nvcc also
+    // compiles the CPU tail as (unreachable) host code after the early return,
+    // and both branches share the function scope otherwise.
+    {
     {
         int m = N_sparse_fd;
         while ((m & 1) == 0 && m > 1) m >>= 1;
@@ -3043,6 +3048,7 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
     gpuErrchk(cudaFree(d_k_f0));
     gpuErrchk(cudaFree(d_f0_grid));
     return;
+    }  // end GPU-path block scope
 #endif
 
     const double TWO_PI  = 2.0 * M_PI;
