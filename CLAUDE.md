@@ -34,6 +34,25 @@ GB-specific physics on top of it.
   GBTDIonTheFly + GBComputationGroup + gb_wdm_het_* kernels.
 - `find_package(pybind11 CONFIG)` added to project-root `CMakeLists.txt`;
   `pybind11` added to `pyproject.toml`'s build-system requires.
+- **`GBGPU_CUDA_ARCH` defaults to `80;90` (2026-07-28)** — was `"native"`, which
+  needs CMake to see a GPU at *configure* time. On a GPU-less cluster
+  build/login node that detection falls through to nvcc's own default (sm_52),
+  which is below the **sm_60 floor for `atomicAdd(double*, double)`** — so
+  `gb_tdi_on_the_fly.cu` (`gb_fd_fill_global`) and LAT's
+  `lat_chunked_het_kernels.hh` (`wdm_het_fill_global_impl`) fail with *"no
+  instance of overloaded function atomicAdd matches (double*, double)"*. LAT
+  never hit this because its own CMakeLists hardcodes `70;75;80;86;90`, and
+  `install.sh` passes no arch flag — so each repo used its own default.
+  A configure-time `FATAL_ERROR` now rejects any arch < 60 up front.
+
+  `80;90` is deliberately narrower than LAT's list: CUDA guarantees binary
+  compatibility forward across *minor* revisions within a major generation, so
+  the sm_80 cubin also covers sm_86 (A40/A6000/RTX30) and sm_89 (Ada/L40).
+  **Not** covered: sm_70 (V100), sm_75 (Turing) — those need
+  `-DGBGPU_CUDA_ARCH=70` or they fail at *runtime* with "no kernel image is
+  available for execution on the device". No PTX entry is emitted, so future
+  majors need an explicit value too. Note GPUBackendTools still defaults to
+  `native` and carries the same latent exposure.
 - **`GBGPU_WITH_SHAREDMEM` (default `ON`, 2026-07-28)** — compiles the legacy
   `SharedMemoryGBGPU.cu` kernel family into `cgbgpu`. It is 4k lines of
   heavily-templated CUDA and the repo's **only** `#include <cufftdx.hpp>`, so

@@ -80,11 +80,18 @@ option(
 # GBGPU_CUDA_ARCH will be passed as the CUDA_ARCHITECTURES property for the CUDA
 # backend if it is compiled. See the documentation of CUDA_ARCHITECTURES:
 # https://cmake.org/cmake/help/latest/prop_tgt/CUDA_ARCHITECTURES.html
-set(
-  GBGPU_CUDA_ARCH "native"
-  CACHE STRING "CUDA Architecture targetted for GBGPU compilation (see doc of \
-          CMAKE_CUDA_ARCHITECTURES)."
-)
+#
+# The default is set below (after CUDAToolkit is found) to "80;90" -- Ampere +
+# Hopper, the sprint's GPU targets -- rather than "native". "native" needs
+# CMake to see a GPU at configure time; on a cluster BUILD/LOGIN node with no
+# visible device that detection fails and nvcc silently falls back to its own
+# default (sm_52 on CUDA 12.x) -- which is below the sm_60 required for
+# `atomicAdd(double*, double)`, so gb_tdi_on_the_fly.cu and LAT's
+# lat_chunked_het_kernels.hh fail to compile with "no instance of overloaded
+# function atomicAdd matches (double*, double)".
+#
+# Pass -DGBGPU_CUDA_ARCH=<arch> to override (70=V100, 75=Turing, 80=A100,
+# 90=H100); a single arch builds fastest. V100/Turing are NOT in the default.
 
 set(
   GBGPU_MARCH "native"
@@ -164,6 +171,58 @@ get_target_property(_GBGPU_WITH_GPU gbgpu WITH_GPU)
 if(_GBGPU_WITH_GPU)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+
+  # Default: sm_80 (Ampere) + sm_90 (Hopper) -- the sprint's actual GPU targets.
+  # Deliberately NARROWER than LISAanalysistools' "70;75;80;86;90": two archs
+  # instead of five roughly halves an already-slow nvcc build, and CUDA binary
+  # compatibility is guaranteed forward across MINOR revisions within a major
+  # generation, so the sm_80 cubin also covers sm_86 (A40/A6000/RTX30) and
+  # sm_89 (Ada/L40). NOT covered: sm_70 (V100) and sm_75 (Turing) -- those need
+  # an explicit -DGBGPU_CUDA_ARCH=70 or they fail at RUNTIME with "no kernel
+  # image is available for execution on the device". There is no PTX entry, so
+  # future majors (sm_100+) also need an explicit value.
+  #
+  # This is the fix for the "native" default: "native" needs CMake to see a GPU
+  # at CONFIGURE time, and on a GPU-less build/login node nvcc falls back to
+  # sm_52 -- below the sm_60 floor below.
+  set(DEFAULT_ARCHS "80;90")
+
+  set(
+    GBGPU_CUDA_ARCH "${DEFAULT_ARCHS}"
+    CACHE STRING "CUDA Architectures targeted for GBGPU compilation (see doc of \
+            CMAKE_CUDA_ARCHITECTURES)."
+  )
+
+  # An explicitly-passed -DGBGPU_CUDA_ARCH= wins (it is already in the cache);
+  # guard only against an EMPTY value, which would leave the target property
+  # unset and hand the choice to nvcc's sm_52 default.
+  if(NOT GBGPU_CUDA_ARCH)
+    set(GBGPU_CUDA_ARCH "${DEFAULT_ARCHS}" CACHE STRING
+        "CUDA Architectures targeted for GBGPU compilation (see doc of \
+            CMAKE_CUDA_ARCHITECTURES)." FORCE)
+  endif()
+
+  # sm_60 is the floor for atomicAdd(double*, double), used by the chunked-het
+  # fill_global kernels. Fail LOUDLY at configure time rather than with a wall
+  # of nvcc overload-resolution notes.
+  foreach(_arch IN LISTS GBGPU_CUDA_ARCH)
+    string(REGEX MATCH "^[0-9]+" _arch_num "${_arch}")
+    if(_arch_num AND _arch_num LESS 60)
+      message(FATAL_ERROR
+        "GBGPU_CUDA_ARCH contains '${_arch}', below sm_60. The chunked-het "
+        "fill_global kernels use atomicAdd(double*, double), which requires "
+        "compute capability >= 6.0. Use e.g. -DGBGPU_CUDA_ARCH=80 (A100), "
+        "90 (H100), or 70 (V100).")
+    endif()
+  endforeach()
+
+  # Also seed the GLOBAL default, as LAT does. Every GPU target today gets the
+  # CUDA_ARCHITECTURES property explicitly (apply_gpu_backend_common_options +
+  # gbgpu_gpu_cgbgpu), but a target added later without it would otherwise
+  # silently inherit nvcc's sm_52 and reproduce the atomicAdd(double*) failure.
+  set(CMAKE_CUDA_ARCHITECTURES ${GBGPU_CUDA_ARCH})
+
+  message(STATUS "GBGPU CUDA Architectures set to: ${GBGPU_CUDA_ARCH}")
 endif()
 
 # ---- Include sources ----
