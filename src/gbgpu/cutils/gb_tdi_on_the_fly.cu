@@ -2874,6 +2874,18 @@ void gb_signal_het_make_reference_kernel(
             }
             Xw[i] = v;
         }
+        // REQUIRED barrier: the fold below is a GATHER -- thread rr reads
+        // Xw[j - j_base] for every j = rr + q*Nt_layer, i.e. entries written
+        // by OTHER threads in the loops above (and tw[] likewise). Without
+        // this sync those reads race the writes and pick up stale/uninitialized
+        // shared memory, which propagates into fold_s -> c0_sparse_out.
+        //
+        // The dense iDFT further down was already safe by accident: it reads
+        // the same Xw/tw but only AFTER the fold's trailing sync. That is why
+        // the bug showed up as c0_sparse_out garbage while c0_dense_out (and
+        // therefore every A0/A1/B0/B1/B0nc/B1nc coefficient derived from it)
+        // compared clean against the CPU.
+        CUDA_SYNC_THREADS;
         // Sparse fold: gather per slot rr over j = rr + q*Nt_layer
         // (increasing j = the CPU's increasing-i summation order), with
         // the CPU's centered-j_off prephase.
