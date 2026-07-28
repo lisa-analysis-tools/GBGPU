@@ -11,6 +11,25 @@
 # GPU backend need to be compiled. Let's retrieve these information here:
 get_target_property(GBGPU_WITH_CPU gbgpu WITH_CPU)
 get_target_property(GBGPU_WITH_GPU gbgpu WITH_GPU)
+# Legacy SharedMemoryGBGPU.cu kernels + their cuFFTDx dependency (see the
+# GBGPU_WITH_SHAREDMEM option in the project-root CMakeLists.txt).
+get_target_property(GBGPU_WITH_SHAREDMEM gbgpu WITH_SHAREDMEM)
+
+# Source lists + per-target extras that differ between the two modes, so the
+# nanobind_add_module calls below stay single-form.
+if(GBGPU_WITH_SHAREDMEM)
+  set(GBGPU_SHAREDMEM_CPU_SRC "SharedMemoryGBGPU.cxx")
+  set(GBGPU_SHAREDMEM_GPU_SRC "SharedMemoryGBGPU.cu")
+  set(GBGPU_SHAREDMEM_HEADERS "SharedMemoryGBGPU.hpp")
+  set(GBGPU_SHAREDMEM_GPU_LIBS mathdx::cufftdx)
+  set(GBGPU_SHAREDMEM_DEFS "")
+else()
+  set(GBGPU_SHAREDMEM_CPU_SRC "")
+  set(GBGPU_SHAREDMEM_GPU_SRC "")
+  set(GBGPU_SHAREDMEM_HEADERS "")
+  set(GBGPU_SHAREDMEM_GPU_LIBS "")
+  set(GBGPU_SHAREDMEM_DEFS GBGPU_NO_SHAREDMEM)
+endif()
 
 # Locate the gpubackendtools cutils directory so we can find gbt_global.h /
 # common helpers that LISAanalysistools' Detector.cu pulls in. Mirrors how
@@ -202,13 +221,15 @@ if(GBGPU_WITH_CPU)
     DEPENDS "Detector.cu"
     VERBATIM)
 
-  add_custom_command(
-    OUTPUT "SharedMemoryGBGPU.cxx"
-    COMMENT "Copy SharedMemoryGBGPU.cu to SharedMemoryGBGPU.cxx (for cgbgpu CPU)"
-    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/SharedMemoryGBGPU.cu"
-            "${CMAKE_CURRENT_BINARY_DIR}/SharedMemoryGBGPU.cxx"
-    DEPENDS "SharedMemoryGBGPU.cu"
-    VERBATIM)
+  if(GBGPU_WITH_SHAREDMEM)
+    add_custom_command(
+      OUTPUT "SharedMemoryGBGPU.cxx"
+      COMMENT "Copy SharedMemoryGBGPU.cu to SharedMemoryGBGPU.cxx (for cgbgpu CPU)"
+      COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/SharedMemoryGBGPU.cu"
+              "${CMAKE_CURRENT_BINARY_DIR}/SharedMemoryGBGPU.cxx"
+      DEPENDS "SharedMemoryGBGPU.cu"
+      VERBATIM)
+  endif()
 
   # Phase 3L.7d (2026-06-04): the GBTDIonTheFly method bodies + the
   # gb_run_wave_tdi kernel/wrap live in gb_tdi_on_the_fly.cu. Copy to
@@ -252,11 +273,15 @@ endif()
 
 
 # III. Declare the GPU backend
-if(GBGPU_WITH_GPU)
+if(GBGPU_WITH_GPU AND GBGPU_WITH_SHAREDMEM)
   # gbgpu_gpu_utils + gbgpu_gpu_sharedmem (Cython) retired -- functions
   # migrated to cgbgpu (see below). The cufftdx + nvidia-mathdx download
   # logic that lived here is preserved for SharedMemoryGBGPU.cu, which
   # we still compile into cgbgpu.
+  #
+  # NOTE: this whole block exists ONLY for SharedMemoryGBGPU.cu -- it is the
+  # sole `#include <cufftdx.hpp>` in the repo. With
+  # -DGBGPU_WITH_SHAREDMEM=OFF the build needs no network access here.
 
   file(DOWNLOAD
       "https://developer.nvidia.com/downloads/compute/cuFFTDx/redist/cuFFTDx/cuda12/nvidia-mathdx-25.06.1-cuda12.tar.gz" # The URL of the file to download
@@ -325,11 +350,13 @@ if(GBGPU_WITH_CPU)
     binding_gbgpu.cxx
     Detector.cxx
     gbgpu_utils.cxx
-    SharedMemoryGBGPU.cxx
+    ${GBGPU_SHAREDMEM_CPU_SRC}
     gb_tdi_on_the_fly.cxx
     lat_tdi_on_the_fly.cxx
     Interpolate.cxx)
   apply_cpu_backend_common_options(cgbgpu)
+  # PUBLIC so binding_gbgpu.hpp's guards apply to every TU of the target.
+  target_compile_definitions(gbgpu_cpu_cgbgpu PUBLIC ${GBGPU_SHAREDMEM_DEFS})
   target_include_directories(gbgpu_cpu_cgbgpu PRIVATE
     "${LISATOOLS_CUTILS}"        # ReturnPointerBase + lisatools_header_abi.hpp + LAT Detector.hpp
     "${GBT_CUTILS}"              # gbt_global.h, pybind11_cuda_array_interface.hpp
@@ -341,7 +368,7 @@ if(GBGPU_WITH_CPU)
   # ${GBT_CUTILS}/gbt_global.h (GPUBackendTools owns the canonical copy).
   target_sources(gbgpu_cpu_cgbgpu PUBLIC FILE_SET HEADERS FILES
                                        binding_gbgpu.hpp gbgpu_utils.hh
-                                       SharedMemoryGBGPU.hpp
+                                       ${GBGPU_SHAREDMEM_HEADERS}
                                        global.hpp Detector.hpp
                                        global.h
                                        common.hpp fp16_common.hpp)
@@ -363,9 +390,11 @@ if(GBGPU_WITH_GPU)
     "${LISATOOLS_CUTILS}/lat_tdi_on_the_fly.cu"
     "${GBT_CUTILS}/Interpolate.cu"
     gbgpu_utils.cu
-    SharedMemoryGBGPU.cu
+    ${GBGPU_SHAREDMEM_GPU_SRC}
     gb_tdi_on_the_fly.cu)
   apply_gpu_backend_common_options(cgbgpu)
+  # PUBLIC so binding_gbgpu.hpp's guards apply to every TU of the target.
+  target_compile_definitions(gbgpu_gpu_cgbgpu PUBLIC ${GBGPU_SHAREDMEM_DEFS})
   target_include_directories(gbgpu_gpu_cgbgpu PRIVATE
     "${LISATOOLS_CUTILS}"
     "${GBT_CUTILS}"
@@ -376,13 +405,13 @@ if(GBGPU_WITH_GPU)
   set_property(TARGET gbgpu_gpu_cgbgpu PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   set_property(TARGET gbgpu_gpu_cgbgpu PROPERTY POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(gbgpu_gpu_cgbgpu PUBLIC CUDA::cudart CUDA::cublas
-      CUDA::cusparse mathdx::cufftdx
+      CUDA::cusparse ${GBGPU_SHAREDMEM_GPU_LIBS}
       ${GBT_LAPACKE_LIBS} ${GBT_LAPACKE_EXTRA_LIBS})
   # NB: cuda_complex.hpp deliberately omitted -- pulled transitively via
   # ${GBT_CUTILS}/gbt_global.h (GPUBackendTools owns the canonical copy).
   target_sources(gbgpu_gpu_cgbgpu PUBLIC FILE_SET HEADERS FILES
                                        binding_gbgpu.hpp gbgpu_utils.hh
-                                       SharedMemoryGBGPU.hpp
+                                       ${GBGPU_SHAREDMEM_HEADERS}
                                        global.hpp Detector.hpp
                                        global.h
                                        common.hpp fp16_common.hpp)

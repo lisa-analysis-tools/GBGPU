@@ -34,6 +34,32 @@ GB-specific physics on top of it.
   GBTDIonTheFly + GBComputationGroup + gb_wdm_het_* kernels.
 - `find_package(pybind11 CONFIG)` added to project-root `CMakeLists.txt`;
   `pybind11` added to `pyproject.toml`'s build-system requires.
+- **`GBGPU_WITH_SHAREDMEM` (default `ON`, 2026-07-28)** — compiles the legacy
+  `SharedMemoryGBGPU.cu` kernel family into `cgbgpu`. It is 4k lines of
+  heavily-templated CUDA and the repo's **only** `#include <cufftdx.hpp>`, so
+  `-DGBGPU_WITH_SHAREDMEM=OFF` also removes the configure-time
+  `nvidia-mathdx` tarball download + extract + `find_package(mathdx)` — a
+  GPU configure with it OFF needs **no network access** and compiles
+  substantially faster.
+
+  ```sh
+  pip install -e . --config-settings=cmake.define.GBGPU_WITH_SHAREDMEM=OFF
+  ```
+
+  The seven `SharedMemory*_wrap` methods stay **bound** (identical Python
+  surface) but raise `RuntimeError` with a rebuild instruction — the guard is
+  `GBGPU_NO_SHAREDMEM` / `GBGPU_SHAREDMEM_UNAVAILABLE` in `binding_gbgpu.hpp`.
+  Unaffected: `GBTDIonTheFly`, the chunked-heterodyne kernels, and the
+  signal-heterodyne (`gb_signal_het_*`) family — i.e. an OFF build fully
+  supports the sig-het in-model GB path and its parity gates.
+
+  **Still needs ON:** GB F-stat RJ births (`GBGPU.get_fstat_ll`, via
+  LAT `gbspecialstretch.para_log_like`), synthetic GB injections and the
+  FD-domain global-template subtraction (`GBGPU.generate_global_template`,
+  via LAT `recipe.py` / `stock/erebor/injections.py` / `sources/gb/waveform.py`),
+  `GBAETWaveform` (`run_wave`), and `gathergalaxy`'s
+  `swap_likelihood_difference`. A WDM-domain **search** run therefore needs
+  ON; WDM PE runs and the sig-het/chunked-het parity gates do not.
 
 **Already received from lisa-on-gpu (Phase 3F):**
 - `gbgpu.jax.sources.ucb` — `JaxUCBSource`.

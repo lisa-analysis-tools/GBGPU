@@ -26,11 +26,32 @@
 // GBGPUComputationWrap method bodies can call out to the underlying free
 // functions.
 #include "gbgpu_utils.hh"        // fill_global_wrap, get_ll_wrap, swap_ll_diff_wrap
+#ifndef GBGPU_NO_SHAREDMEM
 #include "SharedMemoryGBGPU.hpp" // SharedMemoryWaveComp, SharedMemoryLikeComp,
                                  // SharedMemorySwapLikeComp,
                                  // SharedMemoryChiSquaredComp,
                                  // SharedMemoryGenerateGlobal,
                                  // SharedMemoryFstatLikeComp
+#endif
+
+// GBGPU_NO_SHAREDMEM is defined by the build when -DGBGPU_WITH_SHAREDMEM=OFF
+// (see the project-root CMakeLists.txt). SharedMemoryGBGPU.cu is then not
+// compiled at all -- which also removes the build's only cuFFTDx/mathdx
+// dependency. The seven ``SharedMemory*_wrap`` methods below stay BOUND so the
+// Python surface is byte-identical; each raises RuntimeError instead of
+// calling into the (absent) kernel. Keep the message actionable: the caller
+// needs a rebuild, not a code change.
+#ifdef GBGPU_NO_SHAREDMEM
+#define GBGPU_SHAREDMEM_UNAVAILABLE(fn)                                       \
+    throw std::runtime_error(                                                 \
+        "[" fn "] this GBGPU backend was built with "                         \
+        "-DGBGPU_WITH_SHAREDMEM=OFF, so the legacy SharedMemoryGBGPU kernels " \
+        "are not present. Rebuild GBGPU without that flag (the default) to "  \
+        "use the legacy GB path (get_fstat_ll / generate_global_template / "  \
+        "run_wave / swap_likelihood_difference / information_matrix). The "   \
+        "GBTDIonTheFly, chunked-heterodyne and signal-heterodyne kernels are " \
+        "unaffected by this flag.")
+#endif
 
 // Phase 3L.7g (2026-06-04): GB TDIonTheFly + GBComputationGroup
 // arrived from lisa-on-gpu. The class declarations + kernel host wrappers
@@ -199,6 +220,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<double> Ps, double L_arm, bool tdi2,
         int window_type, double window_alpha)
     {
+#ifdef GBGPU_NO_SHAREDMEM
+        GBGPU_SHAREDMEM_UNAVAILABLE("SharedMemoryWaveComp_wrap");
+#else
         SharedMemoryWaveComp(
             (cmplx*) return_pointer(tdi_out,        "tdi_out"),
             return_pointer(start_inds_out, "start_inds_out"),
@@ -214,6 +238,7 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             T, dt, N, num_bin_all, tdi_channel_setup,
             return_pointer(Ps, "Ps"), L_arm, tdi2,
             window_type, window_alpha);
+#endif
     }
 
     void SharedMemoryLikeComp_wrap(
@@ -235,6 +260,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<double> Ps, double L_arm, bool tdi2,
         int window_type, double window_alpha)
     {
+#ifdef GBGPU_NO_SHAREDMEM
+        GBGPU_SHAREDMEM_UNAVAILABLE("SharedMemoryLikeComp_wrap");
+#else
         SharedMemoryLikeComp(
             (cmplx*) return_pointer(d_h,  "d_h"),
             (cmplx*) return_pointer(h_h,  "h_h"),
@@ -258,6 +286,7 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             num_data, num_noise,
             return_pointer(Ps, "Ps"), L_arm, tdi2,
             window_type, window_alpha);
+#endif
     }
 
     void SharedMemorySwapLikeComp_wrap(
@@ -287,6 +316,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<double> Ps, double L_arm, bool tdi2,
         int window_type, double window_alpha)
     {
+#ifdef GBGPU_NO_SHAREDMEM
+        GBGPU_SHAREDMEM_UNAVAILABLE("SharedMemorySwapLikeComp_wrap");
+#else
         SharedMemorySwapLikeComp(
             (cmplx*) return_pointer(d_h_remove,    "d_h_remove"),
             (cmplx*) return_pointer(d_h_add,       "d_h_add"),
@@ -322,6 +354,7 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             num_data, num_noise,
             return_pointer(Ps, "Ps"), L_arm, tdi2,
             window_type, window_alpha);
+#endif
     }
 
     void SharedMemoryChiSquaredComp_wrap(
@@ -343,6 +376,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<double> Ps, double L_arm, bool tdi2,
         int window_type, double window_alpha)
     {
+#ifdef GBGPU_NO_SHAREDMEM
+        GBGPU_SHAREDMEM_UNAVAILABLE("SharedMemoryChiSquaredComp_wrap");
+#else
         SharedMemoryChiSquaredComp(
             (cmplx*) return_pointer(h1_h1, "h1_h1"),
             (cmplx*) return_pointer(h2_h2, "h2_h2"),
@@ -365,6 +401,7 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             num_data, num_noise,
             return_pointer(Ps, "Ps"), L_arm, tdi2,
             window_type, window_alpha);
+#endif
     }
 
     void SharedMemoryGenerateGlobal_wrap(
@@ -383,6 +420,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<double> Ps, double L_arm, bool tdi2,
         int window_type, double window_alpha)
     {
+#ifdef GBGPU_NO_SHAREDMEM
+        GBGPU_SHAREDMEM_UNAVAILABLE("SharedMemoryGenerateGlobal_wrap");
+#else
         SharedMemoryGenerateGlobal(
             (cmplx*) return_pointer(data, "data"),
             return_pointer(data_index, "data_index"),
@@ -402,6 +442,7 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             device, do_synchronize,
             return_pointer(Ps, "Ps"), L_arm, tdi2,
             window_type, window_alpha);
+#endif
     }
 
     void SharedMemoryFstatLikeComp_wrap(
@@ -421,6 +462,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         array_type<double> Ps, double L_arm, bool tdi2,
         int window_type, double window_alpha)
     {
+#ifdef GBGPU_NO_SHAREDMEM
+        GBGPU_SHAREDMEM_UNAVAILABLE("SharedMemoryFstatLikeComp_wrap");
+#else
         SharedMemoryFstatLikeComp(
             (cmplx*) return_pointer(M_mat, "M_mat"),
             (cmplx*) return_pointer(N_arr, "N_arr"),
@@ -440,6 +484,7 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             num_data, num_noise,
             return_pointer(Ps, "Ps"), L_arm, tdi2,
             window_type, window_alpha);
+#endif
     }
 
     // mojito (2026-06 merge): Fisher / information-matrix kernel. Re-expressed
@@ -468,6 +513,9 @@ class GBGPUComputationWrap : public ReturnPointerBase {
         bool easy_central_difference,
         int window_type, double window_alpha)
     {
+#ifdef GBGPU_NO_SHAREDMEM
+        GBGPU_SHAREDMEM_UNAVAILABLE("SharedMemoryInfoMatComp_wrap");
+#else
         SharedMemoryInfoMatComp(
             return_pointer(info_mat,                "info_mat"),
             (cmplx*) return_pointer(d_dh_workspace, "d_dh_workspace"),
@@ -492,6 +540,7 @@ class GBGPUComputationWrap : public ReturnPointerBase {
             return_pointer(Ps, "Ps"), L_arm, tdi2,
             easy_central_difference,
             window_type, window_alpha);
+#endif
     }
 };
 

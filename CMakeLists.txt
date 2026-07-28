@@ -52,6 +52,31 @@ set_property(
   STRINGS "AUTO" "ON" "OFF" "ONLY" "BARE"
 )
 
+# GBGPU_WITH_SHAREDMEM controls whether the LEGACY SharedMemoryGBGPU.cu kernel
+# family (SharedMemoryWaveComp / LikeComp / SwapLikeComp / ChiSquaredComp /
+# GenerateGlobal / FstatLikeComp / InfoMatComp) is compiled into cgbgpu.
+#
+# It is the single most expensive part of a GBGPU build: 4k lines of heavily
+# templated CUDA, and the ONLY consumer of cuFFTDx -- so turning it OFF also
+# drops the configure-time ~nvidia-mathdx tarball download + extract +
+# find_package(mathdx) entirely. A GPU build with it OFF needs no network
+# access at configure time and compiles substantially faster.
+#
+# ON (default) preserves current behaviour. OFF is for builds that only
+# exercise the modern kernel families (GBTDIonTheFly, chunked-heterodyne,
+# signal-heterodyne / sig-het in-model). With it OFF the seven
+# ``SharedMemory*_wrap`` methods are still BOUND (identical Python surface)
+# but raise ``RuntimeError`` when called. Paths that still need ON:
+# GB F-stat RJ births (``GBGPU.get_fstat_ll``), synthetic GB injections and
+# the FD-domain global-template subtraction
+# (``GBGPU.generate_global_template``), ``GBAETWaveform`` (``run_wave``),
+# and ``gathergalaxy``'s ``swap_likelihood_difference``.
+option(
+  GBGPU_WITH_SHAREDMEM
+  "Compile the legacy SharedMemoryGBGPU.cu kernels (requires cuFFTDx/mathdx on GPU)"
+  ON
+)
+
 # GBGPU_CUDA_ARCH will be passed as the CUDA_ARCHITECTURES property for the CUDA
 # backend if it is compiled. See the documentation of CUDA_ARCHITECTURES:
 # https://cmake.org/cmake/help/latest/prop_tgt/CUDA_ARCHITECTURES.html
@@ -71,6 +96,15 @@ add_library(gbgpu INTERFACE)
 
 # ---- Enable building the CPU version of backends by default ----
 set_target_properties(gbgpu PROPERTIES WITH_CPU ON)
+
+# ---- Legacy SharedMemoryGBGPU.cu kernels (see GBGPU_WITH_SHAREDMEM above) ----
+set_target_properties(gbgpu PROPERTIES WITH_SHAREDMEM ${GBGPU_WITH_SHAREDMEM})
+if(GBGPU_WITH_SHAREDMEM)
+  message(STATUS "GBGPU legacy SharedMemoryGBGPU kernels: ON (cuFFTDx/mathdx required for GPU).")
+else()
+  message(STATUS "GBGPU legacy SharedMemoryGBGPU kernels: OFF -- SharedMemory*_wrap will \
+raise RuntimeError; no cuFFTDx/mathdx download.")
+endif()
 
 # ---- Test whether the GBGPU_MARCH option is supported by CXX compiler ----
 include(CheckCXXCompilerFlag)
