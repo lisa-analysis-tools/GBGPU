@@ -29,6 +29,7 @@
 
 #include "gb_tdi_on_the_fly.hh"  // GBTDIonTheFly class + LAT/GBT/LISATDIonTheFly machinery
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 // `N_PARAMS_MAX` is the upper bound on per-source parameter count
@@ -40,6 +41,32 @@
 #ifndef N_PARAMS_MAX
 #define N_PARAMS_MAX 20
 #endif
+
+// Upper bound on the sig-het active-band HALF width. The per-thread
+// `m_active[]` stack array (device consumer + host wraps) is sized for this;
+// GBs never need more than a couple of layers, so a hard cap of 8 (17 active
+// layers) is generous. The host wraps THROW when a caller exceeds it rather
+// than silently overflowing the fixed array.
+#ifndef GB_SIGHET_M_HALF_MAX
+#define GB_SIGHET_M_HALF_MAX 8
+#endif
+#define GB_SIGHET_M_ACTIVE_MAX (2 * GB_SIGHET_M_HALF_MAX + 1)
+
+// Host-side guard: reject an over-wide active band BEFORE it overflows the
+// fixed-size `m_active[]` stack arrays in the sig-het consumer/wraps. Called
+// at the top of every sig-het host wrap that takes `m_active_half_width`.
+static inline void gb_sighet_check_m_half(int m_active_half_width)
+{
+    if (m_active_half_width < 0 || m_active_half_width > GB_SIGHET_M_HALF_MAX)
+        throw std::invalid_argument(
+            "m_active_half_width out of range: got "
+            + std::to_string(m_active_half_width)
+            + ", must be in [0, " + std::to_string(GB_SIGHET_M_HALF_MAX)
+            + "]. GBs never need more than a couple of active layers; the "
+              "kernel's m_active[] is sized for this cap. Raise "
+              "GB_SIGHET_M_HALF_MAX (and rebuild) only if a wider band is "
+              "genuinely required.");
+}
 
 
 // =============================================================================
@@ -1925,7 +1952,7 @@ void gb_signal_het_consume_one_source(
     // Active m-band (every thread computes the same tiny array).
     const int Nf_active_idx_max = Nf_active - 1;
     const int m_floor = (int) floor(f0_cand / layer_df);
-    int m_active[16];
+    int m_active[GB_SIGHET_M_ACTIVE_MAX];
     for (int im = 0; im < M; ++im) {
         int m_g = m_floor + (im - m_active_half_width);
         if (m_g < ind_min_f) m_g = ind_min_f;
@@ -2161,6 +2188,7 @@ void GBComputationGroup::gb_signal_het_get_ll_wrap(
     int     nchannels, int tdi_type,
     int     n_rfft, double max_r)
 {
+    gb_sighet_check_m_half(m_active_half_width);
     (void) params_ref_all;  // not used in bin-fold path (kept for future de-rotation)
     (void) fdot_idx;
     (void) num_data;
@@ -2187,7 +2215,7 @@ void GBComputationGroup::gb_signal_het_get_ll_wrap(
     for (int bin = 0; bin < num_bin; ++bin) {
         const double f0_cand = params_cand_all[(size_t) bin * nparams + f0_idx];
         const int    m_floor = (int) std::floor(f0_cand / layer_df);
-        int m_active[16];
+        int m_active[GB_SIGHET_M_ACTIVE_MAX];
         for (int im = 0; im < M; ++im) {
             int m_g = m_floor + (im - m_active_half_width);
             if (m_g < ind_min_f) m_g = ind_min_f;
@@ -2387,6 +2415,7 @@ void GBComputationGroup::gb_signal_het_get_ll_sparse_wrap(
     int     nchannels, int tdi_type,
     int     N_sparse_fd, double max_r, int project_real)
 {
+    gb_sighet_check_m_half(m_active_half_width);
     // project_real != 0: compute the REAL WDM likelihood. <d|h> is exact via the
     // repacked A0/A1 coefficients (no kernel change here -- the same 0.5*Re(A0*r)
     // gives the real value). <h|h> adds the NONCONJ blocks B0nc/B1nc so that
@@ -2577,6 +2606,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
     int     nchannels, int tdi_type,
     int     N_sparse_fd, double tukey_alpha, double max_r, int project_real)
 {
+    gb_sighet_check_m_half(m_active_half_width);
     // Validate the polyphase divisibility contract in ONE place for both
     // builds: the fold identity `iFFT_Nt sub-sampled at stride == fold mod
     // Nt_layer + iFFT_Nt_layer` requires Nt == Nt_layer * stride exactly.
@@ -3189,6 +3219,7 @@ void GBComputationGroup::gb_signal_het_fill_global_sparse_wrap(
     int     nchannels,
     int     N_sparse_fd, double max_r)
 {
+    gb_sighet_check_m_half(m_active_half_width);
     (void) num_data;
 
 #ifdef __CUDACC__
@@ -3218,7 +3249,7 @@ void GBComputationGroup::gb_signal_het_fill_global_sparse_wrap(
         const double f0_cand   = params_cand_all[(size_t) bin * nparams + f0_idx];
         const double fdot_cand = params_cand_all[(size_t) bin * nparams + fdot_idx];
         const int    m_floor   = (int) std::floor(f0_cand / layer_df);
-        int m_active[16];
+        int m_active[GB_SIGHET_M_ACTIVE_MAX];
         for (int im = 0; im < M; ++im) {
             int m_g = m_floor + (im - m_active_half_width);
             if (m_g < ind_min_f) m_g = ind_min_f;
@@ -3411,6 +3442,7 @@ void GBComputationGroup::gb_signal_het_fill_global_in_kernel_wrap(
     int     nchannels,
     int     N_sparse_fd, double tukey_alpha, double max_r)
 {
+    gb_sighet_check_m_half(m_active_half_width);
 #ifdef __CUDACC__
     throw std::runtime_error(
         "[gb_signal_het_fill_global_in_kernel_wrap] GPU implementation is a TODO -- the v2 signal-het CUDA "
