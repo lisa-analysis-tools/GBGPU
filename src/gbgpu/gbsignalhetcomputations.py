@@ -42,6 +42,15 @@ from lisatools.signal_het import sparse_time_grid, bin_fold_real
 from .parallelbase import GBGPUParallelModule as FastLISAResponseParallelModule
 
 
+# Peak-memory cap (bytes) for the batched bin-fold in ``setup_in_model``. The
+# <h|h> intermediates (Ec + En) dominate the setup's high-water mark, so the
+# source axis is chunked to stay under this. 1 GiB leaves room for the
+# residual/invC slabs and the reference stash on the same device while still
+# batching every realistic block (a mojito-scale source costs ~13 MB here, so
+# ~75 sources per chunk).
+_SIGHET_FOLD_MAX_BYTES = 1 << 30
+
+
 def _recommended_edge_cut(Nt, tukey_alpha, margin=8):
     """Edge-cut (WDM time-layers) matching the Tukey taper: ``max(20, taper+margin)``,
     where the taper is ``ceil(0.5*alpha*Nt)`` layers. Auto-decided from the window."""
@@ -274,6 +283,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         self.d_d = float(getattr(chunked_comp, "d_d", 0.0))
         self._in_model = None
         self._slot_to_ref = None
+        self._slot_to_ref_xp = None
         return self
 
     def setup_in_model(self, buffer_aca, params_ref_phys, data_index,
@@ -337,14 +347,30 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             g["dt"], g["Tobs"], g["t0"],
             3, g["n_sparse_fd"], g["tukey_alpha"])
 
-        A0l, A1l, B0l, B1l, B0ncl, B1ncl = [], [], [], [], [], []
-        for i in range(n):
-            A0, A1, B0, B1, B0nc, B1nc = bin_fold_real(
-                res[i].astype(xp.complex128), c0_dense[i], invC[i],
-                self.n_sparse_local, g["stride"], g["Nt_active"],
-                tdi_type="XYZ")
-            A0l.append(A0); A1l.append(A1); B0l.append(B0)
-            B1l.append(B1); B0ncl.append(B0nc); B1ncl.append(B1nc)
+        # BATCHED bin-fold: ``bin_fold_real`` broadcasts over leading axes, so
+        # the whole block folds in one call per chunk instead of one call per
+        # source. (``res`` is passed straight through -- the fold only reads
+        # its REAL part, so the old per-source .astype(complex128) was an
+        # allocation of a value that was immediately discarded.)
+        #
+        # Chunked because the <h|h> intermediates (Ec + En, each
+        # nch^2 * Nf_active * Nt_active complex128 PER SOURCE) are the memory
+        # high-water mark of the whole setup; folding all n at once is what
+        # would OOM a block with many picked sources.
+        per_src_bytes = 2 * nch * nch * g["Nf_active"] * g["Nt_active"] * 16
+        chunk = max(1, min(n, _SIGHET_FOLD_MAX_BYTES // max(per_src_bytes, 1)))
+        folds = [
+            bin_fold_real(res[s:s + chunk], c0_dense[s:s + chunk],
+                          invC[s:s + chunk], self.n_sparse_local,
+                          g["stride"], g["Nt_active"], tdi_type="XYZ")
+            for s in range(0, n, chunk)
+        ]
+        if len(folds) == 1:
+            A0s, A1s, B0s, B1s, B0ncs, B1ncs = folds[0]
+        else:
+            A0s, A1s, B0s, B1s, B0ncs, B1ncs = [
+                xp.concatenate(parts, axis=0) for parts in zip(*folds)
+            ]
 
         if self._in_model is not None:
             # Mid-block PATCH: re-anchor only the given slots (the move's
@@ -359,12 +385,12 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                     "sig-het in-model patch hit a slot with no reference; "
                     "mid-block refreshes must target the block's slots.")
             self.c0_sparse_all[ref_idx] = c0_sparse
-            self.A0_all[ref_idx] = xp.stack(A0l)
-            self.A1_all[ref_idx] = xp.stack(A1l)
-            self.B0_all[ref_idx] = xp.stack(B0l)
-            self.B1_all[ref_idx] = xp.stack(B1l)
-            self.B0nc_all[ref_idx] = xp.stack(B0ncl)
-            self.B1nc_all[ref_idx] = xp.stack(B1ncl)
+            self.A0_all[ref_idx] = A0s
+            self.A1_all[ref_idx] = A1s
+            self.B0_all[ref_idx] = B0s
+            self.B1_all[ref_idx] = B1s
+            self.B0nc_all[ref_idx] = B0ncs
+            self.B1nc_all[ref_idx] = B1ncs
             self.params_ref_all[ref_idx] = refs
             return True
 
@@ -372,17 +398,20 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         # the run's device), then reused by every repeat-proposal get_ll
         # with no further host<->device traffic.
         self.c0_sparse_all = xp.ascontiguousarray(c0_sparse)
-        self.A0_all = xp.ascontiguousarray(xp.stack(A0l))
-        self.A1_all = xp.ascontiguousarray(xp.stack(A1l))
-        self.B0_all = xp.ascontiguousarray(xp.stack(B0l))
-        self.B1_all = xp.ascontiguousarray(xp.stack(B1l))
-        self.B0nc_all = xp.ascontiguousarray(xp.stack(B0ncl))
-        self.B1nc_all = xp.ascontiguousarray(xp.stack(B1ncl))
+        self.A0_all = xp.ascontiguousarray(A0s)
+        self.A1_all = xp.ascontiguousarray(A1s)
+        self.B0_all = xp.ascontiguousarray(B0s)
+        self.B1_all = xp.ascontiguousarray(B1s)
+        self.B0nc_all = xp.ascontiguousarray(B0ncs)
+        self.B1nc_all = xp.ascontiguousarray(B1ncs)
         self.params_ref_all = refs
 
         slot_map = np.full(int(slots.max()) + 1, -1, dtype=int)
         slot_map[slots] = np.arange(n)
         self._slot_to_ref = slot_map
+        # Device mirror for the per-repeat hot path (get_ll_wdm); the host
+        # copy above stays for the once-per-refresh patch bookkeeping.
+        self._slot_to_ref_xp = xp.asarray(slot_map)
         self._in_model = True
         return True
 
@@ -391,6 +420,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         chunked delegate (RJ / removal / any out-of-block scoring)."""
         self._in_model = None
         self._slot_to_ref = None
+        self._slot_to_ref_xp = None
 
     # ---- band-engine surface (chunked delegate + in-model routing) -------
 
@@ -421,17 +451,29 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             self.d_h_out = self.chunked.d_h_out
             self.h_h_out = self.chunked.h_h_out
             return ll
-        slots = np.asarray(
-            data_index.get() if hasattr(data_index, "get") else data_index,
-            dtype=int)
-        ref_idx = self._slot_to_ref[slots]
-        if np.any(ref_idx < 0):
-            raise RuntimeError(
-                "sig-het in-model scoring hit a buffer slot with no "
-                "reference; setup_in_model was not run for it.")
+        # Slot -> reference lookup stays ON DEVICE. The old path did
+        # ``data_index.get()`` (a full D2H of the slot array, forcing a sync),
+        # a numpy gather, then an H2D re-upload -- on EVERY repeat proposal.
+        # The validity test would sync again.
+        #
+        # Instead: CLAMP to an in-range, non-negative reference so the kernel
+        # can never read out of bounds, run it, and raise AFTERWARDS. The
+        # kernel wrap already synchronizes, so by then the check is a single
+        # scalar read off an idle stream rather than an extra round trip.
+        xp = self.xp
+        di = xp.asarray(data_index)
+        n_slots = int(self._slot_to_ref_xp.shape[0])
+        di_ok = xp.clip(di, 0, n_slots - 1)
+        ref_raw = self._slot_to_ref_xp[di_ok]
+        bad = (di != di_ok) | (ref_raw < 0)
+        ref_idx = xp.where(bad, 0, ref_raw)
         # params stay on their resident device (cupy on the CUDA path).
         ll = self.get_ll(self.xp.asarray(params, dtype=float),
                          data_index=ref_idx)
+        if bool(bad.any()):
+            raise RuntimeError(
+                "sig-het in-model scoring hit a buffer slot with no "
+                "reference; setup_in_model was not run for it.")
         self.d_h_out = self.last_d_h
         self.h_h_out = self.last_h_h
         return ll
