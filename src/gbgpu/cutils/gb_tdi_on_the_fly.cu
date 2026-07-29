@@ -2803,6 +2803,11 @@ void gb_signal_het_make_reference_kernel(
     int    *k_f0_buf,           // (num_data,)
     double *wdm_window,
     int    *n_sparse_local_arr,
+    const int *w_lo_arr,        // (num_data,) per-ref ACTIVE-LOCAL window
+                                // start: ref d's compact Nf_active-wide
+                                // output slab has effective origin
+                                // ind_min_f + w_lo_arr[d]. All-zeros
+                                // reproduces the shared-origin behavior.
     int     num_data,
     int     Nf, int Nt, int Nf_active, int Nt_active,
     int     Nt_layer, int N_sparse_t, int stride,
@@ -2838,12 +2843,13 @@ void gb_signal_het_make_reference_kernel(
         const int k_f0 = k_f0_buf[d];
         // Same +-1-layer-slack window as the CPU loop (truncating integer
         // division kept verbatim).
-        const int m_lo = max(0, (k_f0 - half_NS) / half_Nt - 1 - ind_min_f);
+        const int ind_min_f_d = ind_min_f + w_lo_arr[d];
+        const int m_lo = max(0, (k_f0 - half_NS) / half_Nt - 1 - ind_min_f_d);
         const int m_hi = min(Nf_active - 1,
-                             (k_f0 + half_NS - 1) / half_Nt + 1 - ind_min_f);
+                             (k_f0 + half_NS - 1) / half_Nt + 1 - ind_min_f_d);
         if (m_local < m_lo || m_local > m_hi) continue;
 
-        const int m_global = ind_min_f + m_local;
+        const int m_global = ind_min_f_d + m_local;
         const int j_base   = k_f0 - half_NS + half_Nt - m_global * half_Nt;
 
         // Any nonzero fold input at all? (CPU nz_j-emptiness guard.)
@@ -2967,6 +2973,7 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
     cmplx  *c0_dense_out,
     double *wdm_window,
     int    *n_sparse_local_arr,
+    int    *w_lo_arr,
     double *params_ref_all,
     int     num_data,
     int     nparams, int f0_idx, int fdot_idx,
@@ -3044,7 +3051,7 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
                                           shared_bytes>>>(
         c0_sparse_out, c0_dense_out,
         d_X_het_raw, d_k_f0,
-        wdm_window, n_sparse_local_arr,
+        wdm_window, n_sparse_local_arr, w_lo_arr,
         num_data,
         Nf, Nt, Nf_active, Nt_active,
         Nt_layer, N_sparse_t, stride,
@@ -3124,13 +3131,14 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
         const int k_f0 = k_f0_buf[d];
         // conservative +-1-layer slack; slack layers fold nothing and are
         // skipped by the nz_j emptiness guard below.
-        const int m_lo = std::max(0, (k_f0 - half_NS) / half_Nt - 1 - ind_min_f);
+        const int ind_min_f_d = ind_min_f + w_lo_arr[d];
+        const int m_lo = std::max(0, (k_f0 - half_NS) / half_Nt - 1 - ind_min_f_d);
         const int m_hi = std::min(Nf_active - 1,
-                                  (k_f0 + half_NS - 1) / half_Nt + 1 - ind_min_f);
+                                  (k_f0 + half_NS - 1) / half_Nt + 1 - ind_min_f_d);
         for (int c = 0; c < nchannels; ++c) {
             const cmplx *X_chan = X_het.data() + ((size_t) d * nchannels + c) * N_sparse_fd;
             for (int m_local = m_lo; m_local <= m_hi; ++m_local) {
-                const int m_global = ind_min_f + m_local;
+                const int m_global = ind_min_f_d + m_local;
                 std::fill(fold_s.begin(), fold_s.end(), cmplx(0.0, 0.0));
                 for (int jj : nz_j) fold_d[jj] = cmplx(0.0, 0.0);
                 nz_j.clear();

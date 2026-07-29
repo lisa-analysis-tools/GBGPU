@@ -154,6 +154,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         c0_dense = np.zeros((1, 3, Nf_active, Nt_active), dtype=np.complex128)
         self.cpp.gb_signal_het_make_reference(
             self.tdi_wrap, c0_sparse, c0_dense, window_full, n_sparse_local,
+            np.zeros(1, dtype=np.int32),          # shared-origin full band
             np.ascontiguousarray(ref_params[None]), 1, 9, 1, 2,
             Nf, Nt, Nf_active, Nt_active, nt_layer, N_sparse_t, stride,
             ind_min_t, ind_min_f, layer_df, dt, Tobs, t0,
@@ -358,60 +359,85 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         # scaled with Nf_active*Nt_active (~2.4 s/source at 1 yr, and a
         # ~54 MB/source dense-c0 transient); windowed it scales with
         # W*Nt_active (W ~ 7-13).
-        half_ext = (int(math.ceil(g["n_sparse_fd"] / g["Nt"])) + 1
-                    + _SIGHET_WINDOW_MARGIN)
-        W = min(2 * half_ext + 1, g["Nf_active"])
-        # LOCAL window starts, clamped so every window has width W.
-        f0_host = np.asarray(refs[:, 1].get() if hasattr(refs, "get")
-                             else refs[:, 1])
-        m_carrier = np.floor(f0_host / g["layer_df"]).astype(int)
-        w_lo_host = np.clip(m_carrier - g["ind_min_f"] - half_ext,
-                            0, g["Nf_active"] - W)
+        slab_Nf = getattr(buffer_aca, "band_slab_Nf", None)
+        if slab_Nf is not None:
+            # NARROW-SLAB buffers (task-b DEFAULT): each slot's slab already
+            # IS the validated small window -- the central band plus
+            # leakage/guard layers each side, with a per-slot ABSOLUTE layer
+            # origin in ``slab_min_f``. The slab doubles as the fold window:
+            # the data needs no layer gather at all, and reference c0 beyond
+            # the slab edge truncates exactly where the chunked-het task-b
+            # kernels truncate, so the two engines score the same domain.
+            W = int(slab_Nf)
+            _slo = buffer_aca.slab_min_f
+            w_lo_host = (np.asarray(
+                _slo.get() if hasattr(_slo, "get") else _slo
+            )[slots] - int(g["ind_min_f"])).astype(np.int32)
+        else:
+            # FULL-BAND buffers: carrier-centered window (exact -- see the
+            # header comment above; the kernel writes nothing outside it).
+            half_ext = (int(math.ceil(g["n_sparse_fd"] / g["Nt"])) + 1
+                        + _SIGHET_WINDOW_MARGIN)
+            W = min(2 * half_ext + 1, g["Nf_active"])
+            f0_host = np.asarray(refs[:, 1].get() if hasattr(refs, "get")
+                                 else refs[:, 1])
+            m_carrier = np.floor(f0_host / g["layer_df"]).astype(int)
+            w_lo_host = np.clip(m_carrier - g["ind_min_f"] - half_ext,
+                                0, g["Nf_active"] - W).astype(np.int32)
         w_lo = xp.asarray(w_lo_host)
+        layers = w_lo[:, None] + xp.arange(W)[None, :]          # (n, W), local
 
-        # FUSED slot+layer gather of the data-side inputs. The slabs are
-        # reshaped VIEWS of the buffer's flat arrays; one advanced-index
-        # gather with (slot, channel, window-layer) pulls only the windowed
-        # rows (~W*Nt_active per source) straight off the resident device.
-        # The previous two-step form -- res[slots] / invC[slots] full-slab
-        # copies, THEN a layer gather -- materialized ~226 MB/source at
-        # 1 yr and dominated the windowed setup cost.
-        slab_shape = (-1, nch, g["Nf_active"], g["Nt_active"])
-        res_full = xp.asarray(buffer_aca.linear_data_arr[0]).reshape(slab_shape)
+        # Data-side inputs. The slabs are reshaped VIEWS of the buffer's
+        # flat arrays; the per-slot layer width is the slab width on the
+        # narrow layout, Nf_active on the full-band one.
+        Nf_data = W if slab_Nf is not None else g["Nf_active"]
+        res_full = xp.asarray(buffer_aca.linear_data_arr[0]).reshape(
+            -1, nch, Nf_data, g["Nt_active"])
         psd_flat = xp.asarray(buffer_aca.linear_psd_arr[0])
-        expected_xyz = psd_flat.size // (nch * nch * g["Nf_active"] * g["Nt_active"])
-        if expected_xyz * nch * nch * g["Nf_active"] * g["Nt_active"] != psd_flat.size:
+        _cell = nch * nch * Nf_data * g["Nt_active"]
+        if (psd_flat.size // _cell) * _cell != psd_flat.size:
             raise NotImplementedError(
                 "sig-het in-model setup currently supports the XYZ "
                 "cross-channel inverse covariance layout only.")
-        invC_full = psd_flat.reshape(-1, nch, nch, g["Nf_active"], g["Nt_active"])
+        invC_full = psd_flat.reshape(-1, nch, nch, Nf_data, g["Nt_active"])
         sl = xp.asarray(slots)
         ch = xp.arange(nch)
-        layers = w_lo[:, None] + xp.arange(W)[None, :]          # (n, W), local
-        res_w = res_full[sl[:, None, None], ch[None, :, None],
-                         layers[:, None, :], :]
-        invC_w = invC_full[sl[:, None, None, None], ch[None, :, None, None],
-                           ch[None, None, :, None],
-                           layers[:, None, None, :], :]
+        if slab_Nf is not None:
+            # Slab == window: a plain slot pick copies only the narrow slabs.
+            res_w = res_full[sl]
+            invC_w = invC_full[sl]
+        else:
+            # FUSED slot+layer gather: one advanced-index gather pulls only
+            # the windowed rows (~W*Nt_active per source) -- the two-step
+            # form (full-slab copies, then a layer gather) materialized
+            # ~226 MB/source at 1 yr and dominated the windowed setup cost.
+            res_w = res_full[sl[:, None, None], ch[None, :, None],
+                             layers[:, None, :], :]
+            invC_w = invC_full[sl[:, None, None, None], ch[None, :, None, None],
+                               ch[None, None, :, None],
+                               layers[:, None, None, :], :]
 
-        # Compact windowed c0 slabs; per-source backend calls (the window
-        # start differs per reference and the wrap takes one ind_min_f).
-        # Each call is a W-layer grid, so the n launches are cheap next to
-        # what the full-band single call allocated and zeroed.
+        # Compact windowed c0 slabs -- ONE batched backend call. The kernel
+        # takes the per-ref window origins as ``w_lo_arr`` (active-local,
+        # added to ind_min_f per reference inside), writing each reference's
+        # compact W-wide slab. This replaced a per-source Python loop whose
+        # ~8.4 ms/source of per-call GPU API overhead scaled linearly with
+        # the block (50 s/iteration at nwalkers=64) and cancelled the
+        # sig-het likelihood win.
         c0_sparse_w = xp.zeros((n, nch, W, g["N_sparse_t"]),
                                dtype=xp.complex128)
         c0_dense_w = xp.zeros((n, nch, W, g["Nt_active"]),
                               dtype=xp.complex128)
-        for i in range(n):
-            self.cpp.gb_signal_het_make_reference(
-                self.tdi_wrap, c0_sparse_w[i], c0_dense_w[i],
-                self.window_full, self.n_sparse_local,
-                refs[i:i + 1], 1, 9, 1, 2,
-                g["Nf"], g["Nt"], W, g["Nt_active"],
-                g["nt_layer"], g["N_sparse_t"], g["stride"],
-                g["ind_min_t"], g["ind_min_f"] + int(w_lo_host[i]),
-                g["layer_df"], g["dt"], g["Tobs"], g["t0"],
-                3, g["n_sparse_fd"], g["tukey_alpha"])
+        self.cpp.gb_signal_het_make_reference(
+            self.tdi_wrap, c0_sparse_w, c0_dense_w,
+            self.window_full, self.n_sparse_local,
+            xp.ascontiguousarray(xp.asarray(w_lo_host, dtype=xp.int32)),
+            refs, n, 9, 1, 2,
+            g["Nf"], g["Nt"], W, g["Nt_active"],
+            g["nt_layer"], g["N_sparse_t"], g["stride"],
+            g["ind_min_t"], g["ind_min_f"],
+            g["layer_df"], g["dt"], g["Tobs"], g["t0"],
+            3, g["n_sparse_fd"], g["tukey_alpha"])
 
         # Row helper for the full-band stash expansion below. The scatters
         # use direct advanced-index ASSIGNMENT, not xp.put_along_axis: cupy

@@ -892,6 +892,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<std::complex<double>> c0_dense_out,
         array_type<double> wdm_window,
         array_type<int> n_sparse_local_arr,
+        array_type<int> w_lo_arr,
         array_type<double> params_ref_all,
         int num_data,
         int nparams, int f0_idx, int fdot_idx,

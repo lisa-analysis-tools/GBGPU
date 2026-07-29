@@ -561,6 +561,7 @@ class GBComputationGroup{
         cmplx  *c0_dense_out,
         double *wdm_window,
         int    *n_sparse_local_arr,
+        int    *w_lo_arr,
         double *params_ref_all,
         int     num_data,
         int     nparams, int f0_idx, int fdot_idx,
