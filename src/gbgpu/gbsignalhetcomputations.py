@@ -27,6 +27,7 @@ below stays CPU-only (offline/validation use).
 from __future__ import annotations
 
 import math
+import os
 from copy import deepcopy
 
 import numpy as np
@@ -48,7 +49,11 @@ from .parallelbase import GBGPUParallelModule as FastLISAResponseParallelModule
 # residual/invC slabs and the reference stash on the same device while still
 # batching every realistic block (a mojito-scale source costs ~13 MB here, so
 # ~75 sources per chunk).
-_SIGHET_FOLD_MAX_BYTES = 1 << 30
+#
+# GB_SIGHET_FOLD_MAX_BYTES overrides it. Lowering it is how the parity gates
+# force the multi-chunk branch with only a handful of sources -- otherwise
+# concatenation across chunks is never exercised at realistic block sizes.
+_SIGHET_FOLD_MAX_BYTES = int(os.environ.get("GB_SIGHET_FOLD_MAX_BYTES", 1 << 30))
 
 
 def _recommended_edge_cut(Nt, tukey_alpha, margin=8):
