@@ -413,11 +413,12 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 g["layer_df"], g["dt"], g["Tobs"], g["t0"],
                 3, g["n_sparse_fd"], g["tukey_alpha"])
 
-        # Scatter index arrays for the full-band stash expansion below
-        # (the data-side gathers happened above, fused with the slot pick).
-        ar_w = xp.arange(W)
-        idx3 = w_lo[:, None, None, None] + ar_w[None, None, :, None]
-        idx4 = w_lo[:, None, None, None, None] + ar_w[None, None, None, :, None]
+        # Row helper for the full-band stash expansion below. The scatters
+        # use direct advanced-index ASSIGNMENT, not xp.put_along_axis: cupy
+        # only grew put_along_axis in v13 and the cluster envs run older
+        # cupy (numpy-only local validation cannot see cupy API-surface
+        # gaps -- same environment-trap family as module-level ``cp``).
+        rows = xp.arange(n)
 
         # BATCHED bin-fold over the window slices; chunked because the
         # <h|h> intermediates (Ec + En, nch^2 * W * Nt_active complex128
@@ -444,13 +445,15 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         def _expand_A(vals):
             out = xp.zeros((n, nch, g["Nf_active"], g["N_sparse_t"]),
                            dtype=xp.complex128)
-            xp.put_along_axis(out, idx3, vals, axis=2)
+            out[rows[:, None, None], ch[None, :, None],
+                layers[:, None, :], :] = vals
             return out
 
         def _expand_B(vals):
             out = xp.zeros((n, nch, nch, g["Nf_active"], g["N_sparse_t"]),
                            dtype=xp.complex128)
-            xp.put_along_axis(out, idx4, vals, axis=3)
+            out[rows[:, None, None, None], ch[None, :, None, None],
+                ch[None, None, :, None], layers[:, None, None, :], :] = vals
             return out
 
         c0_sparse = _expand_A(c0_sparse_w)
