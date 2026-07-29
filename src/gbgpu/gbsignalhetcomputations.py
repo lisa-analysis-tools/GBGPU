@@ -335,18 +335,6 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                         copy=True).reshape(-1, 9)
         n = refs.shape[0]
 
-        # Residual/inverse-PSD slabs stay on their resident device (cupy on
-        # the CUDA path -- no host round-trip).
-        slab_shape = (-1, nch, g["Nf_active"], g["Nt_active"])
-        res = xp.asarray(buffer_aca.linear_data_arr[0]).reshape(slab_shape)[slots]
-        psd_flat = xp.asarray(buffer_aca.linear_psd_arr[0])
-        expected_xyz = psd_flat.size // (nch * nch * g["Nf_active"] * g["Nt_active"])
-        if expected_xyz * nch * nch * g["Nf_active"] * g["Nt_active"] != psd_flat.size:
-            raise NotImplementedError(
-                "sig-het in-model setup currently supports the XYZ "
-                "cross-channel inverse covariance layout only.")
-        invC = psd_flat.reshape(-1, nch, nch, g["Nf_active"], g["Nt_active"])[slots]
-
         # ---- WINDOWED reference build (EXACT, not an approximation) ------
         # The make_reference kernel only WRITES layers within
         # ceil(n_sparse_fd/Nt)+1 of each reference's carrier; c0 is
@@ -381,6 +369,31 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                             0, g["Nf_active"] - W)
         w_lo = xp.asarray(w_lo_host)
 
+        # FUSED slot+layer gather of the data-side inputs. The slabs are
+        # reshaped VIEWS of the buffer's flat arrays; one advanced-index
+        # gather with (slot, channel, window-layer) pulls only the windowed
+        # rows (~W*Nt_active per source) straight off the resident device.
+        # The previous two-step form -- res[slots] / invC[slots] full-slab
+        # copies, THEN a layer gather -- materialized ~226 MB/source at
+        # 1 yr and dominated the windowed setup cost.
+        slab_shape = (-1, nch, g["Nf_active"], g["Nt_active"])
+        res_full = xp.asarray(buffer_aca.linear_data_arr[0]).reshape(slab_shape)
+        psd_flat = xp.asarray(buffer_aca.linear_psd_arr[0])
+        expected_xyz = psd_flat.size // (nch * nch * g["Nf_active"] * g["Nt_active"])
+        if expected_xyz * nch * nch * g["Nf_active"] * g["Nt_active"] != psd_flat.size:
+            raise NotImplementedError(
+                "sig-het in-model setup currently supports the XYZ "
+                "cross-channel inverse covariance layout only.")
+        invC_full = psd_flat.reshape(-1, nch, nch, g["Nf_active"], g["Nt_active"])
+        sl = xp.asarray(slots)
+        ch = xp.arange(nch)
+        layers = w_lo[:, None] + xp.arange(W)[None, :]          # (n, W), local
+        res_w = res_full[sl[:, None, None], ch[None, :, None],
+                         layers[:, None, :], :]
+        invC_w = invC_full[sl[:, None, None, None], ch[None, :, None, None],
+                           ch[None, None, :, None],
+                           layers[:, None, None, :], :]
+
         # Compact windowed c0 slabs; per-source backend calls (the window
         # start differs per reference and the wrap takes one ind_min_f).
         # Each call is a W-layer grid, so the n launches are cheap next to
@@ -400,12 +413,11 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 g["layer_df"], g["dt"], g["Tobs"], g["t0"],
                 3, g["n_sparse_fd"], g["tukey_alpha"])
 
-        # Window slices of the data-side inputs (gathers, no host traffic).
+        # Scatter index arrays for the full-band stash expansion below
+        # (the data-side gathers happened above, fused with the slot pick).
         ar_w = xp.arange(W)
         idx3 = w_lo[:, None, None, None] + ar_w[None, None, :, None]
         idx4 = w_lo[:, None, None, None, None] + ar_w[None, None, None, :, None]
-        res_w = xp.take_along_axis(res, idx3, axis=2)
-        invC_w = xp.take_along_axis(invC, idx4, axis=3)
 
         # BATCHED bin-fold over the window slices; chunked because the
         # <h|h> intermediates (Ec + En, nch^2 * W * Nt_active complex128
