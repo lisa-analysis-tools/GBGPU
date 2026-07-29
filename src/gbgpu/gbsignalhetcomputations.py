@@ -55,6 +55,14 @@ from .parallelbase import GBGPUParallelModule as FastLISAResponseParallelModule
 # concatenation across chunks is never exercised at realistic block sizes.
 _SIGHET_FOLD_MAX_BYTES = int(os.environ.get("GB_SIGHET_FOLD_MAX_BYTES", 1 << 30))
 
+# Extra WDM layers each side of the reference carrier included in the WINDOWED
+# reference build, beyond the make_reference kernel's own write extent of
+# ceil(n_sparse_fd/Nt)+1 layers. The windowed build is EXACT for any margin
+# >= 0 (outside the kernel's write window c0 is identically zero, so every
+# fold coefficient is too); the default 1 only absorbs the floor-vs-C-integer
+# carrier-layer rounding difference between Python and the kernel.
+_SIGHET_WINDOW_MARGIN = int(os.environ.get("GB_SIGHET_WINDOW_MARGIN", 1))
+
 
 def _recommended_edge_cut(Nt, tukey_alpha, margin=8):
     """Edge-cut (WDM time-layers) matching the Tukey taper: ``max(20, taper+margin)``,
@@ -339,34 +347,74 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 "cross-channel inverse covariance layout only.")
         invC = psd_flat.reshape(-1, nch, nch, g["Nf_active"], g["Nt_active"])[slots]
 
-        c0_sparse = xp.zeros((n, nch, g["Nf_active"], g["N_sparse_t"]),
-                             dtype=xp.complex128)
-        c0_dense = xp.zeros((n, nch, g["Nf_active"], g["Nt_active"]),
-                            dtype=xp.complex128)
-        self.cpp.gb_signal_het_make_reference(
-            self.tdi_wrap, c0_sparse, c0_dense, self.window_full,
-            self.n_sparse_local, refs, n, 9, 1, 2,
-            g["Nf"], g["Nt"], g["Nf_active"], g["Nt_active"],
-            g["nt_layer"], g["N_sparse_t"], g["stride"],
-            g["ind_min_t"], g["ind_min_f"], g["layer_df"],
-            g["dt"], g["Tobs"], g["t0"],
-            3, g["n_sparse_fd"], g["tukey_alpha"])
-
-        # BATCHED bin-fold: ``bin_fold_real`` broadcasts over leading axes, so
-        # the whole block folds in one call per chunk instead of one call per
-        # source. (``res`` is passed straight through -- the fold only reads
-        # its REAL part, so the old per-source .astype(complex128) was an
-        # allocation of a value that was immediately discarded.)
+        # ---- WINDOWED reference build (EXACT, not an approximation) ------
+        # The make_reference kernel only WRITES layers within
+        # ceil(n_sparse_fd/Nt)+1 of each reference's carrier; c0 is
+        # identically ZERO outside that window, so every bin-fold
+        # coefficient outside it is exactly zero too (A ~ data*invC*c0,
+        # B ~ c0*invC*c0). All heavy work therefore restricts to a
+        # constant-width window of W layers per reference:
         #
-        # Chunked because the <h|h> intermediates (Ec + En, each
-        # nch^2 * Nf_active * Nt_active complex128 PER SOURCE) are the memory
-        # high-water mark of the whole setup; folding all n at once is what
-        # would OOM a block with many picked sources.
-        per_src_bytes = 2 * nch * nch * g["Nf_active"] * g["Nt_active"] * 16
+        #   * the backend runs PER SOURCE with the grid's ind_min_f SHIFTED
+        #     to the window start and Nf_active = W. The kernel's math is
+        #     absolute (m_global = ind_min_f + m_local; j_base, kappa and
+        #     the parity signs all use m_global), so this is the SAME
+        #     computation writing into a compact slab -- no kernel change;
+        #   * the bin-fold runs batched over the (n, ..., W, Nt_active)
+        #     window slices;
+        #   * results scatter into full-band, absolutely-indexed stash
+        #     arrays (zeros elsewhere == exactly what the full-band build
+        #     produced there), so the get_ll consumer is untouched.
+        #
+        # This makes the reference build Tobs-independent: full-band it
+        # scaled with Nf_active*Nt_active (~2.4 s/source at 1 yr, and a
+        # ~54 MB/source dense-c0 transient); windowed it scales with
+        # W*Nt_active (W ~ 7-13).
+        half_ext = (int(math.ceil(g["n_sparse_fd"] / g["Nt"])) + 1
+                    + _SIGHET_WINDOW_MARGIN)
+        W = min(2 * half_ext + 1, g["Nf_active"])
+        # LOCAL window starts, clamped so every window has width W.
+        f0_host = np.asarray(refs[:, 1].get() if hasattr(refs, "get")
+                             else refs[:, 1])
+        m_carrier = np.floor(f0_host / g["layer_df"]).astype(int)
+        w_lo_host = np.clip(m_carrier - g["ind_min_f"] - half_ext,
+                            0, g["Nf_active"] - W)
+        w_lo = xp.asarray(w_lo_host)
+
+        # Compact windowed c0 slabs; per-source backend calls (the window
+        # start differs per reference and the wrap takes one ind_min_f).
+        # Each call is a W-layer grid, so the n launches are cheap next to
+        # what the full-band single call allocated and zeroed.
+        c0_sparse_w = xp.zeros((n, nch, W, g["N_sparse_t"]),
+                               dtype=xp.complex128)
+        c0_dense_w = xp.zeros((n, nch, W, g["Nt_active"]),
+                              dtype=xp.complex128)
+        for i in range(n):
+            self.cpp.gb_signal_het_make_reference(
+                self.tdi_wrap, c0_sparse_w[i], c0_dense_w[i],
+                self.window_full, self.n_sparse_local,
+                refs[i:i + 1], 1, 9, 1, 2,
+                g["Nf"], g["Nt"], W, g["Nt_active"],
+                g["nt_layer"], g["N_sparse_t"], g["stride"],
+                g["ind_min_t"], g["ind_min_f"] + int(w_lo_host[i]),
+                g["layer_df"], g["dt"], g["Tobs"], g["t0"],
+                3, g["n_sparse_fd"], g["tukey_alpha"])
+
+        # Window slices of the data-side inputs (gathers, no host traffic).
+        ar_w = xp.arange(W)
+        idx3 = w_lo[:, None, None, None] + ar_w[None, None, :, None]
+        idx4 = w_lo[:, None, None, None, None] + ar_w[None, None, None, :, None]
+        res_w = xp.take_along_axis(res, idx3, axis=2)
+        invC_w = xp.take_along_axis(invC, idx4, axis=3)
+
+        # BATCHED bin-fold over the window slices; chunked because the
+        # <h|h> intermediates (Ec + En, nch^2 * W * Nt_active complex128
+        # per source) remain the setup's memory high-water mark.
+        per_src_bytes = 2 * nch * nch * W * g["Nt_active"] * 16
         chunk = max(1, min(n, _SIGHET_FOLD_MAX_BYTES // max(per_src_bytes, 1)))
         folds = [
-            bin_fold_real(res[s:s + chunk], c0_dense[s:s + chunk],
-                          invC[s:s + chunk], self.n_sparse_local,
+            bin_fold_real(res_w[s:s + chunk], c0_dense_w[s:s + chunk],
+                          invC_w[s:s + chunk], self.n_sparse_local,
                           g["stride"], g["Nt_active"], tdi_type="XYZ")
             for s in range(0, n, chunk)
         ]
@@ -377,9 +425,32 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 xp.concatenate(parts, axis=0) for parts in zip(*folds)
             ]
 
+        # Scatter the compact window results into full-band stash arrays
+        # (absolute layer indexing, zeros outside -- the consumer kernel is
+        # unchanged). A-blocks: (n, nch, Nf_active, N_sparse_t), axis 2;
+        # B-blocks: (n, nch, nch, Nf_active, N_sparse_t), axis 3.
+        def _expand_A(vals):
+            out = xp.zeros((n, nch, g["Nf_active"], g["N_sparse_t"]),
+                           dtype=xp.complex128)
+            xp.put_along_axis(out, idx3, vals, axis=2)
+            return out
+
+        def _expand_B(vals):
+            out = xp.zeros((n, nch, nch, g["Nf_active"], g["N_sparse_t"]),
+                           dtype=xp.complex128)
+            xp.put_along_axis(out, idx4, vals, axis=3)
+            return out
+
+        c0_sparse = _expand_A(c0_sparse_w)
+        A0s, A1s = _expand_A(A0s), _expand_A(A1s)
+        B0s, B1s = _expand_B(B0s), _expand_B(B1s)
+        B0ncs, B1ncs = _expand_B(B0ncs), _expand_B(B1ncs)
+
         if self._in_model is not None:
             # Mid-block PATCH: re-anchor only the given slots (the move's
-            # drift refresh). They must already carry a reference.
+            # drift refresh). They must already carry a reference. Full-row
+            # assignment (not a window write) so a shifted window cannot
+            # leave stale coefficients behind.
             if int(slots.max()) >= len(self._slot_to_ref):
                 raise RuntimeError(
                     "sig-het in-model patch hit a slot outside the "
@@ -401,14 +472,15 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
 
         # The coefficient stash is the per-block CACHE: built once here (on
         # the run's device), then reused by every repeat-proposal get_ll
-        # with no further host<->device traffic.
-        self.c0_sparse_all = xp.ascontiguousarray(c0_sparse)
-        self.A0_all = xp.ascontiguousarray(A0s)
-        self.A1_all = xp.ascontiguousarray(A1s)
-        self.B0_all = xp.ascontiguousarray(B0s)
-        self.B1_all = xp.ascontiguousarray(B1s)
-        self.B0nc_all = xp.ascontiguousarray(B0ncs)
-        self.B1nc_all = xp.ascontiguousarray(B1ncs)
+        # with no further host<->device traffic. (Freshly allocated by the
+        # expanders above, so already contiguous.)
+        self.c0_sparse_all = c0_sparse
+        self.A0_all = A0s
+        self.A1_all = A1s
+        self.B0_all = B0s
+        self.B1_all = B1s
+        self.B0nc_all = B0ncs
+        self.B1nc_all = B1ncs
         self.params_ref_all = refs
 
         slot_map = np.full(int(slots.max()) + 1, -1, dtype=int)
