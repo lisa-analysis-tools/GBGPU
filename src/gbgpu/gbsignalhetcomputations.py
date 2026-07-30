@@ -87,7 +87,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     def __init__(self, data_td, ref_params, *, Nf, Nt, dt, t0, t_ref,
                  orbits, tdi_config, min_freq, max_freq, sens_model="scirdv1",
                  edge_cut=None, nt_layer=64, n_sparse_fd=1024, m_active_half_width=2,
-                 max_r=5.0, tukey_alpha=0.05, force_backend="cpu"):
+                 max_r=0.0, tukey_alpha=0.05, force_backend="cpu"):
         if isinstance(force_backend, str) and force_backend not in ("cpu", "gbgpu_cpu"):
             raise NotImplementedError(
                 "GBSignalHetComputations' full data-loading constructor is the "
@@ -210,8 +210,19 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
 
     @classmethod
     def for_band_engine(cls, chunked_comp, *, nt_layer=64, n_sparse_fd=1024,
-                        m_active_half_width=2, max_r=5.0):
+                        m_active_half_width=2, max_r=0.0):
         """Build a data-less engine-mode instance around ``chunked_comp``.
+
+        ``max_r=0`` disables the kernel's heterodyne-ratio magnitude clip.
+        The clip SILENTLY saturates every candidate whose amplitude ratio
+        vs the fixed reference exceeds it — at the old default 5.0 that
+        corrupted the likelihood of any in-model proposal beyond
+        |dlnA| ~ 1.6 (measured: 62% delta error at +2, driving cold-chain
+        ll-bookkeeping runaways over long repeat blocks), while with the
+        clip off the expansion is exact in amplitude to at least ratio
+        e^8 (~3e-6). The FLOOR_EPS reference floor in the kernel already
+        guards the divide-by-small on its own. Set ``max_r > 0`` only as
+        a diagnostic.
 
         Grid, orbits, TDI configuration, phase reference time, window and
         taper all come from the chunked delegate's ``wdm_settings`` (the
