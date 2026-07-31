@@ -248,24 +248,39 @@ int GBTDIonTheFly::get_gb_buffer_size(int N)
     return N * sizeof(double) + get_tdi_buffer_size(N);
 }
 
-int GBTDIonTheFly::get_gb_fd_buffer_size(int N, int nchannels)
+int GBTDIonTheFly::get_gb_fd_buffer_size(int N, int nchannels, int n_cp_sig)
 {
     // Shared-memory budget per source for the heterodyne FD kernel:
     //   params_here[N_PARAMS_MAX]                        N_PARAMS_MAX * 8
     //   t_arr_local[N]                                              N * 8
     //   tdi_channels_arr[nchannels * N]  (cmplx, FFT)    nchannels * N * 16
+    // then EITHER the direct-path region (n_cp_sig <= 1):
     //   tdi_amp[nchannels * N]                           nchannels * N * 8
     //   tdi_phase[nchannels * N]                         nchannels * N * 8
     //   phi_ref[N]                                                  N * 8
     //   get_tdi scratch (flip, pjump, count, fix_count)            21 * N
-    return (int) (
+    // OR the control-point spline arena (n_cp_sig > 1; see the spline
+    // branch in gbfd_build_one_source): 23 doubles per node (t_cp +
+    // amp/phase/dphi_ref coefficient stacks + B + PCR scratch + un-het
+    // phi_ref) + the raw cp TDI (cmplx) + extract/unwrap scratch.
+    // The MAX of the two is reserved so a runtime path switch is safe.
+    const size_t common =
           N_PARAMS_MAX * sizeof(double)
         + (size_t) N * sizeof(double)
-        + (size_t) nchannels * (size_t) N * sizeof(cmplx)
-        + 2 * (size_t) nchannels * (size_t) N * sizeof(double)
+        + (size_t) nchannels * (size_t) N * sizeof(cmplx);
+    const size_t direct_region =
+          2 * (size_t) nchannels * (size_t) N * sizeof(double)
         + (size_t) N * sizeof(double)
-        + (size_t) get_tdi_buffer_size(N)
-    );
+        + (size_t) get_tdi_buffer_size(N);
+    size_t region = direct_region;
+    if (n_cp_sig > 1) {
+        const size_t spline_region =
+              (size_t) n_cp_sig * 23 * sizeof(double)
+            + (size_t) nchannels * (size_t) n_cp_sig * sizeof(cmplx)
+            + (size_t) (21 * n_cp_sig + 16);
+        if (spline_region > region) region = spline_region;
+    }
+    return (int) (common + region);
 }
 
 
@@ -378,7 +393,7 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
                            int log2N,
                            cmplx **tdi_chan_out,
                            int *kf0_out, double *f0g_out, double *dts_out,
-                           double tukey_alpha, double edge_frac)
+                           double tukey_alpha, double edge_frac, int n_cp_sig)
 {
     // ---- carve up shared memory ------------------------------------------
     char *cur = (char*) shared_mem;
@@ -392,18 +407,6 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
     cmplx *tdi_chan = (cmplx*) cur;             // also slow + FFT buffer
     cur += (size_t) nchannels * N * sizeof(cmplx);
 
-    double *tdi_amp = (double*) cur;
-    cur += (size_t) nchannels * N * sizeof(double);
-
-    double *tdi_phase = (double*) cur;
-    cur += (size_t) nchannels * N * sizeof(double);
-
-    double *phi_ref = (double*) cur;
-    cur += (size_t) N * sizeof(double);
-
-    void *get_tdi_scratch = (void*) cur;
-    int   get_tdi_scratch_len = tof->get_tdi_buffer_size(N);
-
     // ---- broadcast params into shared ------------------------------------
     for (int i = THREAD_START_X; i < n_params; i += BLOCK_INCR_X)
         params_here[i] = params_in[bin_i * n_params + i];
@@ -415,57 +418,188 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
     const double f0g  = (double) kf0 * df;
     const double dts  = Tobs / (double) N;
 
-    // ---- build sparse absolute-time array in shared ----------------------
-    for (int n = THREAD_START_X; n < N; n += BLOCK_INCR_X)
-        t_arr_local[n] = t_start + (double) n * dts;
-    CUDA_SYNC_THREADS;
-
-    // ---- call existing get_tdi to fill tdi_chan / tdi_amp / tdi_phase /
-    //      phi_ref from the sparse t_arr_local
-    tof->get_tdi(get_tdi_scratch, get_tdi_scratch_len,
-                 tdi_chan, tdi_amp, tdi_phase, phi_ref,
-                 params_here, t_arr_local, N, bin_i, nchannels);
-
-    // ---- build slow positive-freq complex signal in-place over tdi_chan --
-    // Tukey window factored in-line: cosine taper on the first / last
-    // alpha/2 fraction of the N sparse samples (rectangular middle). Matches
-    // scipy.signal.windows.tukey(N, alpha) sample-by-sample so the sparse FD
-    // matches the dense rfft(Tukey*td) inner product. alpha=0 -> no taper.
+    // Window constants shared by both eval paths.
+    // Tukey: cosine taper on the first / last alpha/2 fraction of the N
+    // sparse samples (rectangular middle), matching
+    // scipy.signal.windows.tukey(N, alpha) sample-by-sample so the sparse
+    // FD matches the dense rfft(Tukey*td) inner product. alpha=0 -> none.
+    // Edge-cut: zero the first / last edge_frac fraction of the sparse
+    // grid so the FD-het template analyses the SAME time region as the
+    // WDM grid's [min_time, max_time] = [EC, Nt-EC] layers
+    // (edge_frac = EC/Nt); when EC > taper the cut subsumes the taper.
     const double n_taper_fd = 0.5 * tukey_alpha * (double) (N - 1);
     const double dlast_fd   = (double) (N - 1);
-    // Edge-cut: zero the first / last edge_frac fraction of the sparse grid, so
-    // the FD-het template analyses the SAME time region as the WDM grid's
-    // [min_time, max_time] = [EC, Nt-EC] layers (edge_frac = EC/Nt). Without it
-    // the FD het integrates the full Tobs and its off-source logL is ~13% too
-    // steep vs the (edge-cut) WDM. The tukey taper is kept (it suppresses the
-    // active-band leakage); when EC > taper the cut subsumes the taper region.
-    const int n_edge = (int) llround(edge_frac * (double) N);
-    for (int n = THREAD_START_X; n < N; n += BLOCK_INCR_X)
+    const int    n_edge     = (int) llround(edge_frac * (double) N);
+
+    if (n_cp_sig > 1)
     {
-        const double tau     = (double) n * dts;
-        const double carrier = 2.0 * M_PI * f0g * tau;
-        const double phref   = phi_ref[n];
-        double w = 1.0;
-        if (n < n_edge || n >= N - n_edge) {
-            w = 0.0;
-        } else if (tukey_alpha > 0.0 && n_taper_fd > 0.0) {
-            const double di = (double) n;
-            if (di < n_taper_fd) {
-                const double xn = di / n_taper_fd;
-                w = 0.5 * (1.0 + cos(M_PI * (xn - 1.0)));
-            } else if (di > dlast_fd - n_taper_fd) {
-                const double xn = (dlast_fd - di) / n_taper_fd;
-                w = 0.5 * (1.0 + cos(M_PI * (xn - 1.0)));
-            }
-        }
+        // ================= CONTROL-POINT SPLINE PATH =====================
+        // Same algorithm as the chunked engine's
+        // fast_wdm_inner_heterodyne_spline (lat_chunked_het_kernels.hh,
+        // mm < 4e-11 pedigree at ~5.5 h node spacing): evaluate the raw
+        // TDI at n_cp_sig control points spanning [t_start, t_start+Tobs],
+        // fit cubic splines (dphi_ref once; amp + phase per channel), and
+        // evaluate the splines at the N sparse samples -- N/n_cp_sig fewer
+        // waveform evaluations. Phase identity vs the direct path:
+        //   th = tdi_phase + phi_ref(t) - 2*pi*f0g*tau
+        //      = tdi_phase + dphi_ref(t) + 2*pi*f0g*t_start,
+        // with dphi_ref(t) = phi_ref(t) - 2*pi*f0g*t and t = t_start+tau.
+        // The arena overlays the direct path's dead amp/phase/phi_ref/
+        // get_tdi region (get_gb_fd_buffer_size reserves the max of both).
+        double *t_cp   = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *amp_y  = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *amp_c1 = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *amp_c2 = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *amp_c3 = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *ph_y   = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *ph_c1  = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *ph_c2  = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *ph_c3  = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *dp_y   = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *dp_c1  = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *dp_c2  = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *dp_c3  = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *B_b    = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        double *pcr    = (double*) cur; cur += (size_t) 8 * n_cp_sig * sizeof(double);
+        double *phi_un = (double*) cur; cur += (size_t) n_cp_sig * sizeof(double);
+        cmplx  *tdi_cp = (cmplx*)  cur; cur += (size_t) nchannels * n_cp_sig * sizeof(cmplx);
+        double *flip   = (double*) cur;
+        double *pjump  = &flip[n_cp_sig];
+        int    *count  = (int *)  &pjump[n_cp_sig];
+        bool   *fix_c  = (bool *) &count[n_cp_sig];
+
+        const double dt_cp     = Tobs / (double) (n_cp_sig - 1);
+        const double two_pi_f0 = 2.0 * M_PI * f0g;
+        const int    cp_last   = n_cp_sig - 1;
+
+        for (int i = THREAD_START_X; i < n_cp_sig; i += BLOCK_INCR_X)
+            t_cp[i] = t_start + (double) i * dt_cp;
+        CUDA_SYNC_THREADS;
+
+        tof->get_tdi_raw(tdi_cp, phi_un, params_here, t_cp,
+                         n_cp_sig, bin_i, nchannels);
+        CUDA_SYNC_THREADS;
+
+        for (int i = THREAD_START_X; i < n_cp_sig; i += BLOCK_INCR_X)
+            dp_y[i] = phi_un[i] - two_pi_f0 * t_cp[i];
+        CUDA_SYNC_THREADS;
+
+        wdm_fit_cubic_spline(t_cp, dp_y, dp_c1, dp_c2, dp_c3,
+                              B_b, pcr, n_cp_sig,
+                              CUBIC_SPLINE_LINEAR_SPACING);
+        CUDA_SYNC_THREADS;
+
+        const double phi0_start = two_pi_f0 * t_start;
         for (int c = 0; c < nchannels; ++c)
         {
-            const double th = tdi_phase[c * N + n] + phref - carrier;
-            tdi_chan[c * N + n] =
-                gcmplx::polar(tdi_amp[c * N + n] * w, th);  // +i sign
+            // Extract needs the UN-heterodyned phi_ref (its
+            // remainder(., 2*pi) unwrap decisions are not invariant under
+            // carrier shifts) -- same contract as the chunked spline path.
+            tof->new_extract_amplitude_and_phase(
+                count, fix_c, flip, pjump, n_cp_sig,
+                amp_y, ph_y, &tdi_cp[c * n_cp_sig], phi_un);
+            CUDA_SYNC_THREADS;
+            tof->new_unwrap_phase(flip, n_cp_sig, ph_y);
+            CUDA_SYNC_THREADS;
+            wdm_fit_cubic_spline(t_cp, amp_y, amp_c1, amp_c2, amp_c3,
+                                  B_b, pcr, n_cp_sig,
+                                  CUBIC_SPLINE_LINEAR_SPACING);
+            CUDA_SYNC_THREADS;
+            wdm_fit_cubic_spline(t_cp, ph_y, ph_c1, ph_c2, ph_c3,
+                                  B_b, pcr, n_cp_sig,
+                                  CUBIC_SPLINE_LINEAR_SPACING);
+            CUDA_SYNC_THREADS;
+
+            for (int n = THREAD_START_X; n < N; n += BLOCK_INCR_X)
+            {
+                const double tau = (double) n * dts;
+                const double t   = t_start + tau;
+                int seg = (int) (tau / dt_cp);
+                if (seg < 0)           seg = 0;
+                if (seg > cp_last - 1) seg = cp_last - 1;
+                const double dx  = t - t_cp[seg];
+                const double dx2 = dx * dx;
+                const double amp = amp_y[seg] + amp_c1[seg] * dx
+                                 + amp_c2[seg] * dx2 + amp_c3[seg] * dx2 * dx;
+                const double tph = ph_y[seg] + ph_c1[seg] * dx
+                                 + ph_c2[seg] * dx2 + ph_c3[seg] * dx2 * dx;
+                const double dph = dp_y[seg] + dp_c1[seg] * dx
+                                 + dp_c2[seg] * dx2 + dp_c3[seg] * dx2 * dx;
+                double w = 1.0;
+                if (n < n_edge || n >= N - n_edge) {
+                    w = 0.0;
+                } else if (tukey_alpha > 0.0 && n_taper_fd > 0.0) {
+                    const double di = (double) n;
+                    if (di < n_taper_fd) {
+                        const double xn = di / n_taper_fd;
+                        w = 0.5 * (1.0 + cos(M_PI * (xn - 1.0)));
+                    } else if (di > dlast_fd - n_taper_fd) {
+                        const double xn = (dlast_fd - di) / n_taper_fd;
+                        w = 0.5 * (1.0 + cos(M_PI * (xn - 1.0)));
+                    }
+                }
+                tdi_chan[c * N + n] =
+                    gcmplx::polar(amp * w, tph + dph + phi0_start);
+            }
+            // Barrier before the single-channel coefficient buffers are
+            // reused for the next channel.
+            CUDA_SYNC_THREADS;
         }
     }
-    CUDA_SYNC_THREADS;
+    else
+    {
+        // ======================= DIRECT PATH =============================
+        double *tdi_amp = (double*) cur;
+        cur += (size_t) nchannels * N * sizeof(double);
+
+        double *tdi_phase = (double*) cur;
+        cur += (size_t) nchannels * N * sizeof(double);
+
+        double *phi_ref = (double*) cur;
+        cur += (size_t) N * sizeof(double);
+
+        void *get_tdi_scratch = (void*) cur;
+        int   get_tdi_scratch_len = tof->get_tdi_buffer_size(N);
+
+        // ---- build sparse absolute-time array in shared ------------------
+        for (int n = THREAD_START_X; n < N; n += BLOCK_INCR_X)
+            t_arr_local[n] = t_start + (double) n * dts;
+        CUDA_SYNC_THREADS;
+
+        // ---- call existing get_tdi to fill tdi_chan / tdi_amp /
+        //      tdi_phase / phi_ref from the sparse t_arr_local
+        tof->get_tdi(get_tdi_scratch, get_tdi_scratch_len,
+                     tdi_chan, tdi_amp, tdi_phase, phi_ref,
+                     params_here, t_arr_local, N, bin_i, nchannels);
+
+        // ---- build slow positive-freq complex signal in-place ------------
+        for (int n = THREAD_START_X; n < N; n += BLOCK_INCR_X)
+        {
+            const double tau     = (double) n * dts;
+            const double carrier = 2.0 * M_PI * f0g * tau;
+            const double phref   = phi_ref[n];
+            double w = 1.0;
+            if (n < n_edge || n >= N - n_edge) {
+                w = 0.0;
+            } else if (tukey_alpha > 0.0 && n_taper_fd > 0.0) {
+                const double di = (double) n;
+                if (di < n_taper_fd) {
+                    const double xn = di / n_taper_fd;
+                    w = 0.5 * (1.0 + cos(M_PI * (xn - 1.0)));
+                } else if (di > dlast_fd - n_taper_fd) {
+                    const double xn = (dlast_fd - di) / n_taper_fd;
+                    w = 0.5 * (1.0 + cos(M_PI * (xn - 1.0)));
+                }
+            }
+            for (int c = 0; c < nchannels; ++c)
+            {
+                const double th = tdi_phase[c * N + n] + phref - carrier;
+                tdi_chan[c * N + n] =
+                    gcmplx::polar(tdi_amp[c * N + n] * w, th);  // +i sign
+            }
+        }
+        CUDA_SYNC_THREADS;
+    }
 
     // ---- NaN scrub. Any non-finite sample left over from a singular
     //      response geometry (e.g. the (1-k.n)->0 wave-axis-vs-arm
@@ -521,7 +655,7 @@ void gbfd_run_one_source(GBTDIonTheFly *tof, void *shared_mem,
                          cmplx *X_het, int *k_f0_out, double *f0_grid_out,
                          double *params_in, double t_start, double Tobs,
                          int N, int nchannels, int n_params, int bin_i,
-                         int log2N, double tukey_alpha)
+                         int log2N, double tukey_alpha, int n_cp_sig)
 {
     cmplx *tdi_chan = NULL;
     int    kf0      = 0;
@@ -529,7 +663,8 @@ void gbfd_run_one_source(GBTDIonTheFly *tof, void *shared_mem,
     double dts      = 0.0;
     gbfd_build_one_source(tof, shared_mem, params_in, t_start, Tobs,
                           N, nchannels, n_params, bin_i, log2N,
-                          &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, 0.0);
+                          &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, 0.0,
+                          n_cp_sig);
 
     // Write heterodyne FD to global, in FFT order.
     for (int n = THREAD_START_X; n < N; n += BLOCK_INCR_X)
@@ -555,7 +690,7 @@ void gb_run_fd_wave_tdi_kernel(GBTDIonTheFly *tdi_on_fly,
     cmplx *X_het, int *k_f0_out, double *f0_grid_out,
     double *params, double t_start, double Tobs,
     int N, int num_bin, int n_params, int nchannels, int log2N,
-    double tukey_alpha)
+    double tukey_alpha, int n_cp_sig)
 {
     extern CUDA_SHARED char shared_mem[];
     GBTDIonTheFly tof(tdi_on_fly->orbits, tdi_on_fly->tdi_config,
@@ -566,7 +701,7 @@ void gb_run_fd_wave_tdi_kernel(GBTDIonTheFly *tdi_on_fly,
                             X_het, k_f0_out, f0_grid_out,
                             params, t_start, Tobs,
                             N, nchannels, n_params, bin_i, log2N,
-                            tukey_alpha);
+                            tukey_alpha, n_cp_sig);
     }
 }
 #endif
@@ -575,7 +710,7 @@ void gb_run_fd_wave_tdi_wrap(GBTDIonTheFly *tdi_on_fly,
     cmplx *X_het, int *k_f0_out, double *f0_grid_out,
     double *params, double t_start, double Tobs,
     int N_sparse, int num_bin, int n_params, int nchannels,
-    double tukey_alpha)
+    double tukey_alpha, int n_cp_sig)
 {
     // Validate power-of-two
     int log2N = 0;
@@ -614,7 +749,7 @@ void gb_run_fd_wave_tdi_wrap(GBTDIonTheFly *tdi_on_fly,
                          cudaMemcpyHostToDevice));
 
     int shared_bytes =
-        tdi_on_fly->get_gb_fd_buffer_size(N_sparse, nchannels);
+        tdi_on_fly->get_gb_fd_buffer_size(N_sparse, nchannels, n_cp_sig);
 
     // Allow shared usage past the 48 KB static default for large N_sparse.
     if (shared_bytes > 48 * 1024)
@@ -628,7 +763,8 @@ void gb_run_fd_wave_tdi_wrap(GBTDIonTheFly *tdi_on_fly,
     gb_run_fd_wave_tdi_kernel<<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(
         d_gb, X_het, k_f0_out, f0_grid_out,
         params, t_start, Tobs,
-        N_sparse, num_bin, n_params, nchannels, log2N, tukey_alpha);
+        N_sparse, num_bin, n_params, nchannels, log2N, tukey_alpha,
+        n_cp_sig);
 
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
@@ -639,7 +775,7 @@ void gb_run_fd_wave_tdi_wrap(GBTDIonTheFly *tdi_on_fly,
     delete gb_host;
 #else
     const int shared_bytes =
-        tdi_on_fly->get_gb_fd_buffer_size(N_sparse, nchannels);
+        tdi_on_fly->get_gb_fd_buffer_size(N_sparse, nchannels, n_cp_sig);
     char *shared_mem = new char[shared_bytes];
     for (int bin_i = 0; bin_i < num_bin; ++bin_i)
     {
@@ -647,7 +783,7 @@ void gb_run_fd_wave_tdi_wrap(GBTDIonTheFly *tdi_on_fly,
                             X_het, k_f0_out, f0_grid_out,
                             params, t_start, Tobs,
                             N_sparse, nchannels, n_params, bin_i, log2N,
-                            tukey_alpha);
+                            tukey_alpha, n_cp_sig);
     }
     delete[] shared_mem;
 #endif
@@ -2514,7 +2650,7 @@ void gb_signal_het_get_ll_in_kernel_kernel(
     int nchannels, int tdi_type,
     int N_sparse_fd, int log2N,
     double tukey_alpha, double max_r, int project_real,
-    size_t consumer_offset)
+    size_t consumer_offset, int n_cp_sig)
 {
     extern CUDA_SHARED char shared_mem[];
     CUDA_SHARED double d_h_tmp[NUM_THREADS_HERE];
@@ -2534,7 +2670,8 @@ void gb_signal_het_get_ll_in_kernel_kernel(
         gbfd_build_one_source(&tof, (void*) shared_mem, params_cand_all,
                               t_start, T_obs,
                               N_sparse_fd, nchannels, nparams, bin_i, log2N,
-                              &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, 0.0);
+                              &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, 0.0,
+                              n_cp_sig);
 
         // Consumer scratch: overlay onto the build slab right after
         // tdi_chan (amp/phase/phi_ref/get_tdi scratch are dead now).
@@ -2604,7 +2741,8 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
     double  layer_df, double dt,
     double  T_obs, double t_start,
     int     nchannels, int tdi_type,
-    int     N_sparse_fd, double tukey_alpha, double max_r, int project_real)
+    int     N_sparse_fd, double tukey_alpha, double max_r, int project_real,
+    int     n_cp_sig)
 {
     gb_sighet_check_m_half(m_active_half_width);
     // Validate the polyphase divisibility contract in ONE place for both
@@ -2665,7 +2803,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
         ((size_t) nchannels * M_here * Nt_layer
          + 3 * (size_t) nchannels * M_here * N_sparse_t) * sizeof(cmplx);
     const int build_bytes =
-        tdi_on_fly->get_gb_fd_buffer_size(N_sparse_fd, nchannels);
+        tdi_on_fly->get_gb_fd_buffer_size(N_sparse_fd, nchannels, n_cp_sig);
     int shared_bytes = build_bytes;
     if ((int) (consumer_offset + consumer_bytes) > shared_bytes)
         shared_bytes = (int) (consumer_offset + consumer_bytes);
@@ -2693,7 +2831,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
         nchannels, tdi_type,
         N_sparse_fd, log2N,
         tukey_alpha, max_r, project_real,
-        consumer_offset);
+        consumer_offset, n_cp_sig);
 
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
@@ -2716,7 +2854,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
         X_het_raw.data(), k_f0_buf.data(), f0_grid_buf.data(),
         params_cand_all, t_start, T_obs,
         N_sparse_fd, num_bin, nparams, nchannels,
-        tukey_alpha);
+        tukey_alpha, n_cp_sig);
 
     // Convert gb_run_fd_wave_tdi output to the centered-slice / dense-rfft
     // convention that gb_signal_het_get_ll_sparse_wrap expects:
@@ -2983,7 +3121,7 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
     double  layer_df, double dt,
     double  T_obs, double t_start,
     int     nchannels,
-    int     N_sparse_fd, double tukey_alpha)
+    int     N_sparse_fd, double tukey_alpha, int n_cp_sig)
 {
     (void) f0_idx; (void) fdot_idx; (void) layer_df;
 
@@ -3024,7 +3162,7 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
         d_X_het_raw, d_k_f0, d_f0_grid,
         params_ref_all, t_start, T_obs,
         N_sparse_fd, num_data, nparams, nchannels,
-        tukey_alpha);
+        tukey_alpha, n_cp_sig);
 
     // (2) fold + iFFT/iDFT kernel. Pre-zero the outputs (the CPU branch's
     // std::fill contract; window-external blocks never write).
@@ -3093,7 +3231,7 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
         X_het_raw.data(), k_f0_buf.data(), f0_grid_buf.data(),
         params_ref_all, t_start, T_obs,
         N_sparse_fd, num_data, nparams, nchannels,
-        tukey_alpha);
+        tukey_alpha, n_cp_sig);
 
     // (2) fftshift + 1/dt -> centered absolute-rfft slice (matches get_ll path).
     std::vector<cmplx> X_het((size_t) num_data * nchannels * N_sparse_fd);

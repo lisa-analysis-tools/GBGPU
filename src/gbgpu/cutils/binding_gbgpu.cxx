@@ -665,7 +665,8 @@ void GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel(
     double layer_df, double dt,
     double T_obs, double t_start,
     int nchannels, int tdi_type,
-    int N_sparse_fd, double tukey_alpha, double max_r, int project_real)
+    int N_sparse_fd, double tukey_alpha, double max_r, int project_real,
+    int n_cp_sig)
 {
     (void) Nt_layer;
     const size_t b_xyz  = (size_t) num_data * nchannels * nchannels
@@ -711,7 +712,7 @@ void GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel(
         layer_df, dt,
         T_obs, t_start,
         nchannels, tdi_type,
-        N_sparse_fd, tukey_alpha, max_r, project_real);
+        N_sparse_fd, tukey_alpha, max_r, project_real, n_cp_sig);
 }
 
 void GBComputationGroupWrap::gb_signal_het_fill_global_in_kernel(
@@ -786,7 +787,7 @@ void GBComputationGroupWrap::gb_signal_het_make_reference(
     double layer_df, double dt,
     double T_obs, double t_start,
     int nchannels,
-    int N_sparse_fd, double tukey_alpha)
+    int N_sparse_fd, double tukey_alpha, int n_cp_sig)
 {
     gb_signal_het_make_reference_wrap(
         tdi_wrap->waveform,
@@ -810,7 +811,7 @@ void GBComputationGroupWrap::gb_signal_het_make_reference(
         layer_df, dt,
         T_obs, t_start,
         nchannels,
-        N_sparse_fd, tukey_alpha);
+        N_sparse_fd, tukey_alpha, n_cp_sig);
 }
 
 void GBComputationGroupWrap::gb_signal_het_get_ll_grad_in_kernel(

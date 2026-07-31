@@ -64,6 +64,25 @@ _SIGHET_FOLD_MAX_BYTES = int(os.environ.get("GB_SIGHET_FOLD_MAX_BYTES", 1 << 30)
 _SIGHET_WINDOW_MARGIN = int(os.environ.get("GB_SIGHET_WINDOW_MARGIN", 1))
 
 
+def _resolve_n_cp(n_cp_build, Tobs):
+    """Control-point count for the spline waveform build.
+
+    ``n_cp_build`` semantics: 0 -> direct per-point evaluation (legacy
+    path); > 1 -> explicit count; < 0 -> AUTO: one node per
+    ``SIGHET_N_CP_SPACING`` seconds of Tobs (default 4 days -- keeps the
+    cubic-spline phase error of the annual Doppler/response modulation
+    below ~1e-4 rad across the GB band), clamped to [32, 256]. The upper
+    clamp bounds the shared-memory arena (~253 B/node); the lower keeps
+    the fit far inside the chunked engine's validated density.
+    """
+    if n_cp_build == 0:
+        return 0
+    if n_cp_build > 1:
+        return int(n_cp_build)
+    spacing = float(os.environ.get("SIGHET_N_CP_SPACING", 4.0 * 86400.0))
+    return int(np.clip(int(math.ceil(float(Tobs) / spacing)) + 1, 32, 256))
+
+
 def _recommended_edge_cut(Nt, tukey_alpha, margin=8):
     """Edge-cut (WDM time-layers) matching the Tukey taper: ``max(20, taper+margin)``,
     where the taper is ``ceil(0.5*alpha*Nt)`` layers. Auto-decided from the window."""
@@ -87,7 +106,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     def __init__(self, data_td, ref_params, *, Nf, Nt, dt, t0, t_ref,
                  orbits, tdi_config, min_freq, max_freq, sens_model="scirdv1",
                  edge_cut=None, nt_layer=64, n_sparse_fd=1024, m_active_half_width=2,
-                 max_r=0.0, tukey_alpha=0.05, force_backend="cpu"):
+                 max_r=0.0, tukey_alpha=0.05, n_cp_build=-1,
+                 force_backend="cpu"):
         if isinstance(force_backend, str) and force_backend not in ("cpu", "gbgpu_cpu"):
             raise NotImplementedError(
                 "GBSignalHetComputations' full data-loading constructor is the "
@@ -104,6 +124,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
 
         Nobs = Nf * Nt
         Tobs = Nt * Nf * dt
+        self.n_cp_build = _resolve_n_cp(n_cp_build, Tobs)
         t_arr = np.arange(Nobs) * dt + t0
         # plain backend flavor for the lisatools frontends (TDIConfig / TDSettings /
         # WDMSettings / GBTDIonTheFly). self.backend is the GBGPU COMPOSITE backend
@@ -158,7 +179,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             np.ascontiguousarray(ref_params[None]), 1, 9, 1, 2,
             Nf, Nt, Nf_active, Nt_active, nt_layer, N_sparse_t, stride,
             ind_min_t, ind_min_f, layer_df, dt, Tobs, t0,
-            3, n_sparse_fd, tukey_alpha)
+            3, n_sparse_fd, tukey_alpha, self.n_cp_build)
 
         # --- bin-fold coefficients from lisatools (dense c0 x data x invC) -------
         A0, A1, B0, B1, B0nc, B1nc = bin_fold_real(
@@ -182,7 +203,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                        nt_layer=nt_layer, N_sparse_t=N_sparse_t, stride=stride,
                        ind_min_t=ind_min_t, ind_min_f=ind_min_f, layer_df=layer_df,
                        dt=dt, Tobs=Tobs, t0=t0, n_sparse_fd=n_sparse_fd,
-                       tukey_alpha=tukey_alpha, max_r=max_r, m_half=self.m_half)
+                       tukey_alpha=tukey_alpha, max_r=max_r, m_half=self.m_half,
+                       n_cp_build=self.n_cp_build)
 
     @property
     def xp(self):
@@ -210,7 +232,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
 
     @classmethod
     def for_band_engine(cls, chunked_comp, *, nt_layer=64, n_sparse_fd=1024,
-                        m_active_half_width=2, max_r=0.0):
+                        m_active_half_width=2, max_r=0.0, n_cp_build=-1):
         """Build a data-less engine-mode instance around ``chunked_comp``.
 
         ``max_r=0`` disables the kernel's heterodyne-ratio magnitude clip.
@@ -302,7 +324,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                        dt=dt, Tobs=Tobs, t0=t0,
                        n_sparse_fd=int(n_sparse_fd),
                        tukey_alpha=tukey_alpha, max_r=float(max_r),
-                       m_half=self.m_half)
+                       m_half=self.m_half,
+                       n_cp_build=_resolve_n_cp(n_cp_build, Tobs))
         # Deltas are what the in-model repeats consume; keep the chunked
         # delegate's d_d convention so absolute ll values line up too.
         self.d_d = float(getattr(chunked_comp, "d_d", 0.0))
@@ -448,7 +471,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             g["nt_layer"], g["N_sparse_t"], g["stride"],
             g["ind_min_t"], g["ind_min_f"],
             g["layer_df"], g["dt"], g["Tobs"], g["t0"],
-            3, g["n_sparse_fd"], g["tukey_alpha"])
+            3, g["n_sparse_fd"], g["tukey_alpha"], g["n_cp_build"])
 
         # Row helper for the full-band stash expansion below. The scatters
         # use direct advanced-index ASSIGNMENT, not xp.put_along_axis: cupy
@@ -662,7 +685,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             g["ind_min_t"], g["ind_min_f"], g["m_half"],
             g["layer_df"], g["dt"], g["Tobs"], g["t0"],
             3, 0, g["n_sparse_fd"],
-            g["tukey_alpha"], g["max_r"], 1)     # project_real=1
+            g["tukey_alpha"], g["max_r"], 1,     # project_real=1
+            g["n_cp_build"])
         self.last_d_h = d_h.copy()
         self.last_h_h = h_h.copy()
         return -0.5 * self.d_d + d_h - 0.5 * h_h

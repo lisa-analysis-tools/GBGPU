@@ -850,7 +850,8 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         double layer_df, double dt,
         double T_obs, double t_start,
         int nchannels, int tdi_type,
-        int N_sparse_fd, double tukey_alpha, double max_r, int project_real);
+        int N_sparse_fd, double tukey_alpha, double max_r, int project_real,
+        int n_cp_sig);
 
     // Signal-het fill_global. Reuses Stage 2b's FD + polyphase machinery to
     // build r at sparse n, then linear-interpolates r to the dense WDM
@@ -902,7 +903,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         double layer_df, double dt,
         double T_obs, double t_start,
         int nchannels,
-        int N_sparse_fd, double tukey_alpha);
+        int N_sparse_fd, double tukey_alpha, int n_cp_sig);
 
     // Signal-het central-difference gradient of logL = d_h - 0.5*h_h. Per
     // binary, performs 1 central + 2*nparams perturbed get_ll_in_kernel

@@ -124,7 +124,8 @@ class GBTDIonTheFly : public LISATDIonTheFly {
 
     // Shared-memory budget helpers (time-domain + heterodyne FD paths).
     CUDA_CALLABLE_MEMBER int get_gb_buffer_size   (int N);
-    CUDA_CALLABLE_MEMBER int get_gb_fd_buffer_size(int N, int nchannels);
+    CUDA_CALLABLE_MEMBER int get_gb_fd_buffer_size(int N, int nchannels,
+                                                   int n_cp_sig = 0);
 };
 
 
@@ -151,7 +152,7 @@ void gb_run_fd_wave_tdi_wrap(
     cmplx *X_het, int *k_f0_out, double *f0_grid_out,
     double *params, double t_start, double Tobs,
     int N_sparse, int num_bin, int n_params, int nchannels,
-    double tukey_alpha);
+    double tukey_alpha, int n_cp_sig = 0);
 
 
 // ----------------------------------------------------------------------------
@@ -206,14 +207,15 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
                            int log2N,
                            cmplx **tdi_chan_out,
                            int *kf0_out, double *f0g_out, double *dts_out,
-                           double tukey_alpha);
+                           double tukey_alpha, double edge_frac = 0.0,
+                           int n_cp_sig = 0);
 
 CUDA_DEVICE
 void gbfd_run_one_source(GBTDIonTheFly *tof, void *shared_mem,
                          cmplx *X_het, int *k_f0_out, double *f0_grid_out,
                          double *params_in, double t_start, double Tobs,
                          int N, int nchannels, int n_params, int bin_i,
-                         int log2N, double tukey_alpha);
+                         int log2N, double tukey_alpha, int n_cp_sig = 0);
 
 
 // Phase 3L.7f.1 (2026-06-04): `class GBComputationGroup` declaration
@@ -571,7 +573,7 @@ class GBComputationGroup{
         double  layer_df, double dt,
         double  T_obs, double t_start,
         int     nchannels,
-        int     N_sparse_fd, double tukey_alpha);
+        int     N_sparse_fd, double tukey_alpha, int n_cp_sig = 0);
 
     // Stage 2b -- in-kernel sparse-FD signal-het. Fuses the existing
     // ``gb_run_fd_wave_tdi`` (sparse heterodyned rfft) with the polyphase +
@@ -602,7 +604,8 @@ class GBComputationGroup{
         double  layer_df, double dt,
         double  T_obs, double t_start,
         int     nchannels, int tdi_type,
-        int     N_sparse_fd, double tukey_alpha, double max_r, int project_real);
+        int     N_sparse_fd, double tukey_alpha, double max_r, int project_real,
+        int     n_cp_sig = 0);
 
     // Signal-het fill_global. Same FD + polyphase + r_sparse machinery as
     // get_ll, but reconstructs the dense template via the heterodyne
