@@ -210,6 +210,50 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     def xp(self):
         return self.backend.xp
 
+
+    _v4_band_arrays = None
+
+    def _make_v4_band_arrays(self):
+        """Host-side cardinal weights for the V4 BANDED evaluation mode.
+
+        The knot-values -> pixel-values map of a fixed-knot cubic spline is
+        a constant linear operator whose rows decay geometrically (~0.27 per
+        knot), so each pixel value is a short dot product against a window of
+        node values.  ``v4_band`` (half-band) selects the truncation: 12 ->
+        ~1e-7, 16 -> ~1e-9 relative, both far below the pipeline's floors.
+        ``v4_band = 0`` returns empty arrays and the kernel takes the
+        cooperative spline-solve path instead (both live in one binary so the
+        two are directly comparable).
+        """
+        xp = self.xp
+        g = self._g
+        band = int(g.get("v4_band", 0))
+        if band <= 0:
+            return (xp.zeros(1, dtype=xp.float64),
+                    xp.zeros(1, dtype=xp.int32), 0)
+        from scipy.interpolate import CubicSpline
+        import numpy as _np
+        K = int(g["v4_knots"])
+        tau_k = _np.linspace(0.0, g["Tobs"], K)
+        n_glob = (g["ind_min_t"] + _np.asarray(self.n_sparse_local)[0]
+                  + _np.arange(g["N_sparse_t"]) * g["stride"])
+        t_pix = n_glob * g["Nf"] * g["dt"]          # tau at the sparse pixels
+        dt_k = tau_k[1] - tau_k[0]
+        W = 2 * band
+        w_out = _np.zeros((len(t_pix), W))
+        j0_out = _np.zeros(len(t_pix), dtype=_np.int32)
+        eye = _np.eye(K)
+        # cardinal columns evaluated at the pixel times, then truncated to
+        # the window centred on each pixel's own knot interval
+        L = CubicSpline(tau_k, eye, axis=0)(t_pix)   # (n_pix, K)
+        for b in range(len(t_pix)):
+            seg = int(_np.clip(t_pix[b] / dt_k, 0, K - 2))
+            j0 = int(_np.clip(seg - band + 1, 0, max(K - W, 0)))
+            j0_out[b] = j0
+            w_out[b] = L[b, j0:j0 + W]
+        return (xp.asarray(_np.ascontiguousarray(w_out.ravel())),
+                xp.asarray(j0_out), W)
+
     def _resolve_v3_nodes(self, x, di):
         """Node count for the v3 ratio build.  ``v3_n_nodes > 0`` = fixed;
         ``-1`` = ADAPTIVE from the batch's worst predicted ratio variation
@@ -256,7 +300,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     @classmethod
     def for_band_engine(cls, chunked_comp, *, nt_layer=64, n_sparse_fd=1024,
                         m_active_half_width=2, max_r=0.0, n_cp_build=-1,
-                        v3_n_nodes=0):
+                        v3_n_nodes=0, v4_knots=0, v4_band=0):
         """Build a data-less engine-mode instance around ``chunked_comp``.
 
         ``max_r=0`` disables the kernel's heterodyne-ratio magnitude clip.
@@ -350,7 +394,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                        tukey_alpha=tukey_alpha, max_r=float(max_r),
                        m_half=self.m_half,
                        n_cp_build=_resolve_n_cp(n_cp_build, Tobs),
-                       v3_n_nodes=int(v3_n_nodes))
+                       v3_n_nodes=int(v3_n_nodes), v4_knots=int(v4_knots),
+                       v4_band=int(v4_band))
         # Deltas are what the in-model repeats consume; keep the chunked
         # delegate's d_d convention so absolute ll values line up too.
         self.d_d = float(getattr(chunked_comp, "d_d", 0.0))
@@ -698,6 +743,37 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         h_h = xp.zeros(N, dtype=xp.float64)
         num_data = int(self.params_ref_all.shape[0])
         g = self._g
+        if g.get("v4_knots", 0) and self._v4_band_arrays is None:
+            self._v4_band_arrays = self._make_v4_band_arrays()
+        if g.get("v4_knots", 0):
+            # V4: fixed-knot ratio evaluation. Same node-eval + log-polar
+            # spline FIT as v3, but the fitted ratio is RESAMPLED onto
+            # n_knots FIXED (candidate-independent) uniform knot times as
+            # linear complex values, and the pixel-time evaluation goes
+            # through the fixed-knot not-a-knot cubic spline whose Thomas
+            # factorization + per-pixel segment map are precomputed once
+            # per call. Consumes the SAME stash as v2/v3. Takes precedence
+            # over v3 when both knobs are set (the fit node count still
+            # honors v3_n_nodes / the adaptive resolve).
+            self.cpp.gb_signal_het_v4_get_ll(
+                self.tdi_wrap, d_h, h_h, self.c0_sparse_all,
+                self.A0_all, self.A1_all, self.B0_all, self.B1_all,
+                self.B0nc_all, self.B1nc_all,
+                self.n_sparse_local,
+                self._v4_band_arrays[0], self._v4_band_arrays[1],
+                self._v4_band_arrays[2],
+                x, self.params_ref_all, di,
+                N, num_data,
+                self._resolve_v3_nodes(x, di), int(g["v4_knots"]),
+                9, 1, 2,
+                g["Nf"], g["Nt"], g["Nf_active"], g["Nt_active"],
+                g["nt_layer"], g["N_sparse_t"], g["stride"],
+                g["ind_min_t"], g["ind_min_f"], g["m_half"],
+                g["layer_df"], g["dt"], g["Tobs"], g["t0"],
+                3, 0, 1)                      # XYZ, project_real=1
+            self.last_d_h = d_h.copy()
+            self.last_h_h = h_h.copy()
+            return -0.5 * self.d_d + d_h - 0.5 * h_h
         if g.get("v3_n_nodes", 0):
             # V3: ratio-spline candidate build straight into the bin-fold
             # (no FFT / polyphase / division). Consumes the SAME stash as

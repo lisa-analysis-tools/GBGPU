@@ -634,6 +634,28 @@ class GBComputationGroup{
         double  T_obs, double t_start,
         int     nchannels, int tdi_type, int project_real);
 
+    void gb_signal_het_v4_get_ll_wrap(
+        GBTDIonTheFly *tdi_on_fly,
+        double *d_h_out, double *h_h_out,
+        cmplx  *c0_sparse_all,
+        cmplx  *A0_all, cmplx *A1_all,
+        cmplx  *B0_all, cmplx *B1_all,
+        cmplx  *B0nc_all, cmplx *B1nc_all,
+        int    *n_sparse_local_arr,
+        double *band_w, int *band_j0, int band_len,
+        double *params_cand_all,
+        double *params_ref_all,
+        int    *data_index_all,
+        int     num_bin, int num_data,
+        int     n_nodes, int n_knots, int nparams, int f0_idx, int fdot_idx,
+        int     Nf, int Nt, int Nf_active, int Nt_active,
+        int     Nt_layer, int N_sparse_t, int stride,
+        int     ind_min_t, int ind_min_f,
+        int     m_active_half_width,
+        double  layer_df, double dt,
+        double  T_obs, double t_start,
+        int     nchannels, int tdi_type, int project_real);
+
     // Signal-het fill_global. Same FD + polyphase + r_sparse machinery as
     // get_ll, but reconstructs the dense template via the heterodyne
     // identity (linear-interp r_demod -> re-rotate carrier -> multiply by

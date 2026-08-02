@@ -783,6 +783,76 @@ void GBComputationGroupWrap::gb_signal_het_v3_get_ll(
         nchannels, tdi_type, project_real);
 }
 
+void GBComputationGroupWrap::gb_signal_het_v4_get_ll(
+    GBTDIonTheFlyWrap *tdi_wrap,
+    array_type<double> d_h_out, array_type<double> h_h_out,
+    array_type<std::complex<double>> c0_sparse_all,
+    array_type<std::complex<double>> A0_all,
+    array_type<std::complex<double>> A1_all,
+    array_type<std::complex<double>> B0_all,
+    array_type<std::complex<double>> B1_all,
+    array_type<std::complex<double>> B0nc_all,
+    array_type<std::complex<double>> B1nc_all,
+    array_type<int> n_sparse_local_arr,
+        array_type<double> band_w, array_type<int> band_j0, int band_len,
+    array_type<double> params_cand_all,
+    array_type<double> params_ref_all,
+    array_type<int> data_index_all,
+    int num_bin, int num_data,
+    int n_nodes, int n_knots, int nparams, int f0_idx, int fdot_idx,
+    int Nf, int Nt, int Nf_active, int Nt_active,
+    int Nt_layer, int N_sparse_t, int stride,
+    int ind_min_t, int ind_min_f,
+    int m_active_half_width,
+    double layer_df, double dt,
+    double T_obs, double t_start,
+    int nchannels, int tdi_type, int project_real)
+{
+    const size_t b_xyz  = (size_t) num_data * nchannels * nchannels
+                        * Nf_active * N_sparse_t;
+    const size_t b_diag = (size_t) num_data * nchannels * Nf_active * N_sparse_t;
+
+    gb_signal_het_v4_get_ll_wrap(
+        tdi_wrap->waveform,
+        return_pointer_and_check_length(d_h_out, "d_h_out", num_bin, 1),
+        return_pointer_and_check_length(h_h_out, "h_h_out", num_bin, 1),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            c0_sparse_all, "c0_sparse_all",
+            (size_t) num_data * nchannels * Nf_active * N_sparse_t, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            A0_all, "A0_all",
+            (size_t) num_data * nchannels * Nf_active * N_sparse_t, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            A1_all, "A1_all",
+            (size_t) num_data * nchannels * Nf_active * N_sparse_t, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B0_all, "B0_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B1_all, "B1_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B0nc_all, "B0nc_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B1nc_all, "B1nc_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        return_pointer_and_check_length(n_sparse_local_arr, "n_sparse_local",
+                                         N_sparse_t, 1),
+        band_w.data(), band_j0.data(), band_len,
+        return_pointer_and_check_length(params_cand_all, "params_cand_all",
+                                         nparams, num_bin),
+        return_pointer_and_check_length(params_ref_all, "params_ref_all",
+                                         nparams, num_data),
+        return_pointer_and_check_length(data_index_all, "data_index_all",
+                                         num_bin, 1),
+        num_bin, num_data,
+        n_nodes, n_knots, nparams, f0_idx, fdot_idx,
+        Nf, Nt, Nf_active, Nt_active,
+        Nt_layer, N_sparse_t, stride,
+        ind_min_t, ind_min_f,
+        m_active_half_width,
+        layer_df, dt,
+        T_obs, t_start,
+        nchannels, tdi_type, project_real);
+}
+
 void GBComputationGroupWrap::gb_signal_het_fill_global_in_kernel(
     GBTDIonTheFlyWrap *tdi_wrap,
     array_type<double> template_fill,
@@ -1091,6 +1161,8 @@ void gbgpu_part(nb::module_ &m) {
          "fold iterates only the N_sparse_fd nonzero bins. Stage 2b will fill "
          "X_het in-kernel from the source-class heterodyned sparse rfft.")
     .def("gb_signal_het_v3_get_ll", &GBComputationGroupWrap::gb_signal_het_v3_get_ll,
+         "Signal-het V3: ratio-spline candidate build straight into the bin-fold")
+    .def("gb_signal_het_v4_get_ll", &GBComputationGroupWrap::gb_signal_het_v4_get_ll,
          "Signal-het V3: ratio-spline candidate build straight into the bin-fold")
     .def("gb_signal_het_get_ll_in_kernel", &GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel,
          "Stage 2b in-kernel sparse-FD signal-het get_ll. Fuses "
