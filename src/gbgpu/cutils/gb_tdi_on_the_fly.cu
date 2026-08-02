@@ -4420,6 +4420,7 @@ static inline size_t gb_sighet_v4_shared_bytes(
 }
 
 
+CUDA_DEVICE
 void gb_signal_het_v4_score_one_source(
     double *dh_partial, double *hh_partial,
     double *band_w, int *band_j0, int band_len,
