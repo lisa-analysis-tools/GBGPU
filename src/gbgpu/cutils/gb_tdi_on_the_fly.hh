@@ -607,6 +607,33 @@ class GBComputationGroup{
         int     N_sparse_fd, double tukey_alpha, double max_r, int project_real,
         int     n_cp_sig = 0);
 
+    // Signal-het V3 -- RATIO-SPLINE candidate build (2026-07-30). Models the
+    // heterodyne ratio r directly: raw TDI for candidate + reference at
+    // n_nodes uniform times, per-channel cubic splines of (dlnA, dphi)
+    // with analytic carrier-difference de-rotation, r evaluated at the
+    // sparse WDM sample times straight into the v2 bin-fold. No FFT, no
+    // polyphase, no division. See the v3 section in gb_tdi_on_the_fly.cu.
+    void gb_signal_het_v3_get_ll_wrap(
+        GBTDIonTheFly *tdi_on_fly,
+        double *d_h_out, double *h_h_out,
+        cmplx  *c0_sparse_all,
+        cmplx  *A0_all, cmplx *A1_all,
+        cmplx  *B0_all, cmplx *B1_all,
+        cmplx  *B0nc_all, cmplx *B1nc_all,
+        int    *n_sparse_local_arr,
+        double *params_cand_all,
+        double *params_ref_all,
+        int    *data_index_all,
+        int     num_bin, int num_data,
+        int     n_nodes, int nparams, int f0_idx, int fdot_idx,
+        int     Nf, int Nt, int Nf_active, int Nt_active,
+        int     Nt_layer, int N_sparse_t, int stride,
+        int     ind_min_t, int ind_min_f,
+        int     m_active_half_width,
+        double  layer_df, double dt,
+        double  T_obs, double t_start,
+        int     nchannels, int tdi_type, int project_real);
+
     // Signal-het fill_global. Same FD + polyphase + r_sparse machinery as
     // get_ll, but reconstructs the dense template via the heterodyne
     // identity (linear-interp r_demod -> re-rotate carrier -> multiply by

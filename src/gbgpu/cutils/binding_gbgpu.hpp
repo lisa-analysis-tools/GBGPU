@@ -853,6 +853,34 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         int N_sparse_fd, double tukey_alpha, double max_r, int project_real,
         int n_cp_sig);
 
+    // Signal-het V3 -- ratio-spline candidate build: raw TDI at n_nodes for
+    // candidate + reference, cubic ratio splines, r straight into the v2
+    // bin-fold (no FFT / polyphase / division). Same stash arrays as the
+    // v2 in-kernel entry minus the window (no polyphase).
+    void gb_signal_het_v3_get_ll(
+        GBTDIonTheFlyWrap *tdi_wrap,
+        array_type<double> d_h_out, array_type<double> h_h_out,
+        array_type<std::complex<double>> c0_sparse_all,
+        array_type<std::complex<double>> A0_all,
+        array_type<std::complex<double>> A1_all,
+        array_type<std::complex<double>> B0_all,
+        array_type<std::complex<double>> B1_all,
+        array_type<std::complex<double>> B0nc_all,
+        array_type<std::complex<double>> B1nc_all,
+        array_type<int> n_sparse_local_arr,
+        array_type<double> params_cand_all,
+        array_type<double> params_ref_all,
+        array_type<int> data_index_all,
+        int num_bin, int num_data,
+        int n_nodes, int nparams, int f0_idx, int fdot_idx,
+        int Nf, int Nt, int Nf_active, int Nt_active,
+        int Nt_layer, int N_sparse_t, int stride,
+        int ind_min_t, int ind_min_f,
+        int m_active_half_width,
+        double layer_df, double dt,
+        double T_obs, double t_start,
+        int nchannels, int tdi_type, int project_real);
+
     // Signal-het fill_global. Reuses Stage 2b's FD + polyphase machinery to
     // build r at sparse n, then linear-interpolates r to the dense WDM
     // time grid, re-rotates the carrier, multiplies by the stored full

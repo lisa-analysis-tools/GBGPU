@@ -210,6 +210,29 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     def xp(self):
         return self.backend.xp
 
+    def _resolve_v3_nodes(self, x, di):
+        """Node count for the v3 ratio build.  ``v3_n_nodes > 0`` = fixed;
+        ``-1`` = ADAPTIVE from the batch's worst predicted ratio variation
+        (sky-Doppler amplitude + inclination/psi displacement vs each
+        candidate's reference): n = 16 * (D/0.4)^(1/4), clipped [8, 64] --
+        calibrated by the prototype's 1-yr axis sweep + 240-proposal stress
+        test.  One scalar device sync per call in adaptive mode."""
+        g = self._g
+        v3 = int(g.get("v3_n_nodes", 0))
+        if v3 > 0:
+            return max(4, v3)
+        xp = self.xp
+        R_LT = 499.00478
+        refs = self.params_ref_all[di]
+        dlam = (x[:, 7] - refs[:, 7]) * xp.cos(refs[:, 8])
+        dbet = x[:, 8] - refs[:, 8]
+        angsep = xp.sqrt(dlam * dlam + dbet * dbet)
+        D = (2.0 * np.pi * x[:, 1] * R_LT * angsep
+             + xp.abs(x[:, 5] - refs[:, 5]) + xp.abs(x[:, 6] - refs[:, 6]))
+        d_max = float(xp.max(D)) if D.size else 0.0
+        return int(np.clip(
+            math.ceil(16.0 * (max(d_max, 1e-3) / 0.4) ** 0.25), 8, 64))
+
     # ------------------------------------------------------------------
     # Band-engine mode: sig-het scoring INSIDE the GB special move.
     #
@@ -232,7 +255,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
 
     @classmethod
     def for_band_engine(cls, chunked_comp, *, nt_layer=64, n_sparse_fd=1024,
-                        m_active_half_width=2, max_r=0.0, n_cp_build=-1):
+                        m_active_half_width=2, max_r=0.0, n_cp_build=-1,
+                        v3_n_nodes=0):
         """Build a data-less engine-mode instance around ``chunked_comp``.
 
         ``max_r=0`` disables the kernel's heterodyne-ratio magnitude clip.
@@ -325,7 +349,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                        n_sparse_fd=int(n_sparse_fd),
                        tukey_alpha=tukey_alpha, max_r=float(max_r),
                        m_half=self.m_half,
-                       n_cp_build=_resolve_n_cp(n_cp_build, Tobs))
+                       n_cp_build=_resolve_n_cp(n_cp_build, Tobs),
+                       v3_n_nodes=int(v3_n_nodes))
         # Deltas are what the in-model repeats consume; keep the chunked
         # delegate's d_d convention so absolute ll values line up too.
         self.d_d = float(getattr(chunked_comp, "d_d", 0.0))
@@ -673,6 +698,26 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         h_h = xp.zeros(N, dtype=xp.float64)
         num_data = int(self.params_ref_all.shape[0])
         g = self._g
+        if g.get("v3_n_nodes", 0):
+            # V3: ratio-spline candidate build straight into the bin-fold
+            # (no FFT / polyphase / division). Consumes the SAME stash as
+            # v2 -- setup_in_model needs no v3-specific work.
+            self.cpp.gb_signal_het_v3_get_ll(
+                self.tdi_wrap, d_h, h_h, self.c0_sparse_all,
+                self.A0_all, self.A1_all, self.B0_all, self.B1_all,
+                self.B0nc_all, self.B1nc_all,
+                self.n_sparse_local,
+                x, self.params_ref_all, di,
+                N, num_data,
+                self._resolve_v3_nodes(x, di), 9, 1, 2,
+                g["Nf"], g["Nt"], g["Nf_active"], g["Nt_active"],
+                g["nt_layer"], g["N_sparse_t"], g["stride"],
+                g["ind_min_t"], g["ind_min_f"], g["m_half"],
+                g["layer_df"], g["dt"], g["Tobs"], g["t0"],
+                3, 0, 1)                      # XYZ, project_real=1
+            self.last_d_h = d_h.copy()
+            self.last_h_h = h_h.copy()
+            return -0.5 * self.d_d + d_h - 0.5 * h_h
         self.cpp.gb_signal_het_get_ll_in_kernel(
             self.tdi_wrap, d_h, h_h, self.c0_sparse_all,
             self.A0_all, self.A1_all, self.B0_all, self.B1_all,
