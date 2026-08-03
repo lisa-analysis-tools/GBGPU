@@ -1338,3 +1338,216 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         if scales_remove is not None:
             grad_remove = grad_remove * scales_remove[None, :]
         return grad_add, grad_remove
+
+    # ------------------------------------------------------------------
+    # Fisher information (numerical-first): central differences of the
+    # fill_global_stft template rows, contracted with the bound group's
+    # inverse covariance under get_ll_stft's own normalization.
+    # ------------------------------------------------------------------
+    def _resolve_info_group(self, holder):
+        """Computation group whose invC rows the Fisher contracts against.
+
+        ``holder`` mirrors the FD/WDM ``information_matrix`` contract (the
+        proposal path passes the parent ``AnalysisContainerArray`` so the
+        contraction runs against the parent walker rows, whatever band
+        buffer the engine currently has this comp bound to). ``None`` keeps
+        the bound ``stft_comps``; an ``AnalysisContainerArray`` resolves to
+        its (single) split's group; anything else is assumed to already be
+        an ``STFTComputationGroup``.
+        """
+        if holder is None:
+            return self.stft_comps
+        splits = getattr(holder, "cpp_splits", None)
+        if splits is not None:
+            if len(splits) != 1:
+                raise NotImplementedError(
+                    "STFTGBComputations.information_matrix supports a single "
+                    f"GPU split (got {len(splits)}); multi-split routing "
+                    "arrives with the sharding re-graft."
+                )
+            return splits[0]
+        return holder
+
+    def information_matrix(self, params, holder=None, inds=None,
+                           param_eps=None, param_scales=None,
+                           param_eps_relative=1.0e-6,
+                           easy_central_difference: bool = False,
+                           noise_index=None,
+                           convert_to_ra_dec: Optional[bool] = None,
+                           batch_size: Optional[int] = None):
+        """Per-source Fisher information matrix over the STFT (Fresnel) domain.
+
+        Signature parity with :meth:`GBFDComputations.information_matrix` so
+        the proposal-Cholesky dispatch is domain-symmetric. The derivative
+        templates ``dh/dtheta_i`` are built by central differences of the
+        :meth:`fill_global_stft` rows (2nd order by default; 1st order with
+        ``easy_central_difference=True``) and folded into the STFT inner
+        product
+
+        ``Gamma_ij = 4 df Re sum_{c,d,t,f} dh_i,c^*(t,f) invC_{c,d}(t,f) dh_j,d(t,f)``
+
+        which is exactly the normalization the ``gb_stft_get_ll`` kernel
+        applies at the fill-path template scale (verified against the
+        kernel's ``h_h_out`` / ``d_h_out`` under both diagonal and
+        cross-channel Hermitian invC: ratio ``4*df`` to ~1e-15). XYZ uses
+        the full cross-channel invC; channel-diagonal groups use the
+        per-channel product. Derivative templates are always evaluated on
+        the astro track (``freq_from_tdi_phase=False``) whatever the
+        sampling configuration — the TDI-phase-derived track differences
+        noisily (see the inline note), while the astro-track family
+        differences exactly and matches it to the ~1e-4-relative Doppler.
+
+        Args:
+            params: ``(num_bin, nparams)`` GB parameters (1D auto-promoted),
+                in the run frame the STFT kernels consume (no RA/DEC
+                conversion here — ``convert_to_ra_dec`` must be falsy).
+            holder: parity slot for the FD/WDM call shape. ``None`` uses the
+                bound ``stft_comps``; an ``AnalysisContainerArray`` resolves
+                to its single split's group (the proposal path passes the
+                parent holder so the contraction is against the parent
+                walker rows keyed by ``noise_index``).
+            inds: parameter indices to include (default all ``nparams``).
+            param_eps / param_scales / param_eps_relative: finite-difference
+                steps, mirroring :meth:`get_ll_grad_stft`.
+            easy_central_difference: 1st-order derivative when ``True``.
+            noise_index: per-binary index into the group's invC rows.
+            batch_size: source-batch size to bound the ``dh`` workspace
+                (default: all sources at once).
+
+        Returns:
+            ``(num_bin, num_derivs, num_derivs)`` real Fisher matrices.
+        """
+        if convert_to_ra_dec:
+            raise ValueError(
+                "STFTGBComputations.information_matrix takes run-frame "
+                "params directly; convert_to_ra_dec is not supported."
+            )
+        xp = self.xp
+        group = self._resolve_info_group(holder)
+
+        p = self._prep_params(params)
+        num_bin, nparams = p.shape
+        if inds is None:
+            inds = list(range(nparams))
+        else:
+            inds = [int(i) for i in xp.asarray(inds).tolist()]
+        num_derivs = len(inds)
+
+        eps_theta, scales = self._resolve_eps_and_scales(
+            nparams, param_eps, param_scales, param_eps_relative,
+        )
+        if param_eps is None and param_scales is None and nparams > 1:
+            # Default-table refinement for the astro-track differencing below
+            # (measured on the cross-domain fixture): at the shared table's
+            # steps, double roundoff in the Fresnel phase leaves Gamma_f0f0
+            # ~2% high (f0 step 2e-14 Hz) and Gamma_fdot,fdot ~13% high
+            # (fdot step 1e-21). 10x f0 / 100x fdot sit on the converged
+            # plateau (<0.4% residual) while still ~1e-9 of a bin width /
+            # ~1e-2 of sigma_fdot.
+            eps_theta = eps_theta.copy()
+            eps_theta[1] = eps_theta[1] * 10.0
+            if nparams > 2:
+                eps_theta[2] = eps_theta[2] * 100.0
+
+        info = xp.zeros((num_bin, num_derivs, num_derivs), dtype=xp.float64)
+        if num_bin == 0:
+            return info
+
+        _, noise_index = self._resolve_indices(num_bin, None, noise_index)
+        assert int(noise_index.max()) < group.num_noise
+
+        settings = group.settings
+        n_t, n_f = int(settings.NT), int(settings.NF_active)
+        nch = int(group.num_channels)
+        df = float(settings.df)
+
+        # The SAME owned complex buffer the C++ domain reads (pinned by the
+        # group; see _owned_cpp_array's dangling-pointer contract).
+        inv_flat = group._owned_cpp_array("invC", group.invC_arr, xp.complex128)
+        if inv_flat.size == group.num_noise * nch * nch * n_t * n_f:
+            inv_rows = inv_flat.reshape(group.num_noise, nch, nch, n_t, n_f)
+            cross_channel = True
+        elif inv_flat.size == group.num_noise * nch * n_t * n_f:
+            inv_rows = inv_flat.reshape(group.num_noise, nch, n_t, n_f)
+            cross_channel = False
+        else:
+            raise ValueError(
+                f"invC buffer size {inv_flat.size} matches neither the "
+                f"cross-channel nor the diagonal layout for num_noise="
+                f"{group.num_noise}, nch={nch}, NT={n_t}, NF_active={n_f}."
+            )
+
+        if batch_size is None or batch_size <= 0:
+            batch_size = num_bin
+
+        # fill_global_stft routes through self.stft_comps' cpp objects; bind
+        # the resolved group for the duration so fill grid and invC rows are
+        # the same group's (whole-grid layouts are identical across parent
+        # and band-buffer groups, but keep them from one source of truth).
+        #
+        # Derivative templates are ALWAYS evaluated on the astro track
+        # (freq_from_tdi_phase=False), whatever the sampling configuration:
+        # the TDI-phase-derived per-column (f0, fdot) estimates carry an
+        # evaluation-noise floor (~1e-10 rad on ~1e5-rad carriers, see
+        # lat_stft_kernels.hh), so central differences across that machinery
+        # diverge as 1/eps (measured |dh_phi0|/|h| up to ~1e3 at the default
+        # steps). The astro-track family differences exactly (dh_phi0 ==
+        # -i*h to machine precision) and agrees with the TDI-phase family to
+        # the ~1e-4-relative Doppler in <h|h> -- a Fisher-shape difference
+        # far below the finite-difference budget, and M-H corrects proposal
+        # shape regardless.
+        prev_group = self.stft_comps
+        prev_fftp = self.freq_from_tdi_phase
+        try:
+            if group is not prev_group:
+                self.stft_comps = group
+            self.freq_from_tdi_phase = False
+
+            for s in range(0, num_bin, batch_size):
+                e = min(s + batch_size, num_bin)
+                pb = p[s:e]
+                nb = e - s
+                row_idx = xp.arange(nb, dtype=xp.int32)
+                buf = xp.zeros((nb, nch, n_t, n_f), dtype=xp.complex128)
+
+                def _templates(pp):
+                    buf[:] = 0.0
+                    self.fill_global_stft(pp, buf, data_index=row_idx)
+                    return buf.copy()
+
+                dh = xp.zeros((nb, num_derivs, nch, n_t, n_f),
+                              dtype=xp.complex128)
+                for di, ind in enumerate(inds):
+                    ei = float(eps_theta[ind])
+                    up1 = pb.copy(); up1[:, ind] += ei
+                    dn1 = pb.copy(); dn1[:, ind] -= ei
+                    h_up1 = _templates(up1)
+                    h_dn1 = _templates(dn1)
+                    if easy_central_difference:
+                        dh[:, di] = (h_up1 - h_dn1) / (2.0 * ei)
+                    else:
+                        up2 = pb.copy(); up2[:, ind] += 2.0 * ei
+                        dn2 = pb.copy(); dn2[:, ind] -= 2.0 * ei
+                        h_up2 = _templates(up2)
+                        h_dn2 = _templates(dn2)
+                        dh[:, di] = (
+                            -h_up2 + h_dn2 + 8.0 * (h_up1 - h_dn1)
+                        ) / (12.0 * ei)
+
+                invc_b = inv_rows[noise_index[s:e]]
+                if cross_channel:
+                    info[s:e] = (4.0 * df * xp.einsum(
+                        "bicts,bcdts,bjdts->bij", dh.conj(), invc_b, dh)).real
+                else:
+                    info[s:e] = (4.0 * df * xp.einsum(
+                        "bicts,bjcts,bcts->bij", dh.conj(), dh, invc_b)).real
+        finally:
+            self.freq_from_tdi_phase = prev_fftp
+            if group is not prev_group:
+                self.stft_comps = prev_group
+
+        if scales is not None:
+            scales_sel = xp.asarray([scales[i] for i in inds],
+                                    dtype=xp.float64)
+            info = info * scales_sel[None, :, None] * scales_sel[None, None, :]
+        return info
