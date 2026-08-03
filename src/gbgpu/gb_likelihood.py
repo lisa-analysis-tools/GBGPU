@@ -373,6 +373,7 @@ class FDBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         start_freq_inds=None,
         data_length: Optional[int] = None,
         opt_snr_rej_samp_limit: float = 5.0,
+        snr_rej_detected: bool = False,
     ):
         self.gb_fd_comp = gb_fd_comp          # config-only comp
         self.basis_settings = basis_settings
@@ -384,6 +385,11 @@ class FDBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         self.start_freq_inds = start_freq_inds
         self.data_length = data_length
         self.opt_snr_rej_samp_limit = opt_snr_rej_samp_limit
+        # Optional companion test on the DETECTED snr d_h/sqrt(h_h) against
+        # the same limit (default OFF): the optimal-SNR boundary is a
+        # property of the template, the detected one fluctuates with the
+        # noise realization.
+        self.snr_rej_detected = bool(snr_rej_detected)
 
     @property
     def xp(self):
@@ -669,12 +675,18 @@ class WDMBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         nchannels: int,
         tdi_channel_setup: str,
         opt_snr_rej_samp_limit: float = 5.0,
+        snr_rej_detected: bool = False,
     ):
         self.gb_comps = gb_comps
         self.basis_settings = basis_settings
         self.nchannels = nchannels
         self.tdi_channel_setup = tdi_channel_setup
         self.opt_snr_rej_samp_limit = opt_snr_rej_samp_limit
+        # Optional companion test on the DETECTED snr d_h/sqrt(h_h) against
+        # the same limit (default OFF): the optimal-SNR boundary is a
+        # property of the template, the detected one fluctuates with the
+        # noise realization.
+        self.snr_rej_detected = bool(snr_rej_detected)
 
     @property
     def xp(self):
@@ -973,6 +985,7 @@ def make_band_likelihood_engine(
     start_freq_inds=None,
     data_length: Optional[int] = None,
     opt_snr_rej_samp_limit: float = 5.0,
+    snr_rej_detected: bool = False,
 ) -> BandLikelihoodEngine:
     """Construct the right engine for the supplied basis-domain settings.
 
@@ -1005,6 +1018,7 @@ def make_band_likelihood_engine(
             start_freq_inds=start_freq_inds,
             data_length=data_length,
             opt_snr_rej_samp_limit=opt_snr_rej_samp_limit,
+            snr_rej_detected=snr_rej_detected,
         )
     if isinstance(basis_settings, WDMSettings):
         if gb_wdm_comp is None:
@@ -1019,6 +1033,7 @@ def make_band_likelihood_engine(
             nchannels=nchannels,
             tdi_channel_setup=tdi_channel_setup,
             opt_snr_rej_samp_limit=opt_snr_rej_samp_limit,
+            snr_rej_detected=snr_rej_detected,
         )
     raise NotImplementedError(
         f"No BandLikelihoodEngine for basis domain {type(basis_settings).__name__}."
