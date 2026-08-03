@@ -235,7 +235,12 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         import numpy as _np
         K = int(g["v4_knots"])
         tau_k = _np.linspace(0.0, g["Tobs"], K)
-        n_glob = (g["ind_min_t"] + _np.asarray(self.n_sparse_local)[0]
+        # n_sparse_local lives on the DEVICE under a CUDA backend; the
+        # cardinal weights are built once on the host with scipy, so pull
+        # it across explicitly (cupy refuses implicit conversion).
+        _nsl = self.n_sparse_local
+        _nsl = _nsl.get() if hasattr(_nsl, "get") else _np.asarray(_nsl)
+        n_glob = (g["ind_min_t"] + _nsl[0]
                   + _np.arange(g["N_sparse_t"]) * g["stride"])
         t_pix = n_glob * g["Nf"] * g["dt"]          # tau at the sparse pixels
         dt_k = tau_k[1] - tau_k[0]
