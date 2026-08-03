@@ -3197,6 +3197,20 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
     gpuErrchk(cudaMemset(c0_sparse_out, 0, n_sparse_tot * sizeof(cmplx)));
     gpuErrchk(cudaMemset(c0_dense_out,  0, n_dense_tot  * sizeof(cmplx)));
 
+    // TODO(cuFFT, deferred 2026-08-02): this shared budget is the HARD
+    // T_obs ceiling of the whole sig-het family -- 145 KB at 4 yr on a
+    // 163 KB device, and it FAILS outright at 8 yr. The reference build
+    // runs once per block / re-anchor, so unlike the per-candidate scorer
+    // it can afford a global-memory round trip: a host-side batched cuFFT
+    // (NOT cuFFTDx, which would re-introduce the mathdx dependency that
+    // GBGPU_WITH_SHAREDMEM=OFF just removed from the default build) would
+    // lift the ceiling entirely and let N_t scale past 4 yr.
+    //   Measured context: the per-candidate hot path would NOT benefit --
+    //   chunked-het's cost is waveform EVALUATION (its evaluation count
+    //   grows with T_obs), not FFT, and the fused shared-memory pipeline
+    //   there is worth more than cuFFT's better transform throughput.
+    //   So: apply cuFFT to make_reference only, and only when a >4 yr
+    //   baseline is actually needed.
     const int shared_bytes = (int) (((size_t) Nt + (size_t) N_sparse_fd
                                      + (size_t) Nt_layer) * sizeof(cmplx));
     if (shared_bytes > 48 * 1024)

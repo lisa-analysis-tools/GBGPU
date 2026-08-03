@@ -265,7 +265,32 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         (sky-Doppler amplitude + inclination/psi displacement vs each
         candidate's reference): n = 16 * (D/0.4)^(1/4), clipped [8, 64] --
         calibrated by the prototype's 1-yr axis sweep + 240-proposal stress
-        test.  One scalar device sync per call in adaptive mode."""
+        test.  One scalar device sync per call in adaptive mode.
+
+        TODO(T_obs-aware node law, 2026-08-02): this law is calibrated at
+        ONE baseline (1 yr) and is blind to T_obs -- but the ratio's
+        structure is dominated by the ANNUAL modulation (sky-Doppler and
+        antenna-pattern), so the number of oscillations the spline has to
+        represent scales as T_obs / 1 yr.  Consequences, both measurable
+        with gb_sighet_proof_figure.py (which now measures accuracy at
+        every T_obs):
+          * SHORT baselines are over-resolved.  At 1 month the ratio makes
+            ~1/12 of a modulation cycle, so ~8-16 nodes should match what
+            64 buys at 1 yr -- and since raw node evaluations DOMINATE the
+            per-candidate cost, that is close to a linear speedup (~4x at
+            1 month), not a marginal one.
+          * LONG baselines may be UNDER-resolved.  The flat ~15 us/candidate
+            measured out to 4 yr holds n_r = 64 fixed; if the accuracy panel
+            degrades with T_obs beyond the known sparse-stride effect, the
+            fit -- not the evaluation -- is the cause and n_r must grow.
+        Proposed form: n_r ~ clip(ceil(k * (T_obs/yr) * (SNR^2 D / eps)^(1/4)),
+        8, n_max), i.e. fold the baseline in alongside the displacement and
+        the already-stashed reference SNR (the SNR-awareness is the other
+        half of this TODO -- raw lnL error scales as SNR^2 x mismatch, so a
+        loud source needs a finer fit for the same lnL accuracy).
+        Note polynomial phase (df0, dfdot) costs NO extra nodes at any
+        baseline -- cubic splines represent it exactly -- so this law should
+        key on the sky/inclination/polarization displacement only."""
         g = self._g
         v3 = int(g.get("v3_n_nodes", 0))
         if v3 > 0:
