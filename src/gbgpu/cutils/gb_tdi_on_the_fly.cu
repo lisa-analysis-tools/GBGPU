@@ -3063,10 +3063,10 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
     // (window width Nt, layer stride half_Nt), so the dense iDFT totals
     // O(2 * N_sparse_fd * Nt_active) per (d, c) instead of the previous
     // O(Nf_active * Nt * Nt_active) full sweep.
-    const size_t n_sparse_tot = (size_t) num_data * nchannels * Nf_active * N_sparse_t;
-    const size_t n_dense_tot  = (size_t) num_data * nchannels * Nf_active * Nt_active;
-    std::fill(c0_sparse_out, c0_sparse_out + n_sparse_tot, cmplx(0.0, 0.0));
-    std::fill(c0_dense_out,  c0_dense_out  + n_dense_tot,  cmplx(0.0, 0.0));
+    const size_t n_sparse_tot_cpu = (size_t) num_data * nchannels * Nf_active * N_sparse_t;
+    const size_t n_dense_tot_cpu  = (size_t) num_data * nchannels * Nf_active * Nt_active;
+    std::fill(c0_sparse_out, c0_sparse_out + n_sparse_tot_cpu, cmplx(0.0, 0.0));
+    std::fill(c0_dense_out,  c0_dense_out  + n_dense_tot_cpu,  cmplx(0.0, 0.0));
 
     std::vector<cmplx> fold_s(Nt_layer);
     std::vector<cmplx> fold_d(Nt);
