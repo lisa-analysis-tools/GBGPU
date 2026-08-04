@@ -656,6 +656,47 @@ class GBComputationGroup{
         double  T_obs, double t_start,
         int     nchannels, int tdi_type, int project_real);
 
+    // Signal-het V5 -- v4-banded with the per-candidate fold scratch
+    // (r_sparse, dr_sparse) ELIMINATED rather than relocated: they are an
+    // M-fold replication of r_pix modulated by one bit per (row, pixel), and
+    // that bit is candidate-independent, so it is precomputed once per
+    // reference build and arrives here bit-packed as ``c0_mask_all``. The
+    // scorer rebuilds r/dr in registers, which drops the per-pixel shared
+    // cost 528 -> 48 B/point and takes the footprint to 27.6 KB, constant in
+    // N_sparse_t up to N ~ 450 (5 blocks/SM on an A100 against v4's 1).
+    //
+    // Same argument shape as the v4 wrap with ``c0_sparse_all`` replaced by
+    // ``c0_mask_all`` (its precomputed derivative -- the scorer never needs
+    // c0 itself) plus one trailing selector:
+    //   v5_mode = 1 -> PHASE-ALIASED shared arena (banded only; the
+    //                  production candidate)
+    //   v5_mode = 2 -> FLAT carve, same arithmetic and traffic at ~3
+    //                  blocks/SM -- the A/B that isolates occupancy
+    // v5_mode = 2 against the v4 entry point isolates everything that is not
+    // occupancy; v5_mode = 1 against v5_mode = 2 isolates occupancy alone.
+    void gb_signal_het_v5_get_ll_wrap(
+        GBTDIonTheFly *tdi_on_fly,
+        double *d_h_out, double *h_h_out,
+        unsigned long long *c0_mask_all,
+        cmplx  *A0_all, cmplx *A1_all,
+        cmplx  *B0_all, cmplx *B1_all,
+        cmplx  *B0nc_all, cmplx *B1nc_all,
+        int    *n_sparse_local_arr,
+        double *band_w, int *band_j0, int band_len,
+        double *params_cand_all,
+        double *params_ref_all,
+        int    *data_index_all,
+        int     num_bin, int num_data,
+        int     n_nodes, int n_knots, int nparams, int f0_idx, int fdot_idx,
+        int     Nf, int Nt, int Nf_active, int Nt_active,
+        int     Nt_layer, int N_sparse_t, int stride,
+        int     ind_min_t, int ind_min_f,
+        int     m_active_half_width,
+        double  layer_df, double dt,
+        double  T_obs, double t_start,
+        int     nchannels, int tdi_type, int project_real,
+        int     v5_mode);
+
     // Signal-het fill_global. Same FD + polyphase + r_sparse machinery as
     // get_ll, but reconstructs the dense template via the heterodyne
     // identity (linear-interp r_demod -> re-rotate carrier -> multiply by

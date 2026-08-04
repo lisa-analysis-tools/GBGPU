@@ -853,6 +853,84 @@ void GBComputationGroupWrap::gb_signal_het_v4_get_ll(
         nchannels, tdi_type, project_real);
 }
 
+// ---- signal-het V5: the v4 body with c0_sparse_all -> c0_mask_all (the
+// ---- precomputed row-floor mask) plus the trailing v5_mode ---------------
+void GBComputationGroupWrap::gb_signal_het_v5_get_ll(
+    GBTDIonTheFlyWrap *tdi_wrap,
+    array_type<double> d_h_out, array_type<double> h_h_out,
+    array_type<uint64_t> c0_mask_all,
+    array_type<std::complex<double>> A0_all,
+    array_type<std::complex<double>> A1_all,
+    array_type<std::complex<double>> B0_all,
+    array_type<std::complex<double>> B1_all,
+    array_type<std::complex<double>> B0nc_all,
+    array_type<std::complex<double>> B1nc_all,
+    array_type<int> n_sparse_local_arr,
+    array_type<double> band_w, array_type<int> band_j0, int band_len,
+    array_type<double> params_cand_all,
+    array_type<double> params_ref_all,
+    array_type<int> data_index_all,
+    int num_bin, int num_data,
+    int n_nodes, int n_knots, int nparams, int f0_idx, int fdot_idx,
+    int Nf, int Nt, int Nf_active, int Nt_active,
+    int Nt_layer, int N_sparse_t, int stride,
+    int ind_min_t, int ind_min_f,
+    int m_active_half_width,
+    double layer_df, double dt,
+    double T_obs, double t_start,
+    int nchannels, int tdi_type, int project_real,
+    int v5_mode)
+{
+    const size_t b_xyz  = (size_t) num_data * nchannels * nchannels
+                        * Nf_active * N_sparse_t;
+    const size_t b_diag = (size_t) num_data * nchannels * Nf_active * N_sparse_t;
+    // One bit per (data, channel, active layer, sparse pixel), packed along
+    // the pixel axis -- 1/128 the size of c0_sparse_all itself.
+    const size_t n_mask = (size_t) num_data * nchannels * Nf_active
+                        * (size_t) ((N_sparse_t + 63) / 64);
+
+    gb_signal_het_v5_get_ll_wrap(
+        tdi_wrap->waveform,
+        return_pointer_and_check_length(d_h_out, "d_h_out", num_bin, 1),
+        return_pointer_and_check_length(h_h_out, "h_h_out", num_bin, 1),
+        reinterpret_cast<unsigned long long*>(
+            return_pointer_and_check_length(c0_mask_all, "c0_mask_all",
+                                            n_mask, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            A0_all, "A0_all",
+            (size_t) num_data * nchannels * Nf_active * N_sparse_t, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            A1_all, "A1_all",
+            (size_t) num_data * nchannels * Nf_active * N_sparse_t, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B0_all, "B0_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B1_all, "B1_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B0nc_all, "B0nc_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B1nc_all, "B1nc_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        return_pointer_and_check_length(n_sparse_local_arr, "n_sparse_local",
+                                         N_sparse_t, 1),
+        band_w.data(), band_j0.data(), band_len,
+        return_pointer_and_check_length(params_cand_all, "params_cand_all",
+                                         nparams, num_bin),
+        return_pointer_and_check_length(params_ref_all, "params_ref_all",
+                                         nparams, num_data),
+        return_pointer_and_check_length(data_index_all, "data_index_all",
+                                         num_bin, 1),
+        num_bin, num_data,
+        n_nodes, n_knots, nparams, f0_idx, fdot_idx,
+        Nf, Nt, Nf_active, Nt_active,
+        Nt_layer, N_sparse_t, stride,
+        ind_min_t, ind_min_f,
+        m_active_half_width,
+        layer_df, dt,
+        T_obs, t_start,
+        nchannels, tdi_type, project_real,
+        v5_mode);
+}
+
 void GBComputationGroupWrap::gb_signal_het_fill_global_in_kernel(
     GBTDIonTheFlyWrap *tdi_wrap,
     array_type<double> template_fill,
@@ -1164,6 +1242,21 @@ void gbgpu_part(nb::module_ &m) {
          "Signal-het V3: ratio-spline candidate build straight into the bin-fold")
     .def("gb_signal_het_v4_get_ll", &GBComputationGroupWrap::gb_signal_het_v4_get_ll,
          "Signal-het V3: ratio-spline candidate build straight into the bin-fold")
+    .def("gb_signal_het_v5_get_ll", &GBComputationGroupWrap::gb_signal_het_v5_get_ll,
+         "Signal-het V5: v4-banded with the per-candidate fold scratch "
+         "(r_sparse / dr_sparse) ELIMINATED rather than relocated. They are "
+         "an M-fold replication of r_pix modulated by one candidate-"
+         "independent bit per (row, pixel), so the bit is precomputed once "
+         "per reference build and passed here as c0_mask_all (in place of "
+         "c0_sparse_all, which the scorer no longer reads) and r/dr are "
+         "rebuilt in registers. Per-pixel shared cost 528 -> 48 B/point; "
+         "with the phase-lifetime arena the footprint is 27.6 KB, constant "
+         "in N_sparse_t up to N ~ 450. Bit-identical to v4. Trailing "
+         "v5_mode: 1 = phase-aliased arena (production; ~5 blocks/SM on an "
+         "A100 vs v4's 1), 2 = flat carve at the same arithmetic and "
+         "traffic (~3 blocks/SM) -- the A/B that isolates occupancy. "
+         "GB_SIGHET_V5_VERBOSE=1 prints registers/thread and CUDA's own "
+         "achieved blocks/SM for the launch.")
     .def("gb_signal_het_get_ll_in_kernel", &GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel,
          "Stage 2b in-kernel sparse-FD signal-het get_ll. Fuses "
          "gb_run_fd_wave_tdi (sparse heterodyned rfft from the GB source "

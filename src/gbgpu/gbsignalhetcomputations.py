@@ -30,7 +30,10 @@ import math
 import os
 from copy import deepcopy
 
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
 from scipy.signal.windows import tukey as _tukey
 
 from lisatools.domains import TDSettings, TDSignal, WDMSettings
@@ -81,6 +84,43 @@ def _resolve_n_cp(n_cp_build, Tobs):
         return int(n_cp_build)
     spacing = float(os.environ.get("SIGHET_N_CP_SPACING", 4.0 * 86400.0))
     return int(np.clip(int(math.ceil(float(Tobs) / spacing)) + 1, 32, 256))
+
+
+def _c0_row_mask_bits(c0, xp):
+    """Bit-packed |c0| row-floor mask -- the v5 scorer's only view of c0.
+
+    ``c0`` is the expanded reference stash, ``(n, nch, Nf_active,
+    N_sparse_t)``. Returns ``uint64`` of shape ``(n, nch, Nf_active,
+    ceil(N_sparse_t / 64))`` with bit ``b % 64`` of word ``b // 64`` set
+    where pixel ``b`` survives its row's floor.
+
+    This is EXACTLY the test the v4 kernel runs -- ``|c0| > max(1e-12 *
+    max_b |c0|, 1e-300)`` along each ``(c, m_local)`` row -- hoisted out of
+    the scorer. It depends only on the reference, never on the candidate
+    being scored, yet v4 recomputes it (and re-reads all of c0 twice, on
+    nch*M of 128 threads) inside every candidate's block. Doing it once here
+    is what lets the v5 fold rebuild ``r``/``dr`` from ``r_pix`` and one bit
+    instead of from a materialised 480 B/pixel shared scratch. See the V5
+    section of ``cutils/gb_tdi_on_the_fly.cu``.
+
+    ``max`` is exact and order-independent, and the comparison is the same
+    comparison, so the mask is bit-for-bit v4's -- which is what makes the
+    v5 fold bit-identical rather than merely equal to round-off.
+    """
+    mag = xp.abs(c0)
+    floor_a = 1e-12 * mag.max(axis=-1)
+    floor_th = xp.where(floor_a > 1e-300, floor_a, 1e-300)
+    keep = mag > floor_th[..., None]
+    N = keep.shape[-1]
+    nwords = (N + 63) // 64
+    pad = nwords * 64 - N
+    if pad:
+        keep = xp.concatenate(
+            [keep, xp.zeros(keep.shape[:-1] + (pad,), dtype=bool)], axis=-1)
+    k = keep.reshape(keep.shape[:-1] + (nwords, 64)).astype(xp.uint64)
+    # Disjoint bits, so the sum IS the bitwise or -- and it vectorises.
+    bits = xp.arange(64, dtype=xp.uint64)
+    return xp.ascontiguousarray((k << bits).sum(axis=-1, dtype=xp.uint64))
 
 
 def _recommended_edge_cut(Nt, tukey_alpha, margin=8):
@@ -330,7 +370,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     @classmethod
     def for_band_engine(cls, chunked_comp, *, nt_layer=64, n_sparse_fd=1024,
                         m_active_half_width=2, max_r=0.0, n_cp_build=-1,
-                        v3_n_nodes=0, v4_knots=0, v4_band=0):
+                        v3_n_nodes=0, v4_knots=0, v4_band=0, v5=0):
         """Build a data-less engine-mode instance around ``chunked_comp``.
 
         ``max_r=0`` disables the kernel's heterodyne-ratio magnitude clip.
@@ -343,6 +383,26 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         e^8 (~3e-6). The FLOOR_EPS reference floor in the kernel already
         guards the divide-by-small on its own. Set ``max_r > 0`` only as
         a diagnostic.
+
+        ``v5`` selects the V5 occupancy experiment (opt-in, default OFF --
+        with ``v5=0`` nothing about the v2/v3/v4 paths changes). It only
+        applies when ``v4_knots`` is set, since v5 IS v4 with the
+        per-candidate fold scratch eliminated: ``r_sparse``/``dr_sparse``
+        are an M-fold replication of ``r_pix`` modulated by one
+        candidate-independent bit per (row, pixel), so the bit is
+        precomputed in :meth:`setup_in_model` and the fold rebuilds r/dr in
+        registers. Per-pixel shared cost falls 528 -> 48 B/point, and the
+        arithmetic is unchanged, so v5 is BIT-identical to v4.
+
+        * ``v5 = 0`` -- off; ``v4_knots`` routes to the v4 entry point.
+        * ``v5 = 1`` -- v5 kernel with the phase-lifetime shared arena
+          (regions with disjoint lifetimes overlaid). ~27.6 KB, constant in
+          ``N_sparse_t`` up to N ~ 450, so an A100 should go 1 -> 5
+          blocks/SM and an H100 1 -> 7. The production candidate.
+        * ``v5 = 2`` -- v5 kernel with a FLAT carve: same arithmetic, same
+          traffic, ~3 blocks/SM. The A/B that isolates the occupancy change
+          from everything else, which is the question the experiment exists
+          to answer.
 
         Grid, orbits, TDI configuration, phase reference time, window and
         taper all come from the chunked delegate's ``wdm_settings`` (the
@@ -425,13 +485,14 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                        m_half=self.m_half,
                        n_cp_build=_resolve_n_cp(n_cp_build, Tobs),
                        v3_n_nodes=int(v3_n_nodes), v4_knots=int(v4_knots),
-                       v4_band=int(v4_band))
+                       v4_band=int(v4_band), v5=int(v5))
         # Deltas are what the in-model repeats consume; keep the chunked
         # delegate's d_d convention so absolute ll values line up too.
         self.d_d = float(getattr(chunked_comp, "d_d", 0.0))
         self._in_model = None
         self._slot_to_ref = None
         self._slot_to_ref_xp = None
+        self.c0_mask_all = None
         return self
 
     def setup_in_model(self, buffer_aca, params_ref_phys, data_index,
@@ -620,6 +681,10 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         A0s, A1s = _expand_A(A0s), _expand_A(A1s)
         B0s, B1s = _expand_B(B0s), _expand_B(B1s)
         B0ncs, B1ncs = _expand_B(B0ncs), _expand_B(B1ncs)
+        # The |c0| row-floor mask is the ONLY thing the fold needs from c0,
+        # and it depends only on the reference -- so build it here, once,
+        # instead of in every candidate's block. See _c0_row_mask_bits.
+        c0_mask = _c0_row_mask_bits(c0_sparse, xp)
 
         if self._in_model is not None:
             # Mid-block PATCH: re-anchor only the given slots (the move's
@@ -636,6 +701,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                     "sig-het in-model patch hit a slot with no reference; "
                     "mid-block refreshes must target the block's slots.")
             self.c0_sparse_all[ref_idx] = c0_sparse
+            self.c0_mask_all[ref_idx] = c0_mask
             self.A0_all[ref_idx] = A0s
             self.A1_all[ref_idx] = A1s
             self.B0_all[ref_idx] = B0s
@@ -650,6 +716,10 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         # with no further host<->device traffic. (Freshly allocated by the
         # expanders above, so already contiguous.)
         self.c0_sparse_all = c0_sparse
+        # v5's view of c0. Cheap (1/128 the size of c0_sparse_all) and built
+        # unconditionally so the v5 A/B never carries a setup-cost asymmetry
+        # against v4; v2/v3/v4 simply never read it.
+        self.c0_mask_all = c0_mask
         self.A0_all = A0s
         self.A1_all = A1s
         self.B0_all = B0s
@@ -673,6 +743,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         self._in_model = None
         self._slot_to_ref = None
         self._slot_to_ref_xp = None
+        self.c0_mask_all = None
 
     # ---- band-engine surface (chunked delegate + in-model routing) -------
 
@@ -688,8 +759,70 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     def hessian_wdm(self, *args, **kwargs):
         return self.chunked.hessian_wdm(*args, **kwargs)
 
-    def information_matrix(self, *args, **kwargs):
-        return self.chunked.information_matrix(*args, **kwargs)
+    def information_matrix(self, params, wdm_holder, inds=None, param_eps=None,
+                           noise_index=None, data_index=None, **kwargs):
+        """Information matrix; sig-het second-difference path when armed.
+
+        ``SIGHET_INFOMAT=1`` routes to
+        :func:`lisatools.info_matrix_ll.information_matrix_from_ll`, driven by
+        THIS object's in-model scorer -- so every evaluation reuses the block
+        reference ``setup_in_model`` already built and costs one fast candidate
+        score instead of a chunked-het swap launch. Requires an active in-model
+        block (``_in_model``); otherwise, and whenever the knob is off, falls
+        through to the validated chunked delegate.
+
+        Cost target: the point is to amortize against the block's repeats.
+        Per 120-source block, ~163 evaluations/source at sig-het speed is
+        ~0.3 s against ~2.3 s of repeats (~13%); the chunked path is ~5.6 s
+        (~250%).
+        """
+        from lisatools.info_matrix_ll import (
+            infomat_knob, information_matrix_from_ll,
+        )
+
+        if not infomat_knob("SIGHET_INFOMAT", False) or not self._in_model:
+            return self.chunked.information_matrix(
+                params, wdm_holder, inds=inds, param_eps=param_eps,
+                noise_index=noise_index, **kwargs)
+
+        xp = self.xp
+        p = xp.asarray(xp.atleast_2d(params))
+        if param_eps is None:
+            param_eps = self.chunked.default_param_eps(p.shape[1]) \
+                if hasattr(self.chunked, "default_param_eps") \
+                else xp.full(p.shape[1], 1e-7)
+        eps = xp.asarray(param_eps, dtype=xp.float64) * float(
+            infomat_knob("SIGHET_INFOMAT_EPS_SCALE", 1.0))
+
+        di = data_index if data_index is not None else noise_index
+        if di is None:
+            di = xp.zeros(p.shape[0], dtype=xp.int32)
+        di = xp.asarray(di)
+
+        def _call_ll(rows):
+            # Rows are the SAME sources repeated per corner, so the data_index
+            # tiles with them.
+            reps = int(rows.shape[0] // di.shape[0])
+            return self.get_ll_wdm(rows, wdm_holder,
+                                   data_index=xp.tile(di, reps),
+                                   noise_index=xp.tile(di, reps))
+
+        G = information_matrix_from_ll(
+            _call_ll, p, xp=xp, param_eps=eps, inds=inds,
+            one_sided=bool(infomat_knob("SIGHET_INFOMAT_ONESIDED", False)),
+        )
+
+        if infomat_knob("SIGHET_INFOMAT_VALIDATE", False):
+            ref = self.chunked.information_matrix(
+                params, wdm_holder, inds=inds, param_eps=param_eps,
+                noise_index=noise_index, **kwargs)
+            num = xp.abs(G - ref)
+            den = xp.maximum(xp.abs(ref), 1e-30)
+            logger.warning(
+                "[SIGHET_INFOMAT_VALIDATE] max reldiff %.3e | median %.3e "
+                "| max|ref| %.3e", float(xp.max(num / den)),
+                float(xp.median(num / den)), float(xp.max(xp.abs(ref))))
+        return G
 
     def get_ll_wdm(self, params, wdm_holder, data_index=None,
                    noise_index=None, **kwargs):
@@ -775,6 +908,44 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         g = self._g
         if g.get("v4_knots", 0) and self._v4_band_arrays is None:
             self._v4_band_arrays = self._make_v4_band_arrays()
+        if g.get("v4_knots", 0) and int(g.get("v5", 0)):
+            # V5: v4 with the per-candidate fold scratch (r_sparse /
+            # dr_sparse) ELIMINATED -- they are an M-fold replication of
+            # r_pix modulated by the candidate-independent |c0| row-floor
+            # mask that setup_in_model already built, so the scorer rebuilds
+            # r/dr in registers and reads ``c0_mask_all`` instead of
+            # ``c0_sparse_all``. Identical algebra, identical accumulation
+            # order -> bit-identical to v4. ``v5 == 1`` -> phase-aliased
+            # shared arena (~5 blocks/SM on an A100 against v4's 1);
+            # ``v5 == 2`` -> flat carve at the same arithmetic and traffic
+            # (~3 blocks/SM), the A/B that isolates occupancy. Opt-in;
+            # default 0 never reaches here.
+            _v5_mode = 1 if int(g["v5"]) == 1 else 2
+            if self.c0_mask_all is None:
+                raise RuntimeError(
+                    "sig-het v5 needs the |c0| row-floor mask, which "
+                    "setup_in_model builds alongside the coefficient stash; "
+                    "no in-model reference is active.")
+            self.cpp.gb_signal_het_v5_get_ll(
+                self.tdi_wrap, d_h, h_h, self.c0_mask_all,
+                self.A0_all, self.A1_all, self.B0_all, self.B1_all,
+                self.B0nc_all, self.B1nc_all,
+                self.n_sparse_local,
+                self._v4_band_arrays[0], self._v4_band_arrays[1],
+                self._v4_band_arrays[2],
+                x, self.params_ref_all, di,
+                N, num_data,
+                self._resolve_v3_nodes(x, di), int(g["v4_knots"]),
+                9, 1, 2,
+                g["Nf"], g["Nt"], g["Nf_active"], g["Nt_active"],
+                g["nt_layer"], g["N_sparse_t"], g["stride"],
+                g["ind_min_t"], g["ind_min_f"], g["m_half"],
+                g["layer_df"], g["dt"], g["Tobs"], g["t0"],
+                3, 0, 1,                      # XYZ, project_real=1
+                _v5_mode)
+            self.last_d_h = d_h.copy()
+            self.last_h_h = h_h.copy()
+            return -0.5 * self.d_d + d_h - 0.5 * h_h
         if g.get("v4_knots", 0):
             # V4: fixed-knot ratio evaluation. Same node-eval + log-polar
             # spline FIT as v3, but the fitted ratio is RESAMPLED onto

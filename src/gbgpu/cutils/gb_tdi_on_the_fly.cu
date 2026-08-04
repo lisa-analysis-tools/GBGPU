@@ -31,6 +31,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cstdio>    // printf -- sig-het V5 occupancy report (GB_SIGHET_V5_VERBOSE)
+#include <cstdlib>   // getenv / atoi / atoll / free -- sig-het V5 slab + knobs
+#include <cstdint>   // uintptr_t -- sig-het V5 shared-tail alignment
 
 // `N_PARAMS_MAX` is the upper bound on per-source parameter count
 // used by the shared-memory layout calculations below. Same value
@@ -5019,6 +5022,883 @@ void GBComputationGroup::gb_signal_het_v4_get_ll_wrap(
             n_sparse_local_arr,
             params_cand_all, params_ref_all,
             data_index_all[bin], bin,
+            n_nodes, n_knots, nparams, f0_idx, fdot_idx,
+            Nf, Nf_active, N_sparse_t, stride,
+            ind_min_t, ind_min_f, m_active_half_width,
+            layer_df, dt, T_obs, t_start,
+            nchannels, tdi_type, project_real);
+        d_h_out[bin] = 0.5 * dh_partial;
+        h_h_out[bin] = 0.5 * hh_partial;
+    }
+#endif
+}
+
+
+// ============================================================================
+// SIGNAL-HET V5 -- ELIMINATE THE PER-PIXEL FOLD SCRATCH
+//
+// Design: docs/superpowers/specs/2026-08-03-sighet-v5-global-residency-design.md
+// in LISAanalysistools, AS AMENDED -- see the 2026-08-04 progress note. The
+// spec's original premise (that the fold blocks are staged into shared memory
+// per block and could be de-duplicated in global) does not survive contact
+// with the v4 kernel: c0_sparse_all / A0 / A1 / B0 / B1 / B0nc / B1nc are
+// ALREADY kernel pointer arguments read straight from global in the folds.
+// They are never staged into shared. There is nothing there to relocate.
+//
+// v5 is v4-banded with IDENTICAL mathematics and a different data layout, and
+// it is BIT-identical to v4 by construction rather than equal to round-off:
+// every floating-point operation, its operands and their order are unchanged.
+// The node stage, the fixed-knot resample and the banded cardinal application
+// below are spliced verbatim from gb_signal_het_v4_score_one_source.
+//
+// WHAT v4 ACTUALLY SPENDS ITS SHARED MEMORY ON
+// --------------------------------------------
+// 143.4 KB per block at N_sparse_t = 204, of a 163 KB per-block limit, so
+// exactly ONE block is resident per SM. 73 % of it is three PER-CANDIDATE
+// scratch arrays:
+//
+//     r_pix      nch * N_sparse_t         cmplx      48 B / sparse point
+//     r_sparse   nch * M * N_sparse_t     cmplx     240 B / sparse point
+//     dr_sparse  nch * M * N_sparse_t     cmplx     240 B / sparse point
+//                                                   ---- 528 B / point
+//
+// THE TWO OBSERVATIONS v5 IS BUILT ON
+// -----------------------------------
+// (1) r_sparse and dr_sparse are REDUNDANT. By v4's own construction
+//
+//         r_sparse[c][im][b]  = keep(c, im, b) ? r_pix[c][b] : 0
+//         dr_sparse[c][im][b] = centred difference of that masked row
+//
+//     so 480 of the 528 bytes per point are an M-fold replication of r_pix
+//     modulated by ONE BIT per (row, pixel). v5 keeps r_pix and the bit and
+//     rebuilds r/dr in registers at the point of use.
+//
+// (2) The mask is CANDIDATE-INDEPENDENT. keep() compares |c0| against
+//     1e-12 * max_b |c0| along the row, and c0_sparse_all depends only on
+//     data_idx -- never on the candidate being scored. v4 nevertheless
+//     recomputes the row maxima and the mask inside every candidate's block:
+//     two full passes over nch*M*N_sparse_t global c0 values, on nch*M = 15
+//     of 128 threads. v5 hoists both into setup_in_model, where they are
+//     computed once per reference build and bit-packed along the pixel axis
+//     (``c0_mask_all``, 1/128 the size of c0).
+//
+// CONSEQUENCES
+// ------------
+//   * the producer loop DISAPPEARS from the scorer: 3*N_sparse_t block-
+//     sequential steps become one staging pass (612 -> 1 at N = 204), and
+//     one full read of c0 per candidate goes away (95 KB);
+//   * per-pixel shared cost falls 528 -> 48 B/point (r_pix alone; the staged
+//     mask words add nch*M*ceil(N/64)*8 B, 480 B at N = 204);
+//   * with the phase-lifetime arena below the footprint is CONSTANT in
+//     N_sparse_t up to N ~ 450: 27.6 KB, so 5 blocks/SM on an A100 and 7 on
+//     an H100 against v4's 1 -- and grids v4 physically cannot run
+//     (N_sparse_t >= 256 exceeds v4's PER-BLOCK limit) become reachable.
+//
+// PHASE-LIFETIME SHARED ARENA (v5_mode = 1, banded only)
+// ------------------------------------------------------
+// The scorer runs in four phases separated by existing CUDA_SYNC_THREADS,
+// and most of the carve is dead outside its own phase:
+//
+//   region  arrays                                          live in
+//   ------  ----------------------------------------------  ----------
+//     A     params_c, params_r                              all
+//     B     t_nodes                                         P1, P2
+//     C     dlnA, dphi, cA1-3, cP1-3                        P1, P2
+//     Bk    t_knots                                         P1, P2
+//     D     B_b, pcr -- node-sized here: banded mode skips   P1
+//           the knot solve entirely, so v4's knot-sized
+//           workspace is 4608 B of pure waste
+//     E     tdi_c/tdi_r, phiun_c/r, amp_y, ph_y, flip,       P1
+//           pjump, count, fix_c
+//     F     rk_re, rk_im                                    P2, P3
+//     G     rpix_re, rpix_im, mask_sh                       P3, P4
+//
+//   P1 node stage -> P2 knot resample -> P3 banded r_pix -> P4 fold
+//
+// So F ALIASES E (dead the moment the per-channel loop ends) and G aliases
+// B+C+Bk+D (dead once the knot resample has run). The arena is
+// max-over-phases, not sum-over-arrays: 27.6 KB instead of 43.7 KB.
+//
+// ``v5_mode = 2`` lays the same arrays out FLAT. Same arithmetic, same
+// traffic, ~3 blocks/SM instead of 5 -- the A/B that isolates the occupancy
+// change from everything else, which is the question the spec actually asks.
+// The non-banded path (band_len <= 0) always uses the flat layout because it
+// keeps cR/cI and t_knots live into P3.
+//
+// r_pix is stored as two double arrays rather than one cmplx array: a warp
+// reading 32 consecutive cmplx resolves in 4 shared-memory phases against 2
+// for doubles, and both r_pix loops already compute ``re`` and ``im``
+// separately, so the split costs nothing.
+//
+// WHY THIS SHOULD WIN, AND THE ONE NUMBER THAT SAYS SO
+// ----------------------------------------------------
+// v4-banded measures FLAT in T_obs while N_sparse_t grows with T_obs. The
+// O(N_sparse_t) work -- the producer loop and both folds -- is therefore NOT
+// what the kernel spends its time on; the fixed-size node stage (two
+// get_tdi_raw sweeps plus the log-polar fits) is. That is model-free evidence
+// that v5's arithmetic savings are worth ~nothing and its OCCUPANCY change is
+// worth everything: 1 -> 5 resident blocks is five candidates in flight per
+// SM to hide the node stage's dependent-FP and spline-lookup latency instead
+// of one.
+//
+// It also bounds the downside. v5 adds no global traffic (it removes 95 KB
+// per candidate), needs no extra shared memory, and changes no arithmetic, so
+// the realistic worst case is "the node stage was issue-bound rather than
+// latency-bound and nothing moved" -- which is exactly the finding the
+// experiment exists to produce. Registers are the one way the 5 is not
+// reached; the host wrap therefore reports CUDA's own occupancy number rather
+// than asserting this arithmetic.
+// ============================================================================
+
+// Round every region to 16 B so cmplx and unsigned long long stay aligned
+// whatever n_nodes / n_knots / N_sparse_t are. The host sizer and the device
+// carve BOTH go through this, which is what keeps them from drifting apart.
+#define GB_SIGHET_V5_AL(x) (((size_t) (x) + 15) & ~(size_t) 15)
+
+
+// Region sizes. Single source of truth for gb_sighet_v5_shared_bytes and for
+// the carve in gb_signal_het_v5_score_one_source.
+CUDA_CALLABLE_MEMBER
+static inline void gb_sighet_v5_region_sizes(
+    int n_nodes, int n_knots, int nchannels, int m_active_half_width,
+    int N_sparse_t, int band_len,
+    size_t *szA, size_t *szB, size_t *szC, size_t *szBk, size_t *szD,
+    size_t *szE, size_t *szF, size_t *szCI, size_t *szG)
+{
+    const int M = 2 * m_active_half_width + 1;
+    const int nwords = (N_sparse_t + 63) / 64;
+    // BANDED: the knot-level cooperative solve never runs, so the spline
+    // workspace only ever sees n_nodes.
+    const int n_fit = (band_len > 0)
+                    ? n_nodes
+                    : ((n_knots > n_nodes) ? n_knots : n_nodes);
+
+    *szA  = GB_SIGHET_V5_AL(2 * (size_t) N_PARAMS_MAX * sizeof(double));
+    *szB  = GB_SIGHET_V5_AL((size_t) n_nodes * sizeof(double));
+    *szC  = GB_SIGHET_V5_AL(8 * (size_t) nchannels * n_nodes * sizeof(double));
+    *szBk = GB_SIGHET_V5_AL((size_t) n_knots * sizeof(double));
+    *szD  = GB_SIGHET_V5_AL(9 * (size_t) n_fit * sizeof(double));
+    *szE  = GB_SIGHET_V5_AL(2 * (size_t) nchannels * n_nodes * sizeof(cmplx)
+                            + 6 * (size_t) n_nodes * sizeof(double)
+                            + (size_t) n_nodes * sizeof(int)
+                            + (size_t) n_nodes * sizeof(bool));
+    *szF  = GB_SIGHET_V5_AL(2 * (size_t) nchannels * n_knots * sizeof(double));
+    *szCI = (band_len > 0)
+          ? 0
+          : GB_SIGHET_V5_AL(6 * (size_t) nchannels * n_knots * sizeof(double));
+    *szG  = GB_SIGHET_V5_AL(
+                2 * (size_t) nchannels * N_sparse_t * sizeof(double)
+                + (size_t) nchannels * M * nwords
+                  * sizeof(unsigned long long));
+}
+
+
+// Total dynamic shared bytes for the v5 scorer.
+CUDA_CALLABLE_MEMBER
+static inline size_t gb_sighet_v5_shared_bytes(
+    int n_nodes, int n_knots, int nchannels, int m_active_half_width,
+    int N_sparse_t, int band_len, int v5_mode)
+{
+    size_t szA, szB, szC, szBk, szD, szE, szF, szCI, szG;
+    gb_sighet_v5_region_sizes(n_nodes, n_knots, nchannels,
+                              m_active_half_width, N_sparse_t, band_len,
+                              &szA, &szB, &szC, &szBk, &szD, &szE, &szF,
+                              &szCI, &szG);
+    if ((band_len > 0) && (v5_mode == 1)) {
+        // F over E, G over B+C+Bk+D: the arena is the widest PHASE.
+        // max(szE, szF) -- NOT szE. F is smaller than E at the production
+        // shape (n_knots = 128, n_nodes = 64), but n_knots > 2*n_nodes would
+        // flip that and F would run off the end of E into B/C/Bk/D, which are
+        // still live in P2 alongside it. Silent corruption; the max is the
+        // whole guard.
+        const size_t ef = (szE > szF) ? szE : szF;
+        const size_t p1 = szA + ef + szB + szC + szBk + szD;
+        const size_t p3 = szA + szF + szG;
+        return (p1 > p3) ? p1 : p3;
+    }
+    return szA + szB + szC + szBk + szD + szE + szF + szCI + szG;
+}
+
+
+// r at one pixel of one (c, im) row: v4's masked r_sparse, rebuilt from the
+// precomputed mask bit and r_pix instead of read out of shared scratch.
+CUDA_DEVICE
+static inline cmplx gb_sighet_v5_r_at(
+    const unsigned long long *mrow, const double *rp_re, const double *rp_im,
+    int b)
+{
+    const bool keep =
+        ((mrow[b >> 6] >> (unsigned) (b & 63)) & 1ULL) != 0ULL;
+    return keep ? cmplx(rp_re[b], rp_im[b]) : cmplx(0.0, 0.0);
+}
+
+
+// (r, dr) at one pixel. The branch structure is v4's centred difference
+// statement for statement -- same operands, same order, same divisions --
+// which is what makes the fold bit-identical rather than merely equal.
+CUDA_DEVICE
+static inline void gb_sighet_v5_r_dr(
+    const unsigned long long *mrow, const double *rp_re, const double *rp_im,
+    int b, int N_sparse_t, double Dn, cmplx *r_out, cmplx *dr_out)
+{
+    const cmplx r = gb_sighet_v5_r_at(mrow, rp_re, rp_im, b);
+    cmplx d(0.0, 0.0);
+    if (N_sparse_t >= 3) {
+        if (b == 0)
+            d = (gb_sighet_v5_r_at(mrow, rp_re, rp_im, 1) - r) / Dn;
+        else if (b == N_sparse_t - 1)
+            d = (r - gb_sighet_v5_r_at(mrow, rp_re, rp_im, b - 1)) / Dn;
+        else
+            d = (gb_sighet_v5_r_at(mrow, rp_re, rp_im, b + 1)
+               - gb_sighet_v5_r_at(mrow, rp_re, rp_im, b - 1)) / (2.0 * Dn);
+    } else if (N_sparse_t == 2) {
+        d = (gb_sighet_v5_r_at(mrow, rp_re, rp_im, 1)
+           - gb_sighet_v5_r_at(mrow, rp_re, rp_im, 0)) / Dn;
+    }
+    *r_out  = r;
+    *dr_out = d;
+}
+
+
+CUDA_DEVICE
+void gb_signal_het_v5_score_one_source(
+    double *dh_partial, double *hh_partial,
+    double *band_w, int *band_j0, int band_len,
+    GBTDIonTheFly *tof, void *shared_mem,
+    unsigned long long *c0_mask_all,
+    cmplx  *A0_all, cmplx *A1_all,
+    cmplx  *B0_all, cmplx *B1_all,
+    cmplx  *B0nc_all, cmplx *B1nc_all,
+    int    *n_sparse_local_arr,
+    double *params_cand_all, double *params_ref_all,
+    int     data_idx, int bin_i, int v5_mode,
+    int     n_nodes, int n_knots, int nparams, int f0_idx, int fdot_idx,
+    int     Nf, int Nf_active, int N_sparse_t, int stride,
+    int     ind_min_t, int ind_min_f, int m_active_half_width,
+    double  layer_df, double dt, double T_obs, double t_start,
+    int     nchannels, int tdi_type, int project_real)
+{
+    const int M      = 2 * m_active_half_width + 1;
+    const int nwords = (N_sparse_t + 63) / 64;
+
+    // ---- shared carve (mirror gb_sighet_v5_shared_bytes exactly) ---------
+    // Region OFFSETS differ between the aliased and flat layouts; region
+    // SIZES and every array's position inside its region are identical, so
+    // the body below is layout-agnostic.
+    size_t szA, szB, szC, szBk, szD, szE, szF, szCI, szG;
+    gb_sighet_v5_region_sizes(n_nodes, n_knots, nchannels,
+                              m_active_half_width, N_sparse_t, band_len,
+                              &szA, &szB, &szC, &szBk, &szD, &szE, &szF,
+                              &szCI, &szG);
+
+    char *base = (char *) shared_mem;
+    size_t oB, oC, oBk, oD, oE, oF, oCI, oG;
+    if ((band_len > 0) && (v5_mode == 1)) {
+        // max(szE, szF), not szE -- see the note in gb_sighet_v5_shared_bytes.
+        const size_t ef = (szE > szF) ? szE : szF;
+        oE  = szA;
+        oF  = szA;                    // F ALIASES E (dead after the node stage)
+        oB  = szA + ef;
+        oC  = oB + szB;
+        oBk = oC + szC;
+        oD  = oBk + szBk;
+        oCI = 0;                      // banded: never carved
+        oG  = szA + szF;              // G ALIASES B+C+Bk+D (dead after P2)
+    } else {
+        oB  = szA;
+        oC  = oB + szB;
+        oBk = oC + szC;
+        oD  = oBk + szBk;
+        oE  = oD + szD;
+        oF  = oE + szE;
+        oCI = oF + szF;
+        oG  = oCI + szCI;
+    }
+
+    double *params_c = (double *) base;
+    double *params_r = params_c + N_PARAMS_MAX;
+    double *t_nodes  = (double *) (base + oB);
+    double *dlnA     = (double *) (base + oC);
+    double *dphi     = dlnA + (size_t) nchannels * n_nodes;
+    double *cA1      = dphi + (size_t) nchannels * n_nodes;
+    double *cA2      = cA1  + (size_t) nchannels * n_nodes;
+    double *cA3      = cA2  + (size_t) nchannels * n_nodes;
+    double *cP1      = cA3  + (size_t) nchannels * n_nodes;
+    double *cP2      = cP1  + (size_t) nchannels * n_nodes;
+    double *cP3      = cP2  + (size_t) nchannels * n_nodes;
+    double *t_knots  = (double *) (base + oBk);
+    const int n_fit_max = (band_len > 0)
+                        ? n_nodes
+                        : ((n_knots > n_nodes) ? n_knots : n_nodes);
+    double *B_b      = (double *) (base + oD);
+    double *pcr      = B_b + n_fit_max;
+    cmplx  *tdi_c    = (cmplx *) (base + oE);
+    cmplx  *tdi_r    = tdi_c + (size_t) nchannels * n_nodes;
+    double *phiun_c  = (double *) (tdi_r + (size_t) nchannels * n_nodes);
+    double *phiun_r  = phiun_c + n_nodes;
+    double *amp_y    = phiun_r + n_nodes;
+    double *ph_y     = amp_y + n_nodes;
+    double *flip     = ph_y + n_nodes;
+    double *pjump    = flip + n_nodes;
+    int    *count    = (int *) (pjump + n_nodes);
+    bool   *fix_c    = (bool *) (count + n_nodes);
+    double *rk_re    = (double *) (base + oF);
+    double *rk_im    = rk_re + (size_t) nchannels * n_knots;
+    double *cR1 = nullptr, *cR2 = nullptr, *cR3 = nullptr;
+    double *cI1 = nullptr, *cI2 = nullptr, *cI3 = nullptr;
+    if (band_len <= 0) {
+        cR1 = (double *) (base + oCI);
+        cR2 = cR1 + (size_t) nchannels * n_knots;
+        cR3 = cR2 + (size_t) nchannels * n_knots;
+        cI1 = cR3 + (size_t) nchannels * n_knots;
+        cI2 = cI1 + (size_t) nchannels * n_knots;
+        cI3 = cI2 + (size_t) nchannels * n_knots;
+    }
+    double *rpix_re = (double *) (base + oG);
+    double *rpix_im = rpix_re + (size_t) nchannels * N_sparse_t;
+    unsigned long long *mask_sh =
+        (unsigned long long *) (rpix_im + (size_t) nchannels * N_sparse_t);
+
+    // ---- params + node grid ----------------------------------------------
+    for (int i = THREAD_START_X; i < nparams; i += BLOCK_INCR_X) {
+        params_c[i] = params_cand_all[(size_t) bin_i * nparams + i];
+        params_r[i] = params_ref_all[(size_t) data_idx * nparams + i];
+    }
+    CUDA_SYNC_THREADS;
+    const double dt_node = T_obs / (double) (n_nodes - 1);
+    for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X)
+        t_nodes[k] = t_start + (double) k * dt_node;
+    CUDA_SYNC_THREADS;
+
+    // ---- raw TDI at the nodes: candidate, then reference ------------------
+    tof->get_tdi_raw(tdi_c, phiun_c, params_c, t_nodes, n_nodes, bin_i,
+                     nchannels);
+    CUDA_SYNC_THREADS;
+    tof->get_tdi_raw(tdi_r, phiun_r, params_r, t_nodes, n_nodes, bin_i,
+                     nchannels);
+    CUDA_SYNC_THREADS;
+
+    // ---- per-channel node ratios ------------------------------------------
+    const double df0   = params_c[f0_idx]  - params_r[f0_idx];
+    const double dfdot = params_c[fdot_idx] - params_r[fdot_idx];
+    const double TWO_PI = 2.0 * M_PI;
+    for (int c = 0; c < nchannels; ++c)
+    {
+        // candidate amp / unwrapped tdi phase for this channel
+        tof->new_extract_amplitude_and_phase(count, fix_c, flip, pjump,
+                                             n_nodes, amp_y, ph_y,
+                                             &tdi_c[(size_t) c * n_nodes],
+                                             phiun_c);
+        CUDA_SYNC_THREADS;
+        tof->new_unwrap_phase(flip, n_nodes, ph_y);
+        CUDA_SYNC_THREADS;
+        // RELATIVE amp floor (1e-2 of the node-series max, stored in
+        // pcr[0] -- pcr is free until the spline fits): a node landing on
+        // an envelope null must not inject log(1e-300)-scale values into
+        // the spline (exp() blow-up at masked-out but spline-neighbouring
+        // eval times). The ratio is meaningless at nulls and carries no
+        // |c0|^2 fold weight there, so flooring is exact where it matters.
+        if (THREAD_ZERO) {
+            double amax = 0.0;
+            for (int k = 0; k < n_nodes; ++k)
+                if (amp_y[k] > amax) amax = amp_y[k];
+            pcr[0] = (amax > 1e-300) ? 1e-2 * amax : 1e-300;
+        }
+        CUDA_SYNC_THREADS;
+        for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X) {
+            double a = amp_y[k];
+            if (a < pcr[0]) a = pcr[0];
+            dlnA[(size_t) c * n_nodes + k] = log(a);
+            dphi[(size_t) c * n_nodes + k] = ph_y[k] + phiun_c[k];
+        }
+        CUDA_SYNC_THREADS;
+        // reference
+        tof->new_extract_amplitude_and_phase(count, fix_c, flip, pjump,
+                                             n_nodes, amp_y, ph_y,
+                                             &tdi_r[(size_t) c * n_nodes],
+                                             phiun_r);
+        CUDA_SYNC_THREADS;
+        tof->new_unwrap_phase(flip, n_nodes, ph_y);
+        CUDA_SYNC_THREADS;
+        if (THREAD_ZERO) {
+            double amax = 0.0;
+            for (int k = 0; k < n_nodes; ++k)
+                if (amp_y[k] > amax) amax = amp_y[k];
+            pcr[0] = (amax > 1e-300) ? 1e-2 * amax : 1e-300;
+        }
+        CUDA_SYNC_THREADS;
+        for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X) {
+            double a = amp_y[k];
+            if (a < pcr[0]) a = pcr[0];
+            const double tau = t_nodes[k] - t_start;
+            double dl = dlnA[(size_t) c * n_nodes + k] - log(a);
+            // belt-and-braces: the trust region bounds physical |dlnA| at
+            // 1.5; anything beyond +-30 is a null/extraction artefact.
+            if (dl >  30.0) dl =  30.0;
+            if (dl < -30.0) dl = -30.0;
+            dlnA[(size_t) c * n_nodes + k] = dl;
+            dphi[(size_t) c * n_nodes + k] -=
+                ph_y[k] + phiun_r[k]
+                + TWO_PI * (df0 * tau + 0.5 * dfdot * tau * tau);
+        }
+        CUDA_SYNC_THREADS;
+        // node-sequence unwrap of the RESIDUAL phase (post-derot the
+        // adjacent-node difference is << pi inside the trust region).
+        if (THREAD_ZERO) {
+            double *dp = dphi + (size_t) c * n_nodes;
+            for (int k = 1; k < n_nodes; ++k) {
+                double d = dp[k] - dp[k - 1];
+                while (d >  M_PI) { dp[k] -= TWO_PI; d = dp[k] - dp[k - 1]; }
+                while (d < -M_PI) { dp[k] += TWO_PI; d = dp[k] - dp[k - 1]; }
+            }
+        }
+        CUDA_SYNC_THREADS;
+        // cubic fits (linear node spacing)
+        wdm_fit_cubic_spline(t_nodes, dlnA + (size_t) c * n_nodes,
+                             cA1 + (size_t) c * n_nodes,
+                             cA2 + (size_t) c * n_nodes,
+                             cA3 + (size_t) c * n_nodes,
+                             B_b, pcr, n_nodes, CUBIC_SPLINE_LINEAR_SPACING);
+        CUDA_SYNC_THREADS;
+        wdm_fit_cubic_spline(t_nodes, dphi + (size_t) c * n_nodes,
+                             cP1 + (size_t) c * n_nodes,
+                             cP2 + (size_t) c * n_nodes,
+                             cP3 + (size_t) c * n_nodes,
+                             B_b, pcr, n_nodes, CUBIC_SPLINE_LINEAR_SPACING);
+        CUDA_SYNC_THREADS;
+    }
+
+    // ---- V4 fixed-knot stage ---------------------------------------------
+    // The log-polar (dlnA, dphi) fit above is the node-economical
+    // representation of the ratio; here it is RESAMPLED onto ``n_knots``
+    // FIXED, candidate-independent knot times as LINEAR complex values.
+    // That is what makes the pixel-time evaluation a fixed linear operator
+    // (and, in a later phase, lets the whole fold pre-contract into
+    // per-segment moment tensors).  The analytic carrier-difference
+    // de-rotation MUST be restored HERE, at the knot times: past this point
+    // the interpolation is linear in the complex ratio, not in the phase.
+    const double dt_knot = T_obs / (double) (n_knots - 1);
+    for (int k = THREAD_START_X; k < n_knots; k += BLOCK_INCR_X)
+        t_knots[k] = t_start + (double) k * dt_knot;
+    CUDA_SYNC_THREADS;
+
+    for (int idx = THREAD_START_X; idx < nchannels * n_knots;
+         idx += BLOCK_INCR_X)
+    {
+        const int    c   = idx / n_knots;
+        const int    k   = idx % n_knots;
+        const double t   = t_knots[k];
+        const double tau = t - t_start;
+        int seg = (int) (tau / dt_node);
+        if (seg < 0)           seg = 0;
+        if (seg > n_nodes - 2) seg = n_nodes - 2;
+        const double dx  = t - t_nodes[seg];
+        const double dx2 = dx * dx;
+        const size_t o   = (size_t) c * n_nodes + seg;
+        const double lA  = dlnA[o] + cA1[o] * dx + cA2[o] * dx2
+                         + cA3[o] * dx2 * dx;
+        const double ph  = dphi[o] + cP1[o] * dx + cP2[o] * dx2
+                         + cP3[o] * dx2 * dx
+                         + TWO_PI * (df0 * tau + 0.5 * dfdot * tau * tau);
+        // NOTE: direct cos/sin, never gcmplx::polar (signed-rho NaN trap).
+        const double amp = exp(lA);
+        rk_re[(size_t) c * n_knots + k] = amp * cos(ph);
+        rk_im[(size_t) c * n_knots + k] = amp * sin(ph);
+    }
+    CUDA_SYNC_THREADS;
+
+    // Cubic splines through the FIXED knots, Re and Im separately (uniform
+    // spacing).  wdm_fit_cubic_spline is block-cooperative (PCR on GPU,
+    // Thomas on CPU), so it is called by every thread, outside any
+    // thread-strided loop -- exactly as the node fits above.
+    // BANDED MODE (band_len > 0): skipped entirely -- the knot -> pixel
+    // cardinal map is precomputed host-side and applied directly below.
+    for (int c = 0; (band_len <= 0) && c < nchannels; ++c)
+    {
+        wdm_fit_cubic_spline(t_knots, rk_re + (size_t) c * n_knots,
+                             cR1 + (size_t) c * n_knots,
+                             cR2 + (size_t) c * n_knots,
+                             cR3 + (size_t) c * n_knots,
+                             B_b, pcr, n_knots, CUBIC_SPLINE_LINEAR_SPACING);
+        CUDA_SYNC_THREADS;
+        wdm_fit_cubic_spline(t_knots, rk_im + (size_t) c * n_knots,
+                             cI1 + (size_t) c * n_knots,
+                             cI2 + (size_t) c * n_knots,
+                             cI3 + (size_t) c * n_knots,
+                             B_b, pcr, n_knots, CUBIC_SPLINE_LINEAR_SPACING);
+        CUDA_SYNC_THREADS;
+    }
+
+    // r at the sparse WDM sample times: depends on (c, b) only -- shared by
+    // every active m row, so evaluate once here instead of M times below.
+    for (int idx = THREAD_START_X; (band_len > 0)
+         && idx < nchannels * N_sparse_t; idx += BLOCK_INCR_X)
+    {
+        // BANDED: r_pix = sum_j w[b][j] * r_knot[c][j0[b]+j]. The cardinal
+        // weights decay ~0.27 per knot, so a half-band of 16 truncates at
+        // ~1e-9 relative -- far below every floor in this pipeline. No
+        // solve, no block sync, no coefficient storage.
+        const int c = idx / N_sparse_t;
+        const int b = idx % N_sparse_t;
+        const int j0 = band_j0[b];
+        double re = 0.0, im = 0.0;
+        const size_t o = (size_t) c * n_knots;
+        for (int j = 0; j < band_len; ++j) {
+            const int kk = j0 + j;
+            if (kk < 0 || kk >= n_knots) continue;
+            const double w = band_w[(size_t) b * band_len + j];
+            re += w * rk_re[o + kk];
+            im += w * rk_im[o + kk];
+        }
+        rpix_re[idx] = re;
+        rpix_im[idx] = im;
+    }
+    CUDA_SYNC_THREADS;
+
+    for (int idx = THREAD_START_X; (band_len <= 0)
+         && idx < nchannels * N_sparse_t; idx += BLOCK_INCR_X)
+    {
+        const int c = idx / N_sparse_t;
+        const int b = idx % N_sparse_t;
+        const int n_global = ind_min_t + n_sparse_local_arr[b];
+        const double t = t_start + (double) n_global * (double) Nf * dt;
+        int seg = (int) ((t - t_start) / dt_knot);
+        if (seg < 0)           seg = 0;
+        if (seg > n_knots - 2) seg = n_knots - 2;
+        const double dx  = t - t_knots[seg];
+        const double dx2 = dx * dx;
+        const size_t o   = (size_t) c * n_knots + seg;
+        const double re  = rk_re[o] + cR1[o] * dx + cR2[o] * dx2
+                         + cR3[o] * dx2 * dx;
+        const double im  = rk_im[o] + cI1[o] * dx + cI2[o] * dx2
+                         + cI3[o] * dx2 * dx;
+        rpix_re[idx] = re;
+        rpix_im[idx] = im;
+    }
+    CUDA_SYNC_THREADS;
+
+    // ---- active m-band (clipped exactly like the v2 consumer) -------------
+    const double f0_cand = params_c[f0_idx];
+    const int Nf_active_idx_max = Nf_active - 1;
+    const int m_floor = (int) floor(f0_cand / layer_df);
+    int m_active[GB_SIGHET_M_ACTIVE_MAX];
+    for (int im = 0; im < M; ++im) {
+        int m_g = m_floor + (im - m_active_half_width);
+        if (m_g < ind_min_f) m_g = ind_min_f;
+        if (m_g > ind_min_f + Nf_active_idx_max)
+            m_g = ind_min_f + Nf_active_idx_max;
+        m_active[im] = m_g;
+    }
+
+    // ---- stage this candidate's mask rows into shared --------------------
+    // The mask is the only thing v4's producer loop produced that the folds
+    // still need, and it is candidate-independent, so setup_in_model already
+    // built it. nch*M rows of ceil(N_sparse_t/64) words -- 480 B at N = 204,
+    // against v4's two full passes over nch*M*N_sparse_t global c0 values on
+    // 15 of 128 threads.
+    const int n_rows = nchannels * M;
+    for (int idx = THREAD_START_X; idx < n_rows * nwords; idx += BLOCK_INCR_X)
+    {
+        const int row     = idx / nwords;
+        const int w       = idx % nwords;
+        const int c       = row / M;
+        const int m_local = m_active[row % M] - ind_min_f;
+        mask_sh[idx] = c0_mask_all[
+            (((size_t) data_idx * nchannels + c) * Nf_active
+             + (size_t) m_local) * nwords + w];
+    }
+    CUDA_SYNC_THREADS;
+
+    // ---- bin-fold inner products (verbatim v2 step (4)) ------------------
+    // Index mapping, accumulation order and every arithmetic expression are
+    // v4's. The ONLY change is that r and dr come from gb_sighet_v5_r_dr
+    // (r_pix + one mask bit) instead of a materialised r_sparse/dr_sparse.
+    const double Dn = (double) stride;
+    cmplx d_h_raw(0.0, 0.0);
+    cmplx h_h_raw(0.0, 0.0);
+
+    const int n_dh = nchannels * M * N_sparse_t;
+    for (int idx = THREAD_START_X; idx < n_dh; idx += BLOCK_INCR_X)
+    {
+        const int c  = idx / (M * N_sparse_t);
+        const int im = (idx / N_sparse_t) % M;
+        const int b  = idx % N_sparse_t;
+        const int m_local = m_active[im] - ind_min_f;
+        const size_t coef_i = ((size_t) data_idx * nchannels + c)
+                              * Nf_active * N_sparse_t
+                              + (size_t) m_local * N_sparse_t + b;
+        cmplx r, dr;
+        gb_sighet_v5_r_dr(mask_sh + (size_t) (c * M + im) * nwords,
+                          rpix_re + (size_t) c * N_sparse_t,
+                          rpix_im + (size_t) c * N_sparse_t,
+                          b, N_sparse_t, Dn, &r, &dr);
+        d_h_raw += A0_all[coef_i] * r + A1_all[coef_i] * dr;
+    }
+
+    if (tdi_type == 0)
+    {
+        const int n_hh = nchannels * nchannels * M * N_sparse_t;
+        for (int idx = THREAD_START_X; idx < n_hh; idx += BLOCK_INCR_X)
+        {
+            const int c  = idx / (nchannels * M * N_sparse_t);
+            const int c2 = (idx / (M * N_sparse_t)) % nchannels;
+            const int im = (idx / N_sparse_t) % M;
+            const int b  = idx % N_sparse_t;
+            const int m_local = m_active[im] - ind_min_f;
+            cmplx r_c, dr_c, r_c2, dr_c2;
+            gb_sighet_v5_r_dr(mask_sh + (size_t) (c * M + im) * nwords,
+                              rpix_re + (size_t) c * N_sparse_t,
+                              rpix_im + (size_t) c * N_sparse_t,
+                              b, N_sparse_t, Dn, &r_c, &dr_c);
+            gb_sighet_v5_r_dr(mask_sh + (size_t) (c2 * M + im) * nwords,
+                              rpix_re + (size_t) c2 * N_sparse_t,
+                              rpix_im + (size_t) c2 * N_sparse_t,
+                              b, N_sparse_t, Dn, &r_c2, &dr_c2);
+            const size_t coef_i =
+                (((size_t) data_idx * nchannels + c) * nchannels + c2)
+                * Nf_active * N_sparse_t
+                + (size_t) m_local * N_sparse_t + b;
+            const cmplx r_outer   = gcmplx::conj(r_c) * r_c2;
+            const cmplx cross_drr = gcmplx::conj(r_c)  * dr_c2
+                                  + gcmplx::conj(dr_c) * r_c2;
+            h_h_raw += B0_all[coef_i] * r_outer + B1_all[coef_i] * cross_drr;
+            if (project_real) {
+                h_h_raw += B0nc_all[coef_i] * (r_c * r_c2)
+                         + B1nc_all[coef_i] * (r_c * dr_c2 + dr_c * r_c2);
+            }
+        }
+    }
+    else
+    {
+        const int n_hh = nchannels * M * N_sparse_t;
+        for (int idx = THREAD_START_X; idx < n_hh; idx += BLOCK_INCR_X)
+        {
+            const int c  = idx / (M * N_sparse_t);
+            const int im = (idx / N_sparse_t) % M;
+            const int b  = idx % N_sparse_t;
+            const int m_local = m_active[im] - ind_min_f;
+            cmplx r, dr;
+            gb_sighet_v5_r_dr(mask_sh + (size_t) (c * M + im) * nwords,
+                              rpix_re + (size_t) c * N_sparse_t,
+                              rpix_im + (size_t) c * N_sparse_t,
+                              b, N_sparse_t, Dn, &r, &dr);
+            const size_t coef_i = ((size_t) data_idx * nchannels + c)
+                                  * Nf_active * N_sparse_t
+                                  + (size_t) m_local * N_sparse_t + b;
+            const double rsq = (gcmplx::conj(r) * r).real();
+            const cmplx cross_drr = gcmplx::conj(r) * dr
+                                  + gcmplx::conj(dr) * r;
+            h_h_raw += B0_all[coef_i] * rsq + B1_all[coef_i] * cross_drr;
+            if (project_real) {
+                h_h_raw += B0nc_all[coef_i] * (r * r)
+                         + B1nc_all[coef_i] * (r * dr + dr * r);
+            }
+        }
+    }
+
+    *dh_partial = d_h_raw.real();
+    *hh_partial = h_h_raw.real();
+}
+
+
+#ifdef __CUDACC__
+CUDA_KERNEL
+void gb_signal_het_v5_get_ll_kernel(
+    GBTDIonTheFly *tdi_on_fly,
+    double *d_h_out, double *h_h_out,
+    unsigned long long *c0_mask_all,
+    cmplx  *A0_all, cmplx *A1_all,
+    cmplx  *B0_all, cmplx *B1_all,
+    cmplx  *B0nc_all, cmplx *B1nc_all,
+    int    *n_sparse_local_arr,
+    double *band_w, int *band_j0, int band_len,
+    double *params_cand_all, double *params_ref_all,
+    int    *data_index_all, int v5_mode,
+    int num_bin, int n_nodes, int n_knots, int nparams, int f0_idx, int fdot_idx,
+    int Nf, int Nf_active, int N_sparse_t, int stride,
+    int ind_min_t, int ind_min_f, int m_active_half_width,
+    double layer_df, double dt, double T_obs, double t_start,
+    int nchannels, int tdi_type, int project_real)
+{
+    extern CUDA_SHARED char shared_mem[];
+    CUDA_SHARED double d_h_tmp[NUM_THREADS_HERE];
+    CUDA_SHARED double h_h_tmp[NUM_THREADS_HERE];
+
+    // device-local construction so the vtable is a DEVICE vtable
+    GBTDIonTheFly tof(tdi_on_fly->orbits, tdi_on_fly->tdi_config,
+                      tdi_on_fly->T, tdi_on_fly->t_ref);
+
+    for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X)
+    {
+        double dh_partial = 0.0, hh_partial = 0.0;
+        gb_signal_het_v5_score_one_source(
+            &dh_partial, &hh_partial,
+            band_w, band_j0, band_len,
+            &tof, (void *) shared_mem,
+            c0_mask_all, A0_all, A1_all, B0_all, B1_all,
+            B0nc_all, B1nc_all,
+            n_sparse_local_arr,
+            params_cand_all, params_ref_all,
+            data_index_all[bin_i], bin_i, v5_mode,
+            n_nodes, n_knots, nparams, f0_idx, fdot_idx,
+            Nf, Nf_active, N_sparse_t, stride,
+            ind_min_t, ind_min_f, m_active_half_width,
+            layer_df, dt, T_obs, t_start,
+            nchannels, tdi_type, project_real);
+
+        const int tid = threadIdx.x;
+        d_h_tmp[tid] = dh_partial;
+        h_h_tmp[tid] = hh_partial;
+        CUDA_SYNC_THREADS;
+        const double dh_sum = block_reduce(d_h_tmp);
+        const double hh_sum = block_reduce(h_h_tmp);
+        if (THREAD_ZERO)
+        {
+            d_h_out[bin_i] = 0.5 * dh_sum;
+            h_h_out[bin_i] = 0.5 * hh_sum;
+        }
+        CUDA_SYNC_THREADS;
+    }
+}
+#endif
+
+
+void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
+    GBTDIonTheFly *tdi_on_fly,
+    double *d_h_out, double *h_h_out,
+    unsigned long long *c0_mask_all,
+    cmplx  *A0_all, cmplx *A1_all,
+    cmplx  *B0_all, cmplx *B1_all,
+    cmplx  *B0nc_all, cmplx *B1nc_all,
+    int    *n_sparse_local_arr,
+    double *band_w, int *band_j0, int band_len,
+    double *params_cand_all, double *params_ref_all,
+    int    *data_index_all,
+    int     num_bin, int num_data,
+    int     n_nodes, int n_knots, int nparams, int f0_idx, int fdot_idx,
+    int     Nf, int Nt, int Nf_active, int Nt_active,
+    int     Nt_layer, int N_sparse_t, int stride,
+    int     ind_min_t, int ind_min_f,
+    int     m_active_half_width,
+    double  layer_df, double dt,
+    double  T_obs, double t_start,
+    int     nchannels, int tdi_type, int project_real,
+    int     v5_mode)
+{
+    gb_sighet_check_m_half(m_active_half_width);
+    if (n_nodes < 4) {
+        throw std::invalid_argument(
+            "[gb_signal_het_v5_get_ll_wrap] n_nodes must be >= 4 "
+            "(cubic spline fit).");
+    }
+    if (Nt_layer * stride != Nt) {
+        throw std::invalid_argument(
+            "[gb_signal_het_v5_get_ll_wrap] Nt_layer * stride != Nt.");
+    }
+    if (v5_mode != 1 && v5_mode != 2) {
+        throw std::invalid_argument(
+            "[gb_signal_het_v5_get_ll_wrap] v5_mode must be 1 (phase-aliased "
+            "shared arena) or 2 (flat carve, the occupancy control).");
+    }
+    (void) num_data; (void) Nt_active;
+
+    const size_t shared_bytes = gb_sighet_v5_shared_bytes(
+        n_nodes, n_knots, nchannels, m_active_half_width, N_sparse_t,
+        band_len, v5_mode);
+
+#ifdef __CUDACC__
+    GBTDIonTheFly *gb_host = new GBTDIonTheFly(
+        tdi_on_fly->orbits, tdi_on_fly->tdi_config,
+        tdi_on_fly->T, tdi_on_fly->t_ref);
+
+    Orbits *d_orbits;
+    cudaMalloc(&d_orbits, sizeof(Orbits));
+    gpuErrchk(cudaMemcpy(d_orbits, tdi_on_fly->orbits, sizeof(Orbits),
+                         cudaMemcpyHostToDevice));
+
+    TDIConfig *d_tdi_config;
+    cudaMalloc(&d_tdi_config, sizeof(TDIConfig));
+    gpuErrchk(cudaMemcpy(d_tdi_config, tdi_on_fly->tdi_config,
+                         sizeof(TDIConfig), cudaMemcpyHostToDevice));
+
+    gb_host->orbits     = d_orbits;
+    gb_host->tdi_config = d_tdi_config;
+
+    GBTDIonTheFly *d_gb;
+    cudaMalloc(&d_gb, sizeof(GBTDIonTheFly));
+    gpuErrchk(cudaMemcpy(d_gb, gb_host, sizeof(GBTDIonTheFly),
+                         cudaMemcpyHostToDevice));
+
+    if (shared_bytes > 48 * 1024)
+    {
+        cudaFuncSetAttribute(
+            gb_signal_het_v5_get_ll_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int) shared_bytes);
+    }
+
+    gb_signal_het_v5_get_ll_kernel<<<num_bin, NUM_THREADS_HERE,
+                                     shared_bytes>>>(
+        d_gb, d_h_out, h_h_out,
+        c0_mask_all, A0_all, A1_all, B0_all, B1_all,
+        B0nc_all, B1nc_all,
+        n_sparse_local_arr,
+        band_w, band_j0, band_len,
+        params_cand_all, params_ref_all, data_index_all, v5_mode,
+        num_bin, n_nodes, n_knots, nparams, f0_idx, fdot_idx,
+        Nf, Nf_active, N_sparse_t, stride,
+        ind_min_t, ind_min_f, m_active_half_width,
+        layer_df, dt, T_obs, t_start,
+        nchannels, tdi_type, project_real);
+
+    cudaDeviceSynchronize();
+    gpuErrchk(cudaGetLastError());
+
+    // The point of v5 is residency, so report what the hardware actually
+    // grants rather than trusting the byte arithmetic: registers, not shared
+    // memory, are the most likely reason the measured number comes in under
+    // the shared-limited bound. One line, opt-in, no Nsight required.
+    if (getenv("GB_SIGHET_V5_VERBOSE") != nullptr)
+    {
+        int blocks_per_sm = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, gb_signal_het_v5_get_ll_kernel,
+            NUM_THREADS_HERE, shared_bytes);
+        int nregs = 0;
+        cudaFuncAttributes attr;
+        if (cudaFuncGetAttributes(&attr, gb_signal_het_v5_get_ll_kernel)
+            == cudaSuccess) {
+            nregs = attr.numRegs;
+        }
+        const size_t ctl_bytes = gb_sighet_v5_shared_bytes(
+            n_nodes, n_knots, nchannels, m_active_half_width, N_sparse_t,
+            band_len, 2);
+        printf("[sighet v5] mode=%d  N_sparse_t=%d  shared=%.1f KB  "
+               "regs/thread=%d  blocks/SM=%d   (flat-carve control would be "
+               "%.1f KB)\n",
+               v5_mode, N_sparse_t, (double) shared_bytes / 1024.0,
+               nregs, blocks_per_sm, (double) ctl_bytes / 1024.0);
+        fflush(stdout);
+    }
+
+    gpuErrchk(cudaFree(d_orbits));
+    gpuErrchk(cudaFree(d_tdi_config));
+    gpuErrchk(cudaFree(d_gb));
+    delete gb_host;
+#else
+    std::vector<char> scratch(shared_bytes);
+    for (int bin = 0; bin < num_bin; ++bin)
+    {
+        double dh_partial = 0.0, hh_partial = 0.0;
+        gb_signal_het_v5_score_one_source(
+            &dh_partial, &hh_partial,
+            band_w, band_j0, band_len,
+            tdi_on_fly, (void *) scratch.data(),
+            c0_mask_all, A0_all, A1_all, B0_all, B1_all,
+            B0nc_all, B1nc_all,
+            n_sparse_local_arr,
+            params_cand_all, params_ref_all,
+            data_index_all[bin], bin, v5_mode,
             n_nodes, n_knots, nparams, f0_idx, fdot_idx,
             Nf, Nf_active, N_sparse_t, stride,
             ind_min_t, ind_min_f, m_active_half_width,
