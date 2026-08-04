@@ -121,6 +121,22 @@ class GBFDComputations(FastLISAResponseParallelModule):
                 means ``t_ref``.
         """
         super().__init__(force_backend=force_backend)
+        # Multi-GPU replica metadata -- the WDM twin's contract verbatim
+        # (see ``lisatools.chunked_het.WDMComputationsBase.__init__``): the
+        # ``cpp_orbits`` / ``cpp_tdi_config`` wraps this constructor builds
+        # hold device pointers fixed at the device current right now, so
+        # record that device plus the arguments needed to rebuild an
+        # equivalent comp inside another shard's device context.
+        from lisatools.utils.device import current_device as _current_device
+
+        self._build_device = _current_device(self.xp)
+        self._ctor_args = (fd_settings, t_ref)
+        self._ctor_kwargs = dict(
+            N_sparse=N_sparse, orbits=orbits, tdi_config=tdi_config,
+            force_backend=force_backend, d_d=d_d, tdi_type=tdi_type,
+            nchannels=nchannels, tukey_alpha=tukey_alpha,
+            edge_frac=edge_frac, t_start=t_start,
+        )
         from lisatools.domains import FDSettings as _FDSettings
         if not isinstance(fd_settings, _FDSettings):
             raise TypeError(
@@ -173,6 +189,22 @@ class GBFDComputations(FastLISAResponseParallelModule):
 
     @property
     def xp(self): return self.backend.xp
+
+    @property
+    def args(self) -> tuple:
+        """Positional arguments for recreating this comp (``(fd_settings, t_ref)``).
+
+        Same contract as :attr:`lisatools.chunked_het.WDMComputationsBase.args`:
+        the per-device replica helper rebuilds
+        ``type(comp)(*comp.args, **comp.kwargs)`` inside the owning device
+        context so the ``*Wrap`` pointer fields are device-local.
+        """
+        return self._ctor_args
+
+    @property
+    def kwargs(self) -> dict:
+        """Keyword arguments for recreating this comp (see :attr:`args`)."""
+        return dict(self._ctor_kwargs)
 
     @property
     def orbits(self): return self._orbits
