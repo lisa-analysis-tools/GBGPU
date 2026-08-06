@@ -177,6 +177,33 @@ class GBFDComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
                 means ``t_ref``.
         """
         super().__init__(force_backend=force_backend)
+
+        # ---- multi-GPU replica metadata ---------------------------------
+        # Everything below pins to the CUDA device current RIGHT NOW and is
+        # never migrated: ``cpp_orbits`` / ``cpp_tdi_config`` pointer fields
+        # and the sparse-FD scratch. Record that device plus the constructor
+        # arguments so ``lisatools.utils.devicereplicas._device_local_gb_comp``
+        # can rebuild an equivalent comp inside a non-primary shard's own
+        # device context. Same contract ``Orbits.args`` /
+        # ``DomainSettingsBase.args`` already carry; every recorded object is
+        # one this instance already holds, so nothing new reaches the
+        # settings tree (pickle-safety rule).
+        #
+        # ``force_backend`` records the RESOLVED ``self.backend``, not the raw
+        # argument: a bare ``None`` would make the replica re-resolve the
+        # process-wide backend, so a ``force_backend="cpu"`` comp on a GPU
+        # node would spawn cuda replicas (the defect class of ``3cf0f78``).
+        from lisatools.utils.device import current_device as _current_device
+
+        self._build_device = _current_device(self.xp)
+        self._ctor_args = (fd_settings, t_ref)
+        self._ctor_kwargs = dict(
+            N_sparse=N_sparse, orbits=orbits, tdi_config=tdi_config,
+            force_backend=self.backend, d_d=d_d, tdi_type=tdi_type,
+            nchannels=nchannels, tukey_alpha=tukey_alpha,
+            edge_frac=edge_frac, t_start=t_start,
+        )
+
         from lisatools.domains import FDSettings as _FDSettings
         if not isinstance(fd_settings, _FDSettings):
             raise TypeError(
@@ -229,6 +256,23 @@ class GBFDComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
 
     @property
     def xp(self): return self.backend.xp
+
+    @property
+    def args(self) -> tuple:
+        """Positional arguments for recreating this comp (``(fd_settings, t_ref)``).
+
+        Mirrors ``lisatools.detector.Orbits.args`` /
+        ``DomainSettingsBase.args``: the per-device replica helper rebuilds
+        ``type(comp)(*comp.args, **comp.kwargs)`` inside the owning device
+        context so every buffer and every ``*Wrap`` pointer field is
+        device-local.
+        """
+        return self._ctor_args
+
+    @property
+    def kwargs(self) -> dict:
+        """Keyword arguments for recreating this comp (see :attr:`args`)."""
+        return dict(self._ctor_kwargs)
 
     @property
     def orbits(self): return self._orbits
@@ -963,6 +1007,37 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
                  freq_from_tdi_phase=True, window_alpha=None, use_midpoint=None,
                  linear_envelope=None):
         super().__init__(force_backend=force_backend)
+
+        # ---- multi-GPU replica metadata ---------------------------------
+        # ``cpp_orbits`` / ``cpp_tdi_config`` are built below on whatever CUDA
+        # device is current RIGHT NOW and are never migrated. The STFT engine
+        # already dispatches per ACA split inside the owning device context
+        # (``STFTBandLikelihoodEngine._split_plan``), so on a multi-GPU run a
+        # non-primary shard launches kernels that dereference these
+        # primary-device pointers -- a peer-access tax with P2P, an illegal
+        # access without it. Recording the build device and the constructor
+        # arguments lets ``lisatools.utils.devicereplicas._device_local_gb_comp``
+        # rebuild a device-local twin per shard.
+        #
+        # ``stft_comps`` is recorded as passed, but is NOT the device-critical
+        # state: the engine rebinds ``gb_stft_comp.stft_comps =
+        # buffer_aca.cpp_splits[s]`` on every call, so each shard already gets
+        # its own split's group. ``force_backend`` records the RESOLVED
+        # ``self.backend`` so a replica cannot re-resolve the process-wide
+        # backend (the ``3cf0f78`` defect class).
+        from lisatools.utils.device import current_device as _current_device
+
+        self._build_device = _current_device(self.xp)
+        self._ctor_args = (stft_comps, T)
+        self._ctor_kwargs = dict(
+            t_ref=t_ref, orbits=orbits, tdi_config=tdi_config,
+            force_backend=self.backend, n_side_bins=n_side_bins,
+            window_factor=window_factor,
+            freq_from_tdi_phase=freq_from_tdi_phase,
+            window_alpha=window_alpha, use_midpoint=use_midpoint,
+            linear_envelope=linear_envelope,
+        )
+
         self.stft_comps = stft_comps
         self.T = float(T)
         self.t_ref = float(t_ref)
@@ -999,6 +1074,21 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
 
     @property
     def num_params(self): return 9
+
+    @property
+    def args(self) -> tuple:
+        """Positional arguments for recreating this comp (``(stft_comps, T)``).
+
+        See :attr:`GBFDComputations.args`. Note the engine rebinds
+        :attr:`stft_comps` per call, so a replica's recorded group is only a
+        construction-time placeholder.
+        """
+        return self._ctor_args
+
+    @property
+    def kwargs(self) -> dict:
+        """Keyword arguments for recreating this comp (see :attr:`args`)."""
+        return dict(self._ctor_kwargs)
 
     @property
     def stft_comps(self): return self._stft_comps

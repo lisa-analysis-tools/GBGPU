@@ -1056,7 +1056,58 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
                 None if n_idx is None else ac_to_intra[n_idx[mask]].astype(xp.int32)
             )
             plan.append((s, mask, intra_d, intra_n, device))
+
+        # Every entry point below writes its per-split results into output
+        # arrays allocated on the CALLER's device, from inside the split's own
+        # device_context (``ll[rows] = ...``, ``d_h_c[rows] = ...``), and reads
+        # ``params_phys[rows]`` the same way. cupy enables peer access
+        # automatically where the topology allows it; where it does not, those
+        # stores are an illegal memory access with no useful diagnostic. Check
+        # once per device set. (The per-split COMPS are device-local -- see
+        # ``_comp_for_split`` -- so this is only about the shared output
+        # arrays; making the arm P2P-independent would mean host-routed
+        # assembly, as ``_RoutedBandEngine._assemble`` does on the FD/WDM
+        # arms.)
+        if len(plan) > 1:
+            from lisatools.utils.device import assert_peer_access
+
+            assert_peer_access(
+                xp, [d for _s, _m, _id, _in, d in plan],
+                context="STFTBandLikelihoodEngine per-split dispatch",
+            )
         return plan
+
+    def _comp_for_split(self, buffer_aca, split, device):
+        """The STFT comp this split must launch on, bound to its own group.
+
+        Two things have to be true before a kernel launches under a split's
+        ``device_context``:
+
+        1. ``stft_comps`` points at THIS split's computation group -- the
+           existing per-call rebind, unchanged;
+        2. the comp's own device state is resident on ``device``.
+
+        (2) is the part sharding alone does not give you.
+        ``STFTGBComputations.__init__`` builds ``cpp_orbits`` /
+        ``cpp_tdi_config`` on whatever CUDA device was current at
+        construction and never migrates them, so a split running on any other
+        device dereferences the build device's pointers: a silent peer-access
+        tax where P2P is enabled, an illegal access where it is not. Resolve
+        a cached per-device replica instead. The comp's own build device (and
+        the CPU path) get the shared object back, so single-GPU behaviour is
+        byte-identical and allocates nothing.
+        """
+        comp = self.gb_stft_comp
+        if device is not None:
+            from lisatools.utils.devicereplicas import device_local_gb_comp
+
+            primary = getattr(comp, "_build_device", None)
+            if primary is None:
+                gpus = getattr(buffer_aca, "gpus", None)
+                primary = None if not gpus else int(gpus[0])
+            comp = device_local_gb_comp(comp, self.xp, int(device), primary)
+        comp.stft_comps = buffer_aca.cpp_splits[split]
+        return comp
 
     # ---------- bounds-keep ---------------------------------------------------
 
@@ -1094,14 +1145,14 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         # support is n_side_bins, fixed on gb_stft_comp at construction.
         for s, mask, intra_d, _, device in self._split_plan(buffer_aca, params_index):
             with buffer_aca.device_context(device):
-                self.gb_stft_comp.stft_comps = buffer_aca.cpp_splits[s]
+                comp = self._comp_for_split(buffer_aca, s, device)
                 factors_arr = xp.full(
                     int(mask.sum()), float(factor), dtype=xp.float64
                 )
                 # The split's flat buffer IS the (num_bands, nchannels, NT,
                 # NF_active) template stack the kernel scatters into;
                 # intra-split data_index addresses the band slot.
-                self.gb_stft_comp.fill_global_stft(
+                comp.fill_global_stft(
                     params_phys[mask],
                     buffer_aca.linear_data_arr[s],
                     data_index=intra_d,
@@ -1152,12 +1203,12 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             ):
                 rows = rows_kept[sub_mask]
                 with buffer_aca.device_context(device):
-                    self.gb_stft_comp.stft_comps = buffer_aca.cpp_splits[s]
-                    ll[rows] = self.gb_stft_comp.get_ll_stft(
+                    comp = self._comp_for_split(buffer_aca, s, device)
+                    ll[rows] = comp.get_ll_stft(
                         params_phys[rows], data_index=intra_d, noise_index=intra_n
                     )
-                    d_h_c[rows] = self.gb_stft_comp.d_h_out
-                    h_h_c[rows] = self.gb_stft_comp.h_h_out
+                    d_h_c[rows] = comp.d_h_out
+                    h_h_c[rows] = comp.h_h_out
 
         self.d_h_out_cmplx = d_h_c
         self.h_h_out_cmplx = h_h_c
@@ -1225,7 +1276,7 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             ):
                 rows = rows_kept[sub_mask]
                 with buffer_aca.device_context(device):
-                    self.gb_stft_comp.stft_comps = buffer_aca.cpp_splits[s]
+                    comp = self._comp_for_split(buffer_aca, s, device)
                     (
                         _like_add,
                         _like_rem,
@@ -1234,7 +1285,7 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
                         aa,
                         rr,
                         ar,
-                    ) = self.gb_stft_comp.get_swap_ll_stft(
+                    ) = comp.get_swap_ll_stft(
                         pa[rows],
                         pr[rows],
                         data_index=intra_d,
@@ -1300,8 +1351,8 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             buffer_aca, data_index, noise_index
         ):
             with buffer_aca.device_context(device):
-                self.gb_stft_comp.stft_comps = buffer_aca.cpp_splits[s]
-                grad[mask] = self.gb_stft_comp.get_ll_grad_stft(
+                comp = self._comp_for_split(buffer_aca, s, device)
+                grad[mask] = comp.get_ll_grad_stft(
                     params_phys[mask],
                     param_eps=param_eps,
                     data_index=intra_d,
