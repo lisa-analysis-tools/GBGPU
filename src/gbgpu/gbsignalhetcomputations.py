@@ -337,6 +337,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             return max(4, v3)
         xp = self.xp
         R_LT = 499.00478
+        _YRSID_SI = 31558149.763545603
         refs = self.params_ref_all[di]
         dlam = (x[:, 7] - refs[:, 7]) * xp.cos(refs[:, 8])
         dbet = x[:, 8] - refs[:, 8]
@@ -344,8 +345,33 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         D = (2.0 * np.pi * x[:, 1] * R_LT * angsep
              + xp.abs(x[:, 5] - refs[:, 5]) + xp.abs(x[:, 6] - refs[:, 6]))
         d_max = float(xp.max(D)) if D.size else 0.0
-        return int(np.clip(
-            math.ceil(16.0 * (max(d_max, 1e-3) / 0.4) ** 0.25), 8, 64))
+
+        # T_obs scaling (the first half of the TODO above). The ratio's
+        # structure is dominated by the ANNUAL modulation, so the number of
+        # oscillations the spline must represent scales as T_obs / 1 yr --
+        # the 16-node coefficient was calibrated at exactly 1 yr, and using
+        # it unscaled over-resolves every shorter baseline. At 3 months the
+        # ratio turns through ~1/4 of a cycle, so this drops n_r from the
+        # 1-yr value toward the floor; raw node evaluations dominate the
+        # per-candidate cost, so the saving is close to linear.
+        #
+        # Keyed on the sky/inclination/polarization displacement ONLY:
+        # polynomial phase (df0, dfdot) costs no extra nodes at any
+        # baseline because cubic splines represent it exactly.
+        #
+        # GB_SIGHET_NODE_TOBS_SCALE=0 restores the 1-yr-calibrated law.
+        t_scale = 1.0
+        if os.environ.get("GB_SIGHET_NODE_TOBS_SCALE", "1") == "1":
+            _T = float(g.get("Tobs", 0.0) or 0.0)
+            if _T > 0.0:
+                t_scale = _T / _YRSID_SI
+        n = math.ceil(16.0 * t_scale * (max(d_max, 1e-3) / 0.4) ** 0.25)
+        # TODO(node-law-snr): the other half of the TODO above -- raw lnL
+        # error scales as SNR^2 x mismatch, so a loud source needs a finer
+        # fit for the same lnL accuracy. Fold the stashed reference SNR in
+        # as (SNR^2 D / eps)^(1/4) once gb_sighet_proof_figure.py has
+        # measured the coefficient; until then the clip floor carries it.
+        return int(np.clip(n, 8, 64))
 
     # ------------------------------------------------------------------
     # Band-engine mode: sig-het scoring INSIDE the GB special move.
