@@ -908,6 +908,27 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         g = self._g
         if g.get("v4_knots", 0) and self._v4_band_arrays is None:
             self._v4_band_arrays = self._make_v4_band_arrays()
+        # Which scorer actually ran -- logged ONCE per comp. The settings
+        # guard upstream only proves the KNOBS were consistent; it cannot
+        # show that the v5 branch was taken at runtime. overnight_v5 asked
+        # for v5 and measured no speedup, and nothing in the log could
+        # distinguish "v5 ran and did not help" from "v5 silently fell
+        # through to v3/v2" -- so say it out loud.
+        if not getattr(self, "_kernel_path_logged", False):
+            self._kernel_path_logged = True
+            if g.get("v4_knots", 0) and int(g.get("v5", 0)):
+                _p = f"v5 (mode {1 if int(g['v5']) == 1 else 2})"
+            elif g.get("v4_knots", 0):
+                _p = "v4"
+            elif g.get("v3_n_nodes", 0):
+                _p = "v3"
+            else:
+                _p = "v2"
+            logger.info(
+                "sig-het scorer: %s  [v3_n_nodes=%s v4_knots=%s v4_band=%s "
+                "v5=%s]", _p, g.get("v3_n_nodes", 0), g.get("v4_knots", 0),
+                g.get("v4_band", 0), g.get("v5", 0),
+            )
         if g.get("v4_knots", 0) and int(g.get("v5", 0)):
             # V5: v4 with the per-candidate fold scratch (r_sparse /
             # dr_sparse) ELIMINATED -- they are an M-fold replication of
