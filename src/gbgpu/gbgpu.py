@@ -227,7 +227,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
     @orbits.setter
     def orbits(self, orbits: Orbits) -> None:
         if orbits is None:
-            self._orbits = EqualArmlengthOrbits()
+            self._orbits = EqualArmlengthOrbits(
+                force_backend=self.lat_backend_name()
+            )
         elif not isinstance(orbits, Orbits):
             raise ValueError(
                 "Input orbits must be of type Orbits (from LISA Analysis Tools)"

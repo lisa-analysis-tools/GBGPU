@@ -233,14 +233,14 @@ class GBFDComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
     @property
     def orbits(self): return self._orbits
     @orbits.setter
-    def orbits(self, o):
-        if o is None:
-            o = EqualArmlengthOrbits()
-        elif not isinstance(o, Orbits) and issubclass(o, Orbits):
-            o = o()
+    def orbits(self, orbit):
+        if orbit is None:
+            orbit = EqualArmlengthOrbits(force_backend=self.lat_backend_name())
+        elif not isinstance(orbit, Orbits) and issubclass(orbit, Orbits):
+            orbit = orbit(force_backend=self.lat_backend_name())
         else:
-            assert isinstance(o, Orbits)
-        self._orbits = deepcopy(o)
+            assert isinstance(orbit, Orbits)
+        self._orbits = deepcopy(orbit)
         # pycppdetector_args triggers lazy configuration if needed.
         self.cpp_orbits = self.backend.OrbitsWrap(
             *self._orbits.pycppdetector_args)
@@ -250,9 +250,9 @@ class GBFDComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
     @tdi_config.setter
     def tdi_config(self, tc):
         if tc is None:
-            tc = TDIConfig("1st generation")
+            tc = TDIConfig("1st generation", force_backend=self.lat_backend_name())
         elif isinstance(tc, str):
-            tc = TDIConfig(tc)
+            tc = TDIConfig(tc, force_backend=self.lat_backend_name())
         elif not isinstance(tc, TDIConfig):
             raise ValueError("tdi_config must be TDIConfig, str, or None.")
         self._tdi_config = tc
@@ -1008,14 +1008,14 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
     @property
     def orbits(self): return self._orbits
     @orbits.setter
-    def orbits(self, o):
-        if o is None:
-            o = EqualArmlengthOrbits()
-        elif not isinstance(o, Orbits) and issubclass(o, Orbits):
-            o = o()
+    def orbits(self, orbit):
+        if orbit is None:
+            orbit = EqualArmlengthOrbits(force_backend=self.lat_backend_name())
+        elif not isinstance(orbit, Orbits) and issubclass(orbit, Orbits):
+            orbit = orbit(force_backend=self.lat_backend_name())
         else:
-            assert isinstance(o, Orbits)
-        self._orbits = deepcopy(o)
+            assert isinstance(orbit, Orbits)
+        self._orbits = deepcopy(orbit)
         if not self._orbits.configured:
             self._orbits.configure(linear_interp_setup=True)
         self.cpp_orbits = self.backend.OrbitsWrap(*self._orbits.pycppdetector_args)
@@ -1025,9 +1025,9 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
     @tdi_config.setter
     def tdi_config(self, tc):
         if tc is None:
-            tc = TDIConfig("1st generation")
+            tc = TDIConfig("1st generation", force_backend=self.lat_backend_name())
         elif isinstance(tc, str):
-            tc = TDIConfig(tc)
+            tc = TDIConfig(tc, force_backend=self.lat_backend_name())
         elif not isinstance(tc, TDIConfig):
             raise ValueError("tdi_config must be TDIConfig, str, or None.")
         self._tdi_config = tc

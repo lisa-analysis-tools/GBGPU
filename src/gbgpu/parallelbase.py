@@ -35,3 +35,23 @@ class GBGPUParallelModule(ParallelModuleBase):
     def GPU_RECOMMENDED_WITH_JAX() -> list[str]:
         """Same as GPU_RECOMMENDED() but with the JAX backend appended."""
         return ["cuda13x", "cuda12x", "cuda11x", "cpu", "jax"]
+
+    def lat_backend_name(self) -> str:
+        """This module's backend as a bare tag LAT classes can resolve.
+
+        Strips the ``gbgpu_`` prefix off ``self.backend.name`` so the tag can
+        be handed to a LAT constructor (``EqualArmlengthOrbits``,
+        ``TDIConfig``, ...), which re-prefixes it with ``lisatools_``.
+
+        Use this when building a LAT sub-object that
+        this module will then feed to its own ``self.backend.*Wrap``. A
+        default-constructed LAT object resolves the PROCESS-WIDE backend, so
+        on a machine where cupy imports (any GPU node) a ``force_backend="cpu"``
+        comp would silently get cuda orbits and die in the wrap with
+        ``OrbitsWrapCPU(*cupy_args)``. Passing ``self.backend`` directly is
+        also wrong: it would leave the LAT object carrying a ``gbgpu_*``
+        backend that lacks LAT-only symbols.
+        """
+        name = self.backend.name
+        prefix = self._BACKEND_PREFIX + "_"
+        return name[len(prefix):] if name.startswith(prefix) else name
