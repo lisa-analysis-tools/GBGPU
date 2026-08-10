@@ -812,7 +812,16 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             infomat_knob, information_matrix_from_ll,
         )
 
-        if not infomat_knob("SIGHET_INFOMAT", False) or not self._in_model:
+        # ``data_index`` here means BUFFER SLOT (get_ll_wdm maps it through
+        # ``_slot_to_ref`` while an in-model reference is live), NOT the
+        # walker. It must be supplied explicitly: falling back to
+        # ``noise_index`` would silently reinterpret walker indices as slots
+        # -- in range, so nothing raises, and the proposal covariance comes
+        # out of the WRONG sources' references. Without it, take the
+        # validated chunked path.
+        if (not infomat_knob("SIGHET_INFOMAT", False)
+                or not self._in_model
+                or data_index is None):
             return self.chunked.information_matrix(
                 params, wdm_holder, inds=inds, param_eps=param_eps,
                 noise_index=noise_index, **kwargs)
@@ -826,10 +835,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         eps = xp.asarray(param_eps, dtype=xp.float64) * float(
             infomat_knob("SIGHET_INFOMAT_EPS_SCALE", 1.0))
 
-        di = data_index if data_index is not None else noise_index
-        if di is None:
-            di = xp.zeros(p.shape[0], dtype=xp.int32)
-        di = xp.asarray(di)
+        di = xp.asarray(data_index)
 
         def _call_ll(rows):
             # Rows are the SAME sources repeated per corner, so the data_index
