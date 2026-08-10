@@ -299,79 +299,85 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         return (xp.asarray(_np.ascontiguousarray(w_out.ravel())),
                 xp.asarray(j0_out), W)
 
-    def _resolve_v3_nodes(self, x, di):
-        """Node count for the v3 ratio build.  ``v3_n_nodes > 0`` = fixed;
-        ``-1`` = ADAPTIVE from the batch's worst predicted ratio variation
-        (sky-Doppler amplitude + inclination/psi displacement vs each
-        candidate's reference): n = 16 * (D/0.4)^(1/4), clipped [8, 64] --
-        calibrated by the prototype's 1-yr axis sweep + 240-proposal stress
-        test.  One scalar device sync per call in adaptive mode.
+    #: Measured ``n_r`` tiers: ``(T_obs/yr upper bound, n_r)``, ascending.
+    #: A baseline at or below a bound takes that row; anything past the last
+    #: row takes :attr:`_NR_DEFAULT`. Same shape as ``get_N``'s tiered
+    #: lookups -- a table of measurements, deliberately NOT a fitted formula.
+    #:
+    #: Every row is an anchor that was actually swept with LAT
+    #: ``scripts/gb_chunked_het/gb_sighet_tier_assess.py`` (its
+    #: ``ii16``/``ii32``/``ii64`` columns ARE this sweep), 8 references x 5
+    #: displacement directions x 5 tiers, against the tiered budget
+    #: ``allowed(T) ~ max(0.1, T/100)``.
+    #:
+    #: **Do not interpolate between rows and do not add a row that was not
+    #: measured** -- an unmeasured baseline should fall through to the safe
+    #: default, not to a guess.
+    _NR_TIERS = (
+        # 0.25 yr (3 mo), 2026-08-09: n_r=32 is indistinguishable from 64 at
+        # every tier -- worst |dLL| 0.052 vs 0.060 at T=1000, ordering
+        # flipping inside noise below that, and 100% pass everywhere.
+        # n_r=16 also passes 100% but leaves only 1.6x margin at T=10 -- the
+        # binding tier -- versus 33x for 32, so the extra 2x is not worth it.
+        (0.25, 32),
+    )
+    #: Baselines past the last measured tier.
+    #:
+    #: 1.0 yr, 2026-08-10 (same harness, 8 refs x 5 dirs): the picture
+    #: INVERTS -- worst |dLL| / pass-rate at T=1000 is
+    #: ``n_r=16 -> 350 / 68%``, ``32 -> 49.6 / 85%``, ``64 -> 26.5 / 98%``.
+    #: So 32 genuinely IS too coarse at 1 yr, which is what the v4/v5
+    #: shootout found; it never contradicted the 0.25 yr row above, because
+    #: n_r is a function of T_obs and the two were measured at different
+    #: ones. Medians stay small at every n_r (0.09 at T=1000 for 64) -- it is
+    #: the WORST references that blow up, so median-only checks miss this.
+    #:
+    #: NOTE: at 1 yr even n_r=64 does not reach 100% (92-98% by tier). That
+    #: residual is NOT an n_r problem -- raising nodes has clearly saturated
+    #: by 64 -- it is the known hard-reference population (see the ref02
+    #: builder-slip case in gb_sighet_tier_assess.py). Do not try to buy it
+    #: back with more nodes.
+    _NR_DEFAULT = 64
 
-        TODO(T_obs-aware node law, 2026-08-02): this law is calibrated at
-        ONE baseline (1 yr) and is blind to T_obs -- but the ratio's
-        structure is dominated by the ANNUAL modulation (sky-Doppler and
-        antenna-pattern), so the number of oscillations the spline has to
-        represent scales as T_obs / 1 yr.  Consequences, both measurable
-        with gb_sighet_proof_figure.py (which now measures accuracy at
-        every T_obs):
-          * SHORT baselines are over-resolved.  At 1 month the ratio makes
-            ~1/12 of a modulation cycle, so ~8-16 nodes should match what
-            64 buys at 1 yr -- and since raw node evaluations DOMINATE the
-            per-candidate cost, that is close to a linear speedup (~4x at
-            1 month), not a marginal one.
-          * LONG baselines may be UNDER-resolved.  The flat ~15 us/candidate
-            measured out to 4 yr holds n_r = 64 fixed; if the accuracy panel
-            degrades with T_obs beyond the known sparse-stride effect, the
-            fit -- not the evaluation -- is the cause and n_r must grow.
-        Proposed form: n_r ~ clip(ceil(k * (T_obs/yr) * (SNR^2 D / eps)^(1/4)),
-        8, n_max), i.e. fold the baseline in alongside the displacement and
-        the already-stashed reference SNR (the SNR-awareness is the other
-        half of this TODO -- raw lnL error scales as SNR^2 x mismatch, so a
-        loud source needs a finer fit for the same lnL accuracy).
-        Note polynomial phase (df0, dfdot) costs NO extra nodes at any
-        baseline -- cubic splines represent it exactly -- so this law should
-        key on the sky/inclination/polarization displacement only."""
+    def _resolve_v3_nodes(self, x, di):
+        """Node count for the v3 ratio build.
+
+        ``v3_n_nodes > 0`` = fixed (the explicit ``SIGHET_V3_NODES`` knob);
+        ``-1`` = look the baseline up in :attr:`_NR_TIERS`.
+
+        The lookup keys on ``T_obs`` ALONE. Two reasons, both measured:
+
+        * **Displacement does not need a term.** The 0.25 yr sweep held
+          ``n_r = 32`` across the whole displacement range the sampler can
+          reach (T=1 through T=1000, the latter being the gate boundary --
+          past it candidates are rejected by the trust region / prior
+          anyway). So there is nothing for a displacement term to buy inside
+          the supported range.
+        * **It removes a device sync.** The superseded law reduced a
+          per-candidate displacement array to a scalar ``d_max``, forcing one
+          device sync per call. A table keyed on a scalar the settings
+          already carry needs none.
+
+        Polynomial phase (df0, dfdot) costs no extra nodes at any baseline --
+        cubic splines represent it exactly -- so it never enters either way.
+
+        TODO(node-law-snr): raw lnL error scales as SNR^2 x mismatch, so a
+        loud source may need a finer fit for the same lnL accuracy. The
+        0.25 yr sweep did not vary reference SNR, so there is no measured
+        anchor for an SNR axis; add one to :attr:`_NR_TIERS`' shape only
+        after sweeping it.
+        """
         g = self._g
         v3 = int(g.get("v3_n_nodes", 0))
         if v3 > 0:
             return max(4, v3)
-        xp = self.xp
-        R_LT = 499.00478
         _YRSID_SI = 31558149.763545603
-        refs = self.params_ref_all[di]
-        dlam = (x[:, 7] - refs[:, 7]) * xp.cos(refs[:, 8])
-        dbet = x[:, 8] - refs[:, 8]
-        angsep = xp.sqrt(dlam * dlam + dbet * dbet)
-        D = (2.0 * np.pi * x[:, 1] * R_LT * angsep
-             + xp.abs(x[:, 5] - refs[:, 5]) + xp.abs(x[:, 6] - refs[:, 6]))
-        d_max = float(xp.max(D)) if D.size else 0.0
-
-        # T_obs scaling (the first half of the TODO above). The ratio's
-        # structure is dominated by the ANNUAL modulation, so the number of
-        # oscillations the spline must represent scales as T_obs / 1 yr --
-        # the 16-node coefficient was calibrated at exactly 1 yr, and using
-        # it unscaled over-resolves every shorter baseline. At 3 months the
-        # ratio turns through ~1/4 of a cycle, so this drops n_r from the
-        # 1-yr value toward the floor; raw node evaluations dominate the
-        # per-candidate cost, so the saving is close to linear.
-        #
-        # Keyed on the sky/inclination/polarization displacement ONLY:
-        # polynomial phase (df0, dfdot) costs no extra nodes at any
-        # baseline because cubic splines represent it exactly.
-        #
-        # GB_SIGHET_NODE_TOBS_SCALE=0 restores the 1-yr-calibrated law.
-        t_scale = 1.0
-        if os.environ.get("GB_SIGHET_NODE_TOBS_SCALE", "1") == "1":
-            _T = float(g.get("Tobs", 0.0) or 0.0)
-            if _T > 0.0:
-                t_scale = _T / _YRSID_SI
-        n = math.ceil(16.0 * t_scale * (max(d_max, 1e-3) / 0.4) ** 0.25)
-        # TODO(node-law-snr): the other half of the TODO above -- raw lnL
-        # error scales as SNR^2 x mismatch, so a loud source needs a finer
-        # fit for the same lnL accuracy. Fold the stashed reference SNR in
-        # as (SNR^2 D / eps)^(1/4) once gb_sighet_proof_figure.py has
-        # measured the coefficient; until then the clip floor carries it.
-        return int(np.clip(n, 8, 64))
+        t_yr = float(g.get("Tobs", 0.0) or 0.0) / _YRSID_SI
+        if t_yr > 0.0:
+            for t_hi, n_tier in self._NR_TIERS:
+                if t_yr <= t_hi:
+                    return int(n_tier)
+        return int(self._NR_DEFAULT)
 
     # ------------------------------------------------------------------
     # Band-engine mode: sig-het scoring INSIDE the GB special move.
