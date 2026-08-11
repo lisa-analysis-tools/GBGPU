@@ -697,6 +697,41 @@ class GBComputationGroup{
         int     nchannels, int tdi_type, int project_real,
         int     v5_mode);
 
+    // Signal-het F-STAT -- per-candidate (N (4,), M_upper (10,)) for the 4
+    // Cornish & Crowder basis filters against SHARED heterodyne references,
+    // via the v5 node stage + fixed-knot resample + generalized bin-fold.
+    // Same (N, M) contract and basis convention as the chunked-het
+    // wdm_het_get_fstat_ll kernel. The stash arrays are COMPACT
+    // per-reference windows of width ``W_slab`` with per-reference absolute
+    // origin ``ind_min_f + w_lo_arr[data_idx]`` (full-band = W_slab ==
+    // Nf_active + all-zero w_lo). ``fstat_mode``: 0 = 2 node stages (one per
+    // psi) + exact phi0 rotation (production); 1 = 4 independent stages
+    // (recombination self-check / fallback). See the F-STAT section of
+    // gb_tdi_on_the_fly.cu for the recombination math and the
+    // basis-frame-reference amplitude-scale rule.
+    void gb_signal_het_fstat_get_ll_wrap(
+        GBTDIonTheFly *tdi_on_fly,
+        double *N_out, double *M_out,
+        unsigned long long *c0_mask_all,
+        cmplx  *A0_all, cmplx *A1_all,
+        cmplx  *B0_all, cmplx *B1_all,
+        cmplx  *B0nc_all, cmplx *B1nc_all,
+        int    *n_sparse_local_arr,
+        double *band_w, int *band_j0, int band_len,
+        double *params_cand_all,
+        double *params_ref_all,
+        int    *data_index_all, int *w_lo_arr,
+        int     num_bin, int num_data,
+        int     n_nodes, int n_knots, int nparams, int f0_idx, int fdot_idx,
+        int     Nf, int Nt, int Nf_active, int W_slab, int Nt_active,
+        int     Nt_layer, int N_sparse_t, int stride,
+        int     ind_min_t, int ind_min_f,
+        int     m_active_half_width,
+        double  layer_df, double dt,
+        double  T_obs, double t_start,
+        int     nchannels, int tdi_type, int project_real,
+        int     fstat_mode);
+
     // Signal-het fill_global. Same FD + polyphase + r_sparse machinery as
     // get_ll, but reconstructs the dense template via the heterodyne
     // identity (linear-interp r_demod -> re-rotate carrier -> multiply by

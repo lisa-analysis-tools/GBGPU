@@ -931,6 +931,86 @@ void GBComputationGroupWrap::gb_signal_het_v5_get_ll(
         v5_mode);
 }
 
+// ---- signal-het F-STAT: (N, M) for the 4 basis filters against shared
+// ---- references; COMPACT per-reference stash windows (W_slab + w_lo) -----
+void GBComputationGroupWrap::gb_signal_het_fstat_get_ll(
+    GBTDIonTheFlyWrap *tdi_wrap,
+    array_type<double> N_out, array_type<double> M_out,
+    array_type<uint64_t> c0_mask_all,
+    array_type<std::complex<double>> A0_all,
+    array_type<std::complex<double>> A1_all,
+    array_type<std::complex<double>> B0_all,
+    array_type<std::complex<double>> B1_all,
+    array_type<std::complex<double>> B0nc_all,
+    array_type<std::complex<double>> B1nc_all,
+    array_type<int> n_sparse_local_arr,
+    array_type<double> band_w, array_type<int> band_j0, int band_len,
+    array_type<double> params_cand_all,
+    array_type<double> params_ref_all,
+    array_type<int> data_index_all,
+    array_type<int> w_lo_arr,
+    int num_bin, int num_data,
+    int n_nodes, int n_knots, int nparams, int f0_idx, int fdot_idx,
+    int Nf, int Nt, int Nf_active, int W_slab, int Nt_active,
+    int Nt_layer, int N_sparse_t, int stride,
+    int ind_min_t, int ind_min_f,
+    int m_active_half_width,
+    double layer_df, double dt,
+    double T_obs, double t_start,
+    int nchannels, int tdi_type, int project_real,
+    int fstat_mode)
+{
+    // COMPACT stash sizes: W_slab wide per reference, absolute window
+    // origins in w_lo_arr (full-band = W_slab == Nf_active + zeros).
+    const size_t b_xyz  = (size_t) num_data * nchannels * nchannels
+                        * W_slab * N_sparse_t;
+    const size_t b_diag = (size_t) num_data * nchannels * W_slab * N_sparse_t;
+    const size_t n_mask = (size_t) num_data * nchannels * W_slab
+                        * (size_t) ((N_sparse_t + 63) / 64);
+
+    gb_signal_het_fstat_get_ll_wrap(
+        tdi_wrap->waveform,
+        return_pointer_and_check_length(N_out, "N_out",
+                                         (size_t) num_bin * 4, 1),
+        return_pointer_and_check_length(M_out, "M_out",
+                                         (size_t) num_bin * 10, 1),
+        reinterpret_cast<unsigned long long*>(
+            return_pointer_and_check_length(c0_mask_all, "c0_mask_all",
+                                            n_mask, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            A0_all, "A0_all", b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            A1_all, "A1_all", b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B0_all, "B0_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B1_all, "B1_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B0nc_all, "B0nc_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            B1nc_all, "B1nc_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+        return_pointer_and_check_length(n_sparse_local_arr, "n_sparse_local",
+                                         N_sparse_t, 1),
+        band_w.data(), band_j0.data(), band_len,
+        return_pointer_and_check_length(params_cand_all, "params_cand_all",
+                                         nparams, num_bin),
+        return_pointer_and_check_length(params_ref_all, "params_ref_all",
+                                         nparams, num_data),
+        return_pointer_and_check_length(data_index_all, "data_index_all",
+                                         num_bin, 1),
+        return_pointer_and_check_length(w_lo_arr, "w_lo_arr", num_data, 1),
+        num_bin, num_data,
+        n_nodes, n_knots, nparams, f0_idx, fdot_idx,
+        Nf, Nt, Nf_active, W_slab, Nt_active,
+        Nt_layer, N_sparse_t, stride,
+        ind_min_t, ind_min_f,
+        m_active_half_width,
+        layer_df, dt,
+        T_obs, t_start,
+        nchannels, tdi_type, project_real,
+        fstat_mode);
+}
+
 void GBComputationGroupWrap::gb_signal_het_fill_global_in_kernel(
     GBTDIonTheFlyWrap *tdi_wrap,
     array_type<double> template_fill,
@@ -1257,6 +1337,24 @@ void gbgpu_part(nb::module_ &m) {
          "traffic (~3 blocks/SM) -- the A/B that isolates occupancy. "
          "GB_SIGHET_V5_VERBOSE=1 prints registers/thread and CUDA's own "
          "achieved blocks/SM for the launch.")
+    .def("gb_signal_het_fstat_get_ll",
+         &GBComputationGroupWrap::gb_signal_het_fstat_get_ll,
+         "Signal-het F-stat: per-candidate N (num_bin, 4) = <d|A_i> and "
+         "M_upper (num_bin, 10) = <A_i|A_j> row-major upper triangle for "
+         "the 4 Cornish & Crowder basis filters (A=2, iota=pi/2, "
+         "psi={0,pi/4,0,pi/4}, phi0={0,pi,3pi/2,pi/2}) at each candidate's "
+         "intrinsics, scored against SHARED heterodyne references through "
+         "the v5 node stage + fixed-knot resample + generalized bin-fold. "
+         "Same (N, M) contract as the chunked-het gb_wdm_het_get_fstat_ll. "
+         "Stash arrays are COMPACT per-reference windows (W_slab wide, "
+         "absolute origins ind_min_f + w_lo_arr[d]); full-band = W_slab == "
+         "Nf_active + all-zero w_lo. fstat_mode 0 = 2 node stages + exact "
+         "phi0 rotation (production); 1 = 4 independent stages "
+         "(recombination self-check). References must be built in the "
+         "CIRCULAR reference frame (A=2, iota=0, psi=0, phi0=0) -- see "
+         "setup_fstat_references / the F-STAT section of "
+         "gb_tdi_on_the_fly.cu for the dlnA-clamp and ratio-pole "
+         "rationale.")
     .def("gb_signal_het_get_ll_in_kernel", &GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel,
          "Stage 2b in-kernel sparse-FD signal-het get_ll. Fuses "
          "gb_run_fd_wave_tdi (sparse heterodyned rfft from the GB source "

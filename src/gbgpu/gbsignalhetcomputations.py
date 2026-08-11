@@ -777,6 +777,259 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         self._slot_to_ref_xp = None
         self.c0_mask_all = None
 
+    # ------------------------------------------------------------------
+    # F-stat against SHARED references (search / grid-fit path).
+    #
+    # ``setup_fstat_references`` builds a COMPACT per-reference stash
+    # (make_reference windows + bin-fold + |c0| row-floor mask) against ONE
+    # residual slab of a wdm_holder; ``get_fstat_ll_wdm`` then scores any
+    # candidate batch through the ``gb_signal_het_fstat_get_ll`` kernel --
+    # the same ``(N (n,4), M_upper (n,10))`` contract as the chunked
+    # ``GBWDMComputations.get_fstat_ll_wdm``, so ``compute_fstat`` /
+    # ``fstat_maximized_extrinsics`` consume either interchangeably.
+    #
+    # This stash is SEPARATE from the in-model stash (setup_in_model /
+    # get_ll): the two paths coexist and neither clobbers the other.
+    # ------------------------------------------------------------------
+
+    _fstat = None
+
+    def setup_fstat_references(self, params_ref_phys, wdm_holder,
+                               data_index=0, noise_index=None,
+                               assert_max_df0=None) -> int:
+        """Build the shared F-stat heterodyne references.
+
+        ``params_ref_phys`` (n_refs, 9): reference rows. Only the INTRINSIC
+        columns (f0, fdot, fddot, lam, beta) are honored -- the extrinsics
+        are FORCED to the CIRCULAR reference frame ``(A, iota, psi, phi0) =
+        (2, 0, 0, 0)``. Two ratio-conditioning requirements drive this (the
+        F-stat itself is exactly invariant to the reference's
+        amplitude/extrinsics -- the ratio carries 1/h_ref, the stash
+        carries h_ref, the product cancels):
+
+        * **Amplitude scale**: a physical reference amplitude ~1e-22
+          against the A=2 basis filters would put the node-ratio dlnA at
+          ~50, past the kernel's +-30 extraction-artefact clamp -> silent
+          corruption. A=2 keeps dlnA at antenna-pattern scale (O(1)).
+        * **Polarization**: the basis filters are LINEARLY polarized
+          (iota=pi/2), so their envelopes have deep antenna-pattern nulls.
+          A linearly-polarized reference would null at DIFFERENT times than
+          the psi-rotated filters, forcing the ratio through POLES no
+          bounded smooth fit can represent (measured: up to ~3e-2 relative
+          error on the psi=pi/4 Gram diagonal). The circular reference's
+          envelope ~ sqrt(xi_p^2 + xi_c^2) is essentially null-free, so
+          every filter ratio has zeros (benign, floored) but no poles.
+
+        ``wdm_holder``: anything exposing ``linear_data_arr[0]`` /
+        ``linear_psd_arr[0]`` in the full-band per-slab layout
+        ``(n_slabs, nch, Nf_active, Nt_active)`` /
+        ``(n_slabs, nch, nch, Nf_active, Nt_active)``. ``data_index`` /
+        ``noise_index`` are SCALAR slab picks (the F-stat scores every
+        candidate against one walker's residual). Only the REAL part of the
+        residual enters the real-projection fold.
+
+        ``assert_max_df0``: optional hard cap on |f0_candidate - f0_ref|
+        enforced by every subsequent :meth:`get_fstat_ll_wdm` call. The
+        fixed-knot resample is violently non-monotonic past its knot-Nyquist
+        envelope (measured), so grid-fit consumers must set this to the
+        measured margin (see
+        ``lisatools.sampling.fstat_gridfit.sighet_fstat_ref_margin_hz``).
+
+        Returns the number of references built.
+        """
+        g = self._g
+        nch = 3
+        xp = self.xp
+        if not g.get("v4_knots", 0):
+            raise RuntimeError(
+                "the sig-het F-stat path runs through the fixed-knot (v4/v5)"
+                " machinery; construct this comp with v4_knots > 0 "
+                "(for_band_engine(..., v4_knots=128, v4_band=16)).")
+        refs = xp.array(xp.asarray(params_ref_phys), dtype=float,
+                        copy=True).reshape(-1, 9)
+        n = refs.shape[0]
+        # Circular-reference-frame overrides (see the docstring). GB
+        # convention: [A, f0, fdot, fddot, phi0, iota, psi, lam, beta].
+        refs[:, 0] = 2.0
+        refs[:, 4] = 0.0
+        refs[:, 5] = 0.0          # iota=0: null-free envelope -> no ratio poles
+        refs[:, 6] = 0.0
+
+        # ---- carrier-centered compact windows (exact; c0 is identically
+        # ---- zero outside the make_reference write extent) ---------------
+        half_ext = (int(math.ceil(g["n_sparse_fd"] / g["Nt"])) + 1
+                    + _SIGHET_WINDOW_MARGIN)
+        W = min(2 * half_ext + 1, g["Nf_active"])
+        f0_host = np.asarray(refs[:, 1].get() if hasattr(refs, "get")
+                             else refs[:, 1])
+        m_carrier = np.floor(f0_host / g["layer_df"]).astype(int)
+        w_lo_host = np.clip(m_carrier - g["ind_min_f"] - half_ext,
+                            0, g["Nf_active"] - W).astype(np.int32)
+        w_lo = xp.ascontiguousarray(xp.asarray(w_lo_host, dtype=xp.int32))
+        layers = xp.asarray(w_lo_host)[:, None] + xp.arange(W)[None, :]
+
+        # ---- data-side windows from the holder's slabs --------------------
+        di = int(data_index)
+        ni = di if noise_index is None else int(noise_index)
+        res_full = xp.asarray(wdm_holder.linear_data_arr[0]).reshape(
+            -1, nch, g["Nf_active"], g["Nt_active"])[di]
+        psd_flat = xp.asarray(wdm_holder.linear_psd_arr[0])
+        _cell = nch * nch * g["Nf_active"] * g["Nt_active"]
+        if (psd_flat.size // _cell) * _cell != psd_flat.size:
+            raise NotImplementedError(
+                "sig-het F-stat setup currently supports the XYZ "
+                "cross-channel inverse covariance layout only.")
+        invC_full = psd_flat.reshape(
+            -1, nch, nch, g["Nf_active"], g["Nt_active"])[ni]
+        ch = xp.arange(nch)
+        res_w = res_full[ch[None, :, None], layers[:, None, :], :]
+        invC_w = invC_full[ch[None, :, None, None], ch[None, None, :, None],
+                           layers[:, None, None, :], :]
+
+        # ---- compact reference c0 (ONE batched backend call) --------------
+        c0_sparse_w = xp.zeros((n, nch, W, g["N_sparse_t"]),
+                               dtype=xp.complex128)
+        c0_dense_w = xp.zeros((n, nch, W, g["Nt_active"]),
+                              dtype=xp.complex128)
+        self.cpp.gb_signal_het_make_reference(
+            self.tdi_wrap, c0_sparse_w, c0_dense_w,
+            self.window_full, self.n_sparse_local,
+            w_lo, refs, n, 9, 1, 2,
+            g["Nf"], g["Nt"], W, g["Nt_active"],
+            g["nt_layer"], g["N_sparse_t"], g["stride"],
+            g["ind_min_t"], g["ind_min_f"],
+            g["layer_df"], g["dt"], g["Tobs"], g["t0"],
+            3, g["n_sparse_fd"], g["tukey_alpha"], g["n_cp_build"])
+
+        # ---- compact bin-fold (chunked over refs for peak memory) ---------
+        per_src_bytes = 2 * nch * nch * W * g["Nt_active"] * 16
+        chunk = max(1, min(n, _SIGHET_FOLD_MAX_BYTES
+                           // max(per_src_bytes, 1)))
+        folds = [
+            bin_fold_real(res_w[s:s + chunk], c0_dense_w[s:s + chunk],
+                          invC_w[s:s + chunk], self.n_sparse_local,
+                          g["stride"], g["Nt_active"], tdi_type="XYZ")
+            for s in range(0, n, chunk)
+        ]
+        if len(folds) == 1:
+            A0s, A1s, B0s, B1s, B0ncs, B1ncs = folds[0]
+        else:
+            A0s, A1s, B0s, B1s, B0ncs, B1ncs = [
+                xp.concatenate(parts, axis=0) for parts in zip(*folds)
+            ]
+
+        # NO full-band expansion: the fstat kernel reads the compact slabs
+        # directly through (W_slab, w_lo_arr). The mask is row-local, so it
+        # builds straight from the compact c0.
+        c0_mask = _c0_row_mask_bits(c0_sparse_w, xp)
+
+        # nearest-reference bucketing support (f0-sorted view + inverse map)
+        order = np.argsort(f0_host)
+        self._fstat = dict(
+            A0=xp.ascontiguousarray(A0s), A1=xp.ascontiguousarray(A1s),
+            B0=xp.ascontiguousarray(B0s), B1=xp.ascontiguousarray(B1s),
+            B0nc=xp.ascontiguousarray(B0ncs),
+            B1nc=xp.ascontiguousarray(B1ncs),
+            mask=xp.ascontiguousarray(c0_mask),
+            refs=xp.ascontiguousarray(refs),
+            w_lo=w_lo, W=int(W), n=int(n),
+            f0_sorted=xp.asarray(f0_host[order]),
+            order=xp.asarray(order),
+            max_df0=(None if assert_max_df0 is None
+                     else float(assert_max_df0)),
+        )
+        return n
+
+    def clear_fstat_references(self) -> None:
+        self._fstat = None
+
+    def get_fstat_ll_wdm(self, params, wdm_holder=None, data_index=None,
+                         noise_index=None, fstat_mode=None, **kwargs):
+        """Sig-het F-stat: ``(N (num_bin, 4), M_upper (num_bin, 10))``.
+
+        Drop-in signature match for the chunked
+        ``GBWDMComputations.get_fstat_ll_wdm`` with two deltas, both
+        documented: ``wdm_holder`` is IGNORED (the data side is already
+        folded into the reference stash built by
+        :meth:`setup_fstat_references` -- which must have been called, and
+        against the residual the caller means); and ``data_index`` selects
+        the REFERENCE for each candidate, not a holder slab (default:
+        nearest reference in f0).
+
+        ``fstat_mode``: 0 (default; env ``GB_SIGHET_FSTAT_MODE``) evaluates
+        2 node stages (one per basis psi) and recovers all 4 filters by the
+        exact phi0 phase rotation; 1 evaluates 4 independent stages (the
+        recombination self-check / fallback).
+        """
+        fs = self._fstat
+        if fs is None:
+            raise RuntimeError(
+                "sig-het get_fstat_ll_wdm needs an active reference stash; "
+                "call setup_fstat_references first.")
+        xp = self.xp
+        g = self._g
+        x = xp.ascontiguousarray(
+            xp.atleast_2d(xp.asarray(params, dtype=float)))
+        num_bin = x.shape[0]
+
+        if data_index is None:
+            # nearest reference in f0 (device-side; refs need not be sorted)
+            if fs["n"] == 1:
+                di = xp.zeros(num_bin, dtype=xp.int32)
+            else:
+                f0s = fs["f0_sorted"]
+                pos = xp.clip(xp.searchsorted(f0s, x[:, 1]), 1, fs["n"] - 1)
+                left = f0s[pos - 1]
+                right = f0s[pos]
+                k = xp.where((x[:, 1] - left) > (right - x[:, 1]),
+                             pos, pos - 1)
+                di = fs["order"][k].astype(xp.int32)
+            di = xp.ascontiguousarray(di)
+        else:
+            di = xp.ascontiguousarray(
+                xp.asarray(data_index, dtype=xp.int32))
+
+        if fs["max_df0"] is not None:
+            # HARD gate: the fixed-knot resample is violently non-monotonic
+            # past its knot-Nyquist envelope -- never trust a lucky point.
+            df0 = xp.abs(x[:, 1] - fs["refs"][di.astype(int), 1])
+            worst = float(df0.max()) if num_bin else 0.0
+            if worst > fs["max_df0"]:
+                raise RuntimeError(
+                    f"sig-het F-stat: candidate displaced {worst:.3e} Hz "
+                    f"from its reference, beyond the asserted margin "
+                    f"{fs['max_df0']:.3e} Hz. Rebuild references with "
+                    "tighter spacing (or bucket candidates correctly).")
+
+        if self._v4_band_arrays is None:
+            self._v4_band_arrays = self._make_v4_band_arrays()
+        band_w, band_j0, band_len = self._v4_band_arrays
+
+        mode = (int(os.environ.get("GB_SIGHET_FSTAT_MODE", "0"))
+                if fstat_mode is None else int(fstat_mode))
+        N_out = xp.zeros((num_bin, 4), dtype=xp.float64)
+        M_out = xp.zeros((num_bin, 10), dtype=xp.float64)
+        self.cpp.gb_signal_het_fstat_get_ll(
+            self.tdi_wrap, N_out.reshape(-1), M_out.reshape(-1),
+            fs["mask"],
+            fs["A0"], fs["A1"], fs["B0"], fs["B1"],
+            fs["B0nc"], fs["B1nc"],
+            self.n_sparse_local,
+            band_w, band_j0, band_len,
+            x, fs["refs"], di, fs["w_lo"],
+            num_bin, fs["n"],
+            self._resolve_v3_nodes(x, di), int(g["v4_knots"]),
+            9, 1, 2,
+            g["Nf"], g["Nt"], g["Nf_active"], fs["W"], g["Nt_active"],
+            g["nt_layer"], g["N_sparse_t"], g["stride"],
+            g["ind_min_t"], g["ind_min_f"], g["m_half"],
+            g["layer_df"], g["dt"], g["Tobs"], g["t0"],
+            3, 0, 1,                      # XYZ, project_real=1
+            mode)
+        self.N_arr = N_out
+        self.M_mat = M_out
+        return N_out, M_out
+
     # ---- band-engine surface (chunked delegate + in-model routing) -------
 
     def fill_global_wdm(self, *args, **kwargs):

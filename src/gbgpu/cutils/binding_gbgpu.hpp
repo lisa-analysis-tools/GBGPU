@@ -938,6 +938,40 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         int nchannels, int tdi_type, int project_real,
         int v5_mode);
 
+    // Signal-het F-STAT: per-candidate (N (num_bin, 4), M_upper
+    // (num_bin, 10)) for the 4 Cornish & Crowder basis filters against
+    // SHARED heterodyne references (v5 machinery; 2 node stages + exact
+    // phi0 rotation at fstat_mode = 0, 4 independent stages at 1). Stash
+    // arrays are COMPACT per-reference windows of width ``W_slab`` with
+    // per-reference active-local origins ``w_lo_arr`` (full-band stash =
+    // W_slab == Nf_active + all-zero w_lo).
+    void gb_signal_het_fstat_get_ll(
+        GBTDIonTheFlyWrap *tdi_wrap,
+        array_type<double> N_out, array_type<double> M_out,
+        array_type<uint64_t> c0_mask_all,
+        array_type<std::complex<double>> A0_all,
+        array_type<std::complex<double>> A1_all,
+        array_type<std::complex<double>> B0_all,
+        array_type<std::complex<double>> B1_all,
+        array_type<std::complex<double>> B0nc_all,
+        array_type<std::complex<double>> B1nc_all,
+        array_type<int> n_sparse_local_arr,
+        array_type<double> band_w, array_type<int> band_j0, int band_len,
+        array_type<double> params_cand_all,
+        array_type<double> params_ref_all,
+        array_type<int> data_index_all,
+        array_type<int> w_lo_arr,
+        int num_bin, int num_data,
+        int n_nodes, int n_knots, int nparams, int f0_idx, int fdot_idx,
+        int Nf, int Nt, int Nf_active, int W_slab, int Nt_active,
+        int Nt_layer, int N_sparse_t, int stride,
+        int ind_min_t, int ind_min_f,
+        int m_active_half_width,
+        double layer_df, double dt,
+        double T_obs, double t_start,
+        int nchannels, int tdi_type, int project_real,
+        int fstat_mode);
+
     // Signal-het fill_global. Reuses Stage 2b's FD + polyphase machinery to
     // build r at sparse n, then linear-interpolates r to the dense WDM
     // time grid, re-rotates the carrier, multiplies by the stored full
