@@ -6200,14 +6200,51 @@ void gb_signal_het_fstat_score_one_source(
         CUDA_SYNC_THREADS;
 
         // ---- per-channel node ratios --------------------------------------
+        // FLIP-FREE positive-envelope extraction (F-stat only; v5's
+        // in-model path is untouched). The shared
+        // new_extract_amplitude_and_phase carries a sign-flip detector
+        // (count/flip/pjump: a curvature test at interior amplitude
+        // minima) whose OUTPUT CONTRACT is a SIGNED smooth envelope --
+        // As = flip * |M| goes negative past a detected zero crossing
+        // (flips are cumsum'd along the series) with the compensating pi
+        // carried in the phase. This node stage consumes amplitude through
+        // ``log(max(a, 1e-2 * amax))``: every negative node is clamped to
+        // the floor, so ONE fired flip corrupts the amplitude of the
+        // ENTIRE remaining series. The in-model path never trips this
+        // (physical generic-iota candidates have null-free envelopes; the
+        // detector never fires), but the F-stat basis filters are LINEARLY
+        // polarized (iota = pi/2) -- their antenna-pattern envelopes
+        // genuinely cross zero, so on long windows the detector fires
+        // legitimately and the psi = 0 stage collapses. Measured
+        // (2026-08-11, first GPU run + CPU reproduction on the SAME 90-d
+        // grid, V4_NT=540 V4_NF=1440, numerically identical on both
+        // backends): center-row N rel [4.2e-2, ~5e-5, 2.6e-1, ~1e-4],
+        // M rel up to 0.86, while fstat_mode 0 == 1 to 6e-10 (|M|, hence
+        // the flip pattern, is invariant to phi0 -- which is why the
+        // recombination gate stayed green through it). The 15-d gate grid
+        // never fires the detector, which is how it passed pre-fix.
+        //
+        // Fix: extract with the POSITIVE-envelope convention -- amp = |M|,
+        // phase = -atan2(Im, Re) - remainder(phi_ref, 2 pi) -- which is
+        // EXACTLY the shared routine's output when no flip fires (flip = 1,
+        // pjump = 0), promoted from accident to invariant: branch-free and
+        // backend-independent. The cost is that a genuine envelope zero is
+        // represented as a positive cusp (V-dip + pi phase step between
+        // nodes) instead of a smooth signed crossing; the fit error is
+        // localized to the null, where the filter's own |r| (and hence the
+        // fold weight of the error) is smallest. gb_sighet_fstat_parity.py
+        // gates this representation on both the 15-d and 90-d grids.
         const double df0   = params_c[f0_idx]  - params_r[f0_idx];
         const double dfdot = params_c[fdot_idx] - params_r[fdot_idx];
+        (void) count; (void) fix_c; (void) pjump;
         for (int c = 0; c < nchannels; ++c)
         {
-            tof->new_extract_amplitude_and_phase(count, fix_c, flip, pjump,
-                                                 n_nodes, amp_y, ph_y,
-                                                 &tdi_c[(size_t) c * n_nodes],
-                                                 phiun_c);
+            for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X) {
+                const cmplx Mv = tdi_c[(size_t) c * n_nodes + k];
+                amp_y[k] = gcmplx::abs(Mv);
+                ph_y[k]  = -atan2(Mv.imag(), Mv.real())
+                           - remainder(phiun_c[k], 2.0 * M_PI);
+            }
             CUDA_SYNC_THREADS;
             tof->new_unwrap_phase(flip, n_nodes, ph_y);
             CUDA_SYNC_THREADS;
@@ -6225,11 +6262,14 @@ void gb_signal_het_fstat_score_one_source(
                 dphi[(size_t) c * n_nodes + k] = ph_y[k] + phiun_c[k];
             }
             CUDA_SYNC_THREADS;
-            // reference
-            tof->new_extract_amplitude_and_phase(count, fix_c, flip, pjump,
-                                                 n_nodes, amp_y, ph_y,
-                                                 &tdi_r[(size_t) c * n_nodes],
-                                                 phiun_r);
+            // reference (circular frame: null-free envelope, but use the
+            // same flip-free extraction for symmetry/determinism)
+            for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X) {
+                const cmplx Mv = tdi_r[(size_t) c * n_nodes + k];
+                amp_y[k] = gcmplx::abs(Mv);
+                ph_y[k]  = -atan2(Mv.imag(), Mv.real())
+                           - remainder(phiun_r[k], 2.0 * M_PI);
+            }
             CUDA_SYNC_THREADS;
             tof->new_unwrap_phase(flip, n_nodes, ph_y);
             CUDA_SYNC_THREADS;
