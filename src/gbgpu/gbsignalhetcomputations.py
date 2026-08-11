@@ -549,6 +549,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         expansion point. Returns True so callers can tell an active
         sig-het setup from the no-op hooks (which return None)."""
         g = self._g
+        self._clamp_n_sparse_fd_for_device()
         nch = 3
         xp = self.xp
         # host copy of the slot ids for the slot->ref map bookkeeping.
@@ -794,6 +795,50 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
 
     _fstat = None
 
+    def _clamp_n_sparse_fd_for_device(self) -> int:
+        """Clamp ``self._g['n_sparse_fd']`` to what THIS device can launch.
+
+        The reference build runs the FD-wave producer
+        (``gb_run_fd_wave_tdi``), whose whole per-source working set lives
+        in dynamic shared memory on CUDA — an oversized ``n_sparse_fd``
+        dies as a bare ``GPUassert: invalid argument`` at the launch.
+        Mirrors the synthetic-injection guard
+        (``lisatools...injections._resolve_synth_n_sparse``): largest
+        power of two that fits ``MaxSharedMemoryPerBlockOptin`` via the
+        wrap's own ``get_fd_buffer_size`` (direct-path size; the spline
+        arena is smaller at the build's ``n_cp`` in practice). CPU is
+        unbounded (heap). The clamped value is written back to ``self._g``
+        so every consumer (window extents, make_reference calls) agrees.
+        """
+        g = self._g
+        n = int(g["n_sparse_fd"])
+        if not getattr(self.backend, "uses_cupy", False):
+            return n
+        try:
+            import cupy as _cp
+
+            attrs = _cp.cuda.Device().attributes
+            limit = attrs.get("MaxSharedMemoryPerBlockOptin") or attrs.get(
+                "MaxSharedMemoryPerBlock"
+            )
+        except Exception:
+            return n
+        if not limit:
+            return n
+        n_fit = n
+        while n_fit > 64 and self.tdi_wrap.get_fd_buffer_size(n_fit, 3) > int(limit):
+            n_fit //= 2
+        if n_fit != n:
+            logger.warning(
+                "sig-het reference build: n_sparse_fd %d needs %.0f KB of "
+                "shared memory against this device's %.0f KB/block; "
+                "clamped to %d (largest fitting power of two).",
+                n, self.tdi_wrap.get_fd_buffer_size(n, 3) / 1024,
+                int(limit) / 1024, n_fit,
+            )
+            g["n_sparse_fd"] = n_fit
+        return n_fit
+
     def setup_fstat_references(self, params_ref_phys, wdm_holder,
                                data_index=0, noise_index=None,
                                assert_max_df0=None) -> int:
@@ -838,6 +883,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         Returns the number of references built.
         """
         g = self._g
+        self._clamp_n_sparse_fd_for_device()
         nch = 3
         xp = self.xp
         if not g.get("v4_knots", 0):
