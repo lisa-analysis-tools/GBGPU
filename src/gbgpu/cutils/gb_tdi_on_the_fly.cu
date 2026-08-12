@@ -72,6 +72,102 @@ static inline void gb_sighet_check_m_half(int m_active_half_width)
 }
 
 
+#ifdef __CUDACC__
+// ----------------------------------------------------------------------------
+// Checked dynamic-shared-memory request for a kernel launch (host side).
+//
+// The historical per-wrap idiom
+//
+//     if (shared_bytes > 48 * 1024)
+//         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+//                              shared_bytes);
+//
+// has two failure modes that both end in a bare
+// ``GPUassert: invalid argument`` at the post-launch cudaGetLastError (the
+// SIGHET_NT_LAYER=135 gate death, 2026-08-12, nt_layers_1.log):
+//
+//   1. the cudaFuncSetAttribute return value was DISCARDED, so a request past
+//      the device's opt-in ceiling (cudaDevAttrMaxSharedMemoryPerBlockOptin:
+//      163,840 B on A100, 232,448 B on H100) failed silently and the launch
+//      then failed with the same uninformative error;
+//   2. the 48 KB threshold compared the DYNAMIC request alone, ignoring the
+//      kernel's STATIC shared usage (cub reduce scratch, link tables): a
+//      dynamic request just under 48 KB whose static+dynamic total crosses
+//      it launches without the opt-in and dies.
+//
+// ``gb_sighet_try_request_shared`` fixes both: it accounts static+dynamic
+// against the true device opt-in limit and error-checks the attribute call.
+// It returns false (without touching the attribute) when the request cannot
+// fit, so callers can fall back to a slimmer layout;
+// ``gb_sighet_request_shared`` is the throwing form for callers with no
+// fallback -- the exception surfaces in Python as a ValueError NAMING the
+// kernel, the request, and the device limit, at setup time, instead of a
+// mid-run GPUassert.
+//
+// Host-launcher plumbing only (CUDA branch): no kernel arithmetic changes,
+// so launches that were legal before produce bit-identical results.
+// ----------------------------------------------------------------------------
+static inline int gb_sighet_device_shared_optin_limit()
+{
+    int dev = 0;
+    gpuErrchk(cudaGetDevice(&dev));
+    int limit = 0;
+    if (cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               dev) != cudaSuccess || limit <= 0)
+    {
+        (void) cudaGetLastError();   // clear the probe failure; use the base cap
+        gpuErrchk(cudaDeviceGetAttribute(
+            &limit, cudaDevAttrMaxSharedMemoryPerBlock, dev));
+    }
+    return limit;
+}
+
+template <typename KernelT>
+static inline bool gb_sighet_try_request_shared(KernelT kernel,
+                                                size_t shared_bytes,
+                                                size_t *total_out = nullptr,
+                                                int *limit_out = nullptr)
+{
+    cudaFuncAttributes attr;
+    gpuErrchk(cudaFuncGetAttributes(&attr, (const void *) kernel));
+    const int    limit = gb_sighet_device_shared_optin_limit();
+    const size_t total = shared_bytes + (size_t) attr.sharedSizeBytes;
+    if (total_out != nullptr) *total_out = total;
+    if (limit_out != nullptr) *limit_out = limit;
+    if (total > (size_t) limit)
+        return false;
+    if (total > (size_t) 48 * 1024)
+    {
+        gpuErrchk(cudaFuncSetAttribute(
+            (const void *) kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int) shared_bytes));
+    }
+    return true;
+}
+
+template <typename KernelT>
+static inline void gb_sighet_request_shared(KernelT kernel,
+                                            size_t shared_bytes,
+                                            const char *kernel_name,
+                                            const char *hint)
+{
+    size_t total = 0;
+    int    limit = 0;
+    if (!gb_sighet_try_request_shared(kernel, shared_bytes, &total, &limit))
+    {
+        throw std::invalid_argument(
+            std::string("[") + kernel_name + "] needs "
+            + std::to_string(total) + " B of shared memory per block ("
+            + std::to_string(shared_bytes) + " dynamic + "
+            + std::to_string(total - shared_bytes) + " static) but this "
+            "device's opt-in limit is " + std::to_string(limit) + " B. "
+            + hint);
+    }
+}
+#endif  // __CUDACC__
+
+
 // =============================================================================
 // GBTDIonTheFly --- UCB closed-form physics
 // =============================================================================
@@ -753,6 +849,20 @@ void gb_run_fd_wave_tdi_wrap(GBTDIonTheFly *tdi_on_fly,
     }
 
 #ifdef __CUDACC__
+    int shared_bytes =
+        tdi_on_fly->get_gb_fd_buffer_size(N_sparse, nchannels, n_cp_sig);
+
+    // Allow shared usage past the 48 KB static default for large N_sparse --
+    // checked against the device opt-in limit BEFORE any allocation (throws
+    // a Python-visible exception instead of a post-launch GPUassert when it
+    // cannot fit).
+    gb_sighet_request_shared(
+        gb_run_fd_wave_tdi_kernel, (size_t) shared_bytes,
+        "gb_run_fd_wave_tdi",
+        "The budget is get_gb_fd_buffer_size(N_sparse, nchannels, n_cp) -- "
+        "lower n_sparse_fd (SIGHET_N_SPARSE_FD; the Python "
+        "_clamp_n_sparse_fd_for_device does this automatically when armed).");
+
     GBTDIonTheFly *gb_host = new GBTDIonTheFly(
         tdi_on_fly->orbits, tdi_on_fly->tdi_config,
         tdi_on_fly->T, tdi_on_fly->t_ref);
@@ -774,18 +884,6 @@ void gb_run_fd_wave_tdi_wrap(GBTDIonTheFly *tdi_on_fly,
     cudaMalloc(&d_gb, sizeof(GBTDIonTheFly));
     gpuErrchk(cudaMemcpy(d_gb, gb_host, sizeof(GBTDIonTheFly),
                          cudaMemcpyHostToDevice));
-
-    int shared_bytes =
-        tdi_on_fly->get_gb_fd_buffer_size(N_sparse, nchannels, n_cp_sig);
-
-    // Allow shared usage past the 48 KB static default for large N_sparse.
-    if (shared_bytes > 48 * 1024)
-    {
-        cudaFuncSetAttribute(
-            gb_run_fd_wave_tdi_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            shared_bytes);
-    }
 
     gb_run_fd_wave_tdi_kernel<<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(
         d_gb, X_het, k_f0_out, f0_grid_out,
@@ -2960,6 +3058,21 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
 // ============================================================================
 
 #ifdef __CUDACC__
+// One-shot fill of the length-Nt twiddle table in GLOBAL memory -- the SAME
+// expression, per k, as the make_reference kernel's cooperative shared fill,
+// so the fallback consumes identical table values. Launched by the wrap only
+// when the full shared carve does not fit the device (see the wrap).
+CUDA_KERNEL
+void gb_sighet_fill_twiddle_kernel(cmplx *tw, int Nt)
+{
+    const double TWO_PI = 2.0 * M_PI;
+    const cmplx  I_c    = cmplx(0.0, 1.0);
+    for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < Nt;
+         k += gridDim.x * blockDim.x)
+        tw[k] = gcmplx::exp(I_c * (TWO_PI * (double) k / (double) Nt));
+}
+
+
 CUDA_KERNEL
 void gb_signal_het_make_reference_kernel(
     cmplx  *c0_sparse_out,
@@ -2979,7 +3092,15 @@ void gb_signal_het_make_reference_kernel(
     int     ind_min_t, int ind_min_f,
     double  dt,
     int     nchannels,
-    int     N_sparse_fd)
+    int     N_sparse_fd,
+    cmplx  *tw_global)          // non-null: pre-filled length-Nt twiddle
+                                // table in GLOBAL memory (the tw[Nt] shared
+                                // slab is then not carved) -- the wrap's
+                                // fallback when (Nt + N_sparse_fd +
+                                // Nt_layer) * 16 exceeds the device's
+                                // shared-memory opt-in limit (Nt = 16800 at
+                                // 23 mo -> 287 KB > any device). Same
+                                // values, same reads; L2 serves the reuse.
 {
     extern CUDA_SHARED char shared_mem[];
 
@@ -2991,10 +3112,15 @@ void gb_signal_het_make_reference_kernel(
     const int    n_start = ind_min_t + n_sparse_local_arr[0];
     const double dt_inv  = 1.0 / dt;
 
-    // Shared carve: tw[Nt] twiddle table + Xw[N_sparse_fd] windowed
-    // X-slice + fold_s[Nt_layer] sparse fold.
+    // Shared carve: tw[Nt] twiddle table (shared mode only) +
+    // Xw[N_sparse_fd] windowed X-slice + fold_s[Nt_layer] sparse fold.
     char  *cur    = shared_mem;
-    cmplx *tw     = (cmplx*) cur;  cur += (size_t) Nt * sizeof(cmplx);
+    cmplx *tw;
+    if (tw_global != nullptr) {
+        tw = tw_global;
+    } else {
+        tw = (cmplx*) cur;  cur += (size_t) Nt * sizeof(cmplx);
+    }
     cmplx *Xw     = (cmplx*) cur;  cur += (size_t) N_sparse_fd * sizeof(cmplx);
     cmplx *fold_s = (cmplx*) cur;
 
@@ -3025,7 +3151,10 @@ void gb_signal_het_make_reference_kernel(
         if (i_lo > i_hi) continue;
 
         // ---- cooperative shared setup --------------------------------
-        for (int k = THREAD_START_X; k < Nt; k += BLOCK_INCR_X)
+        // (global-tw mode: the table is pre-filled by
+        // gb_sighet_fill_twiddle_kernel with the SAME expression; skip.)
+        for (int k = THREAD_START_X; (tw_global == nullptr) && k < Nt;
+             k += BLOCK_INCR_X)
             tw[k] = gcmplx::exp(I_c * (TWO_PI * (double) k / (double) Nt));
         // Xw[i] = centered/scaled X * window at j = j_base + i (zero
         // outside the valid j range or where the raw X is zero).
@@ -3175,6 +3304,46 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
         }
     }
 
+    // Shared budget: (Nt + N_sparse_fd + Nt_layer) * 16 B. The tw[Nt]
+    // twiddle table dominates and made this launch the HARD T_obs ceiling
+    // of the whole sig-het family (Nt = 16800 at the 23-month grid ->
+    // 287 KB, over EVERY device's opt-in limit; the old code then died as
+    // a bare post-launch GPUassert). tw depends only on (k, Nt) -- every
+    // block builds the identical table -- so when the full carve does not
+    // fit, it moves to GLOBAL memory: gb_sighet_fill_twiddle_kernel fills
+    // it once with the same per-k expression and every block reads it
+    // through L2 (~Nt*16 B, comfortably cached; the build runs once per
+    // block/re-anchor, not per candidate). Devices where the full carve
+    // FITS keep the historical all-shared launch, bit-for-bit.
+    //   (An earlier TODO here proposed host-side batched cuFFT as the
+    //   ceiling lift; the global-tw fallback achieves the capacity without
+    //   restructuring the transforms, and keeps the fold/iDFT summation
+    //   orders untouched. Decided BEFORE the transient allocations below so
+    //   an over-budget config throws without leaking device buffers.)
+    const size_t shared_full = ((size_t) Nt + (size_t) N_sparse_fd
+                                + (size_t) Nt_layer) * sizeof(cmplx);
+    const size_t shared_slim = ((size_t) N_sparse_fd
+                                + (size_t) Nt_layer) * sizeof(cmplx);
+    cmplx *d_tw = nullptr;
+    size_t shared_bytes = shared_full;
+    const bool tw_fits_shared = gb_sighet_try_request_shared(
+        gb_signal_het_make_reference_kernel, shared_full);
+    if (!tw_fits_shared)
+    {
+        gb_sighet_request_shared(
+            gb_signal_het_make_reference_kernel, shared_slim,
+            "gb_signal_het_make_reference",
+            "Even the slim carve (N_sparse_fd + Nt_layer complex doubles, "
+            "twiddle table already in global memory) does not fit; lower "
+            "SIGHET_N_SPARSE_FD and/or SIGHET_NT_LAYER.");
+        shared_bytes = shared_slim;
+        gpuErrchk(cudaMalloc(&d_tw, (size_t) Nt * sizeof(cmplx)));
+        gb_sighet_fill_twiddle_kernel<<<
+            (Nt + NUM_THREADS_HERE - 1) / NUM_THREADS_HERE,
+            NUM_THREADS_HERE>>>(d_tw, Nt);
+        gpuErrchk(cudaGetLastError());
+    }
+
     // (1) FD-heterodyne of the reference sources -- transient device buffers.
     cmplx  *d_X_het_raw;
     int    *d_k_f0;
@@ -3200,30 +3369,6 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
     gpuErrchk(cudaMemset(c0_sparse_out, 0, n_sparse_tot * sizeof(cmplx)));
     gpuErrchk(cudaMemset(c0_dense_out,  0, n_dense_tot  * sizeof(cmplx)));
 
-    // TODO(cuFFT, deferred 2026-08-02): this shared budget is the HARD
-    // T_obs ceiling of the whole sig-het family -- 145 KB at 4 yr on a
-    // 163 KB device, and it FAILS outright at 8 yr. The reference build
-    // runs once per block / re-anchor, so unlike the per-candidate scorer
-    // it can afford a global-memory round trip: a host-side batched cuFFT
-    // (NOT cuFFTDx, which would re-introduce the mathdx dependency that
-    // GBGPU_WITH_SHAREDMEM=OFF just removed from the default build) would
-    // lift the ceiling entirely and let N_t scale past 4 yr.
-    //   Measured context: the per-candidate hot path would NOT benefit --
-    //   chunked-het's cost is waveform EVALUATION (its evaluation count
-    //   grows with T_obs), not FFT, and the fused shared-memory pipeline
-    //   there is worth more than cuFFT's better transform throughput.
-    //   So: apply cuFFT to make_reference only, and only when a >4 yr
-    //   baseline is actually needed.
-    const int shared_bytes = (int) (((size_t) Nt + (size_t) N_sparse_fd
-                                     + (size_t) Nt_layer) * sizeof(cmplx));
-    if (shared_bytes > 48 * 1024)
-    {
-        cudaFuncSetAttribute(
-            gb_signal_het_make_reference_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            shared_bytes);
-    }
-
     const long n_blocks = (long) num_data * nchannels * Nf_active;
     const int  grid_x   = (int) ((n_blocks < 65535L) ? n_blocks : 65535L);
     gb_signal_het_make_reference_kernel<<<grid_x, NUM_THREADS_HERE,
@@ -3237,11 +3382,13 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
         ind_min_t, ind_min_f,
         dt,
         nchannels,
-        N_sparse_fd);
+        N_sparse_fd,
+        d_tw);
 
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 
+    if (d_tw != nullptr) gpuErrchk(cudaFree(d_tw));
     gpuErrchk(cudaFree(d_X_het_raw));
     gpuErrchk(cudaFree(d_k_f0));
     gpuErrchk(cudaFree(d_f0_grid));
@@ -6698,6 +6845,20 @@ void GBComputationGroup::gb_signal_het_fstat_get_ll_wrap(
         band_len, n_stages);
 
 #ifdef __CUDACC__
+    // Validate the shared budget BEFORE any device allocation: an oversized
+    // N_sparse_t surfaces as a Python ValueError naming the numbers (and the
+    // knob to turn), never as a mid-run ``GPUassert: invalid argument``.
+    // The budget scales ~ 48 * n_stages * N_sparse_t B on top of a fixed
+    // node/knot arena, so N_sparse_t (SIGHET_NT_LAYER) is the lever.
+    gb_sighet_request_shared(
+        gb_signal_het_fstat_get_ll_kernel, shared_bytes,
+        "gb_signal_het_fstat_get_ll",
+        "The budget grows ~ 48 * n_stages * N_sparse_t bytes (n_stages = 2 "
+        "at fstat_mode = 0, 4 at mode 1) plus the fixed node/knot arena; "
+        "lower SIGHET_NT_LAYER (N_sparse_t) or use fstat_mode = 0. The "
+        "Python driver's setup_fstat_references clamp reports the max "
+        "supported SIGHET_NT_LAYER for this device.");
+
     GBTDIonTheFly *gb_host = new GBTDIonTheFly(
         tdi_on_fly->orbits, tdi_on_fly->tdi_config,
         tdi_on_fly->T, tdi_on_fly->t_ref);
@@ -6720,14 +6881,7 @@ void GBComputationGroup::gb_signal_het_fstat_get_ll_wrap(
     gpuErrchk(cudaMemcpy(d_gb, gb_host, sizeof(GBTDIonTheFly),
                          cudaMemcpyHostToDevice));
 
-    if (shared_bytes > 48 * 1024)
-    {
-        cudaFuncSetAttribute(
-            gb_signal_het_fstat_get_ll_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int) shared_bytes);
-    }
-
+    // Opt-in already granted (checked) by gb_sighet_request_shared above.
     gb_signal_het_fstat_get_ll_kernel<<<num_bin, NUM_THREADS_HERE,
                                         shared_bytes>>>(
         d_gb, N_out, M_out,

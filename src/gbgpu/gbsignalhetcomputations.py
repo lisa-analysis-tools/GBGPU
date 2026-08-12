@@ -130,6 +130,120 @@ def _recommended_edge_cut(Nt, tukey_alpha, margin=8):
     return max(20, taper + int(margin))
 
 
+#: Bytes held back from the device shared-memory limit in the PYTHON budget
+#: checks below, covering the kernels' STATIC shared usage (cub reduce
+#: scratch, link tables -- ~100-200 B measured from source) that only the
+#: C++ side can query exactly (``cudaFuncGetAttributes``). The C++ wraps
+#: re-check with the exact static size before every launch, so this reserve
+#: only has to be conservative, not exact.
+_SIGHET_STATIC_SHARED_RESERVE = 2048
+
+
+def _al16(x):
+    """16-byte alignment helper -- mirror of ``GB_SIGHET_V5_AL``."""
+    return (int(x) + 15) & ~15
+
+
+def _sighet_fstat_shared_bytes(n_nodes, n_knots, nchannels, m_half,
+                               N_sparse_t, band_len, n_stages):
+    """EXACT mirror of ``gb_sighet_fstat_shared_bytes`` + the underlying
+    ``gb_sighet_v5_region_sizes`` (cutils/gb_tdi_on_the_fly.cu).
+
+    KEEP IN LOCKSTEP WITH THE C++ -- integer arithmetic only, region for
+    region (N_PARAMS_MAX = 20 there; cmplx = 16 B; the fstat carve is the v5
+    flat carve with region G re-sized for ``n_stages`` r_pix slabs plus the
+    shared mask rows). The C++ wrap re-validates with the same formula (plus
+    the exact static-shared size) before the launch, so a drift here cannot
+    corrupt a launch -- it can only mis-predict the setup-time clamp, and
+    ``tests/test_sighet_shared_budget.py`` pins this mirror to reference
+    values computed from the C++ source.
+    """
+    M = 2 * int(m_half) + 1
+    nwords = (int(N_sparse_t) + 63) // 64
+    n_fit = (int(n_nodes) if band_len > 0
+             else max(int(n_knots), int(n_nodes)))
+    szA = _al16(2 * 20 * 8)                                   # N_PARAMS_MAX
+    szB = _al16(n_nodes * 8)
+    szC = _al16(8 * nchannels * n_nodes * 8)
+    szBk = _al16(n_knots * 8)
+    szD = _al16(9 * n_fit * 8)
+    szE = _al16(2 * nchannels * n_nodes * 16 + 6 * n_nodes * 8
+                + n_nodes * 4 + n_nodes * 1)
+    szF = _al16(2 * nchannels * n_knots * 8)
+    szCI = 0 if band_len > 0 else _al16(6 * nchannels * n_knots * 8)
+    szG = _al16(n_stages * 2 * nchannels * N_sparse_t * 8
+                + nchannels * M * nwords * 8)
+    return szA + szB + szC + szBk + szD + szE + szF + szCI + szG
+
+
+def _resolve_nt_layer(nt_layer, Nf, Nt, Nt_active, dt, *, v3_n_nodes,
+                      v4_knots, v4_band, m_half, device_shared_limit):
+    """Resolve the ``nt_layer`` knob for ``for_band_engine``.
+
+    * explicit ``nt_layer > 0``: snapped to the nearest divisor of ``Nt``
+      (ties -> the larger, i.e. denser/more accurate, side) -- the
+      pre-existing behavior, unchanged. Never device-clamped: an explicit
+      accuracy prescription that cannot fit must FAIL LOUDLY downstream
+      (``_check_fstat_shared_for_device`` / the C++ wrap guards), not be
+      quietly degraded.
+    * ``nt_layer == -1``: AUTO. Derive from Tobs targeting a CONSTANT
+      sparse-time spacing (~35 h; env ``SIGHET_NT_AUTO_SPACING_H``) -- the
+      accuracy studies' constant-temporal-density finding: the 2/4-yr
+      accuracy "wall" was the coarse sparse TIME grid, and N_sparse_t ~ 510
+      at 2 yr (~34.5 h spacing) passes the full tiered battery, matching
+      the 23-month prescription (525 -> 32 h). Snapped to a divisor of Nt,
+      then CLAMPED to the largest divisor whose fstat-scorer shared budget
+      (production ``fstat_mode=0``) fits ``device_shared_limit`` (pass
+      ``None`` on CPU -- no clamp). The knob DEFAULT stays 64; auto is
+      opt-in via ``SIGHET_NT_LAYER=-1``.
+    """
+    nt_layer = int(nt_layer)
+    auto = nt_layer == -1
+    if auto:
+        spacing_h = float(os.environ.get("SIGHET_NT_AUTO_SPACING_H", "35.0"))
+        layer_dt = float(Nf) * float(dt)
+        stride_t = max(1, int(round(spacing_h * 3600.0 / layer_dt)))
+        nt_layer = max(2, int(Nt) // stride_t)
+        logger.info(
+            "sig-het nt_layer AUTO: target spacing %.1f h -> stride %d "
+            "layers -> nt_layer %d (Nt=%d, layer_dt=%.0f s).",
+            spacing_h, stride_t, nt_layer, Nt, layer_dt)
+    elif nt_layer <= 0:
+        raise ValueError(
+            f"sig-het nt_layer={nt_layer} invalid; pass a positive layer "
+            "count or -1 for AUTO.")
+    if Nt % nt_layer != 0:
+        divisors = [d for d in range(2, Nt + 1) if Nt % d == 0]
+        snapped = min(divisors, key=lambda d: (abs(d - nt_layer), -d))
+        logger.warning(
+            "sig-het nt_layer=%d does not divide Nt=%d; snapping to %d "
+            "(stride %d).", nt_layer, Nt, snapped, Nt // snapped)
+        nt_layer = snapped
+    if auto and device_shared_limit:
+        budget = int(device_shared_limit) - _SIGHET_STATIC_SHARED_RESERVE
+        _nn = int(v3_n_nodes) if int(v3_n_nodes) > 0 else 64
+        _band = 2 * int(v4_band)
+
+        def _fits(layer):
+            nsp = int(Nt_active) // (int(Nt) // layer)
+            return _sighet_fstat_shared_bytes(
+                _nn, int(v4_knots), 3, int(m_half), nsp, _band, 2) <= budget
+
+        if not _fits(nt_layer):
+            fitting = [d for d in range(2, nt_layer)
+                       if Nt % d == 0 and _fits(d)]
+            if not fitting:
+                raise ValueError(
+                    f"sig-het nt_layer AUTO: no divisor of Nt={Nt} fits "
+                    f"this device's {int(device_shared_limit)} B "
+                    "shared-memory limit for the fstat scorer.")
+            logger.warning(
+                "sig-het nt_layer AUTO: %d exceeds the device fstat shared "
+                "budget; clamped to %d.", nt_layer, fitting[-1])
+            nt_layer = fitting[-1]
+    return nt_layer
+
+
 class GBSignalHetComputations(FastLISAResponseParallelModule):
     """Signal-het GB likelihood. ``__init__`` builds the heterodyne reference ``c0``
     (from the backend) and the bin-fold coefficients (from lisatools); ``get_ll``
@@ -468,17 +582,25 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         # The polyphase fold identity requires nt_layer to DIVIDE Nt exactly
         # (Nt == nt_layer * stride); the C++ wraps now hard-error otherwise.
         # Production grids need not be power-of-two-friendly (mojito Nt=2160),
-        # so SNAP the requested value to the nearest divisor of Nt (ties ->
-        # the larger, i.e. denser/more accurate, side).
-        nt_layer = int(nt_layer)
-        if Nt % nt_layer != 0:
-            divisors = [d for d in range(2, Nt + 1) if Nt % d == 0]
-            snapped = min(divisors, key=lambda d: (abs(d - nt_layer), -d))
-            import logging
-            logging.getLogger(__name__).warning(
-                "sig-het nt_layer=%d does not divide Nt=%d; snapping to %d "
-                "(stride %d).", nt_layer, Nt, snapped, Nt // snapped)
-            nt_layer = snapped
+        # so the resolver SNAPS the requested value to the nearest divisor of
+        # Nt (ties -> the larger, denser side); -1 = AUTO (constant ~35 h
+        # sparse spacing, divisor-snapped, device-clamped). See
+        # _resolve_nt_layer.
+        limit = None
+        if getattr(self.backend, "uses_cupy", False):
+            try:
+                import cupy as _cp
+
+                attrs = _cp.cuda.Device().attributes
+                limit = (attrs.get("MaxSharedMemoryPerBlockOptin")
+                         or attrs.get("MaxSharedMemoryPerBlock"))
+            except Exception:
+                limit = None
+        nt_layer = _resolve_nt_layer(
+            int(nt_layer), Nf, Nt, Nt_active, dt,
+            v3_n_nodes=int(v3_n_nodes), v4_knots=int(v4_knots),
+            v4_band=int(v4_band), m_half=int(m_active_half_width),
+            device_shared_limit=limit)
         stride, N_sparse_t, n_sparse_local = sparse_time_grid(
             Nt, Nt_active, nt_layer)
         # window + sparse grid go straight into the kernels -> device-resident
@@ -839,6 +961,91 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             g["n_sparse_fd"] = n_fit
         return n_fit
 
+    def _device_shared_limit(self):
+        """CURRENT device's max opt-in shared memory per block (bytes), or
+        ``None`` on CPU / when the query is unavailable. Queried per call --
+        never cached on the instance -- because the comp may be scored under
+        different ``device_context``s (multi-GPU replicas)."""
+        if not getattr(self.backend, "uses_cupy", False):
+            return None
+        try:
+            import cupy as _cp
+
+            attrs = _cp.cuda.Device().attributes
+            limit = attrs.get("MaxSharedMemoryPerBlockOptin") or attrs.get(
+                "MaxSharedMemoryPerBlock"
+            )
+        except Exception:
+            return None
+        return int(limit) if limit else None
+
+    def _fstat_kernel_budget(self, fstat_mode):
+        """(shared_bytes, parts dict) for the fstat scorer at this comp's
+        resolved knobs -- the Python mirror of the C++ wrap's request."""
+        g = self._g
+        n_nodes = self._resolve_v3_nodes(None, None)
+        n_knots = int(g.get("v4_knots", 0))
+        band_len = 2 * int(g.get("v4_band", 0))
+        n_stages = 4 if int(fstat_mode) == 1 else 2
+        need = _sighet_fstat_shared_bytes(
+            n_nodes, n_knots, 3, int(g["m_half"]), int(g["N_sparse_t"]),
+            band_len, n_stages)
+        return need, dict(n_nodes=n_nodes, n_knots=n_knots,
+                          band_len=band_len, n_stages=n_stages)
+
+    def _check_fstat_shared_for_device(self, fstat_mode) -> None:
+        """FAIL AT SETUP TIME when the sig-het F-stat scorer's shared-memory
+        request cannot fit the current device -- with the max supported
+        ``SIGHET_NT_LAYER`` in the message -- instead of the bare mid-run
+        ``GPUassert: invalid argument`` the SIGHET_NT_LAYER=135 gate died
+        with (2026-08-12).
+
+        Unlike :meth:`_clamp_n_sparse_fd_for_device` this does NOT silently
+        coarsen: ``N_sparse_t`` is an ACCURACY prescription (the 2-yr
+        battery's ~510-point ruling), so degrading it quietly would
+        invalidate the run's error budget. The C++ wrap re-validates with
+        the exact static-shared size before every launch, so this check is
+        the friendly front door, not the only guard. No-op on CPU (heap).
+        """
+        limit = self._device_shared_limit()
+        if limit is None:
+            return
+        budget = int(limit) - _SIGHET_STATIC_SHARED_RESERVE
+        need, parts = self._fstat_kernel_budget(fstat_mode)
+        if need <= budget:
+            return
+        g = self._g
+        # Invert the budget for the largest N_sparse_t that fits, then map
+        # it to the largest divisor-of-Nt nt_layer at or under it (the knob
+        # is snapped to a divisor of Nt, and N_sparse_t = Nt_active // stride
+        # with stride = Nt // nt_layer).
+        Nt, Nt_active = int(g["Nt"]), int(g["Nt_active"])
+        max_nsp = 0
+        for n in range(int(g["N_sparse_t"]), 0, -1):
+            if _sighet_fstat_shared_bytes(
+                    parts["n_nodes"], parts["n_knots"], 3, int(g["m_half"]),
+                    n, parts["band_len"], parts["n_stages"]) <= budget:
+                max_nsp = n
+                break
+        best_layer = 0
+        for d in range(2, Nt + 1):
+            if Nt % d:
+                continue
+            if Nt_active // (Nt // d) <= max_nsp:
+                best_layer = d
+        raise ValueError(
+            f"sig-het F-stat scorer: N_sparse_t={g['N_sparse_t']} "
+            f"(nt_layer={g['nt_layer']}) needs {need} B of shared memory "
+            f"per block (n_stages={parts['n_stages']} at "
+            f"fstat_mode={int(fstat_mode)}, n_nodes={parts['n_nodes']}, "
+            f"n_knots={parts['n_knots']}, band_len={parts['band_len']}, "
+            f"m_half={g['m_half']}) against this device's {int(limit)} B "
+            f"opt-in limit (minus a {_SIGHET_STATIC_SHARED_RESERVE} B "
+            f"static-shared reserve). Max supported on this device: "
+            f"N_sparse_t={max_nsp}, i.e. SIGHET_NT_LAYER={best_layer} "
+            f"(largest divisor of Nt={Nt} that fits). Lower "
+            f"SIGHET_NT_LAYER, or use fstat_mode=0 if this was mode 1.")
+
     def setup_fstat_references(self, params_ref_phys, wdm_holder,
                                data_index=0, noise_index=None,
                                assert_max_df0=None) -> int:
@@ -891,6 +1098,12 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 "the sig-het F-stat path runs through the fixed-knot (v4/v5)"
                 " machinery; construct this comp with v4_knots > 0 "
                 "(for_band_engine(..., v4_knots=128, v4_band=16)).")
+        # SETUP-TIME device budget gate for the scorer this stash feeds
+        # (both modes: 0 is the production default, 1 the recombination
+        # self-check a run may flip on via GB_SIGHET_FSTAT_MODE) -- an
+        # actionable ValueError here beats a mid-sweep GPUassert.
+        self._check_fstat_shared_for_device(
+            int(os.environ.get("GB_SIGHET_FSTAT_MODE", "0")))
         refs = xp.array(xp.asarray(params_ref_phys), dtype=float,
                         copy=True).reshape(-1, 9)
         n = refs.shape[0]
@@ -1053,6 +1266,10 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
 
         mode = (int(os.environ.get("GB_SIGHET_FSTAT_MODE", "0"))
                 if fstat_mode is None else int(fstat_mode))
+        # Re-gate with the ACTUAL mode (mode 1 doubles the node-stage slabs;
+        # a caller-passed mode can differ from the env default checked at
+        # setup). Pure integer arithmetic -- negligible per-batch cost.
+        self._check_fstat_shared_for_device(mode)
         N_out = xp.zeros((num_bin, 4), dtype=xp.float64)
         M_out = xp.zeros((num_bin, 10), dtype=xp.float64)
         self.cpp.gb_signal_het_fstat_get_ll(
