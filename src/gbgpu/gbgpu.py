@@ -959,7 +959,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             data_splits = self.xp.full(num_data[0], _gpus_iter[0])
 
         if num_per_gpu is None:
-            assert len(_gpus_iter) == 1
+            # No batching cap: valid for ANY gpu count (the dispatch loop
+            # routes rows by data_splits); only the data_splits default
+            # above is inherently single-device.
             num_per_gpu = int(2**31 - 1)
             # make really high so just keeps (int32-safe: numpy 2 rejects
             # int32 arrays modulo a Python int beyond the int32 range)
@@ -1268,7 +1270,9 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
             data_splits = self.xp.full(num_data[0], _gpus_iter[0])
 
         if num_per_gpu is None:
-            assert len(_gpus_iter) == 1
+            # No batching cap: valid for ANY gpu count (the dispatch loop
+            # routes rows by data_splits); only the data_splits default
+            # above is inherently single-device.
             num_per_gpu = int(2**31 - 1)
             # make really high so just keeps (int32-safe: numpy 2 rejects
             # int32 arrays modulo a Python int beyond the int32 range)
