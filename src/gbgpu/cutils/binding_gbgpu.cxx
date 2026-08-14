@@ -1268,14 +1268,25 @@ void gbgpu_part(nb::module_ &m) {
 #endif
     .def(nb::init<>())
     .def("gb_fd_fill_global", &GBComputationGroupWrap::gb_fd_fill_global,
+         // GIL released for the wrap body: the routed band engines dispatch
+         // per-device shards on host threads (GB_ROUTER_THREADED), and
+         // holding the GIL here serializes every lane's kernel call. The
+         // body is Python-free after nanobind's argument conversion
+         // (nb::ndarray pointer extraction only) and allocates all device
+         // scratch per call -- no shared mutable state.
+         nb::call_guard<nb::gil_scoped_release>(),
          "FD analog of gb_wdm_fill_global: scatter per-source heterodyne FD onto a "
          "global rfft-grid template (cmplx, shape (num_data, nchannels, n_rfft)).")
     .def("gb_fd_get_ll", &GBComputationGroupWrap::gb_fd_get_ll,
+         // Same GIL release + safety argument as gb_fd_fill_global.
+         nb::call_guard<nb::gil_scoped_release>(),
          "FD analog of gb_wdm_get_ll: (d|h) and (h|h) per binary using the "
          "lisatools FD inner product (4 Re sum conj(d) h invC * df).  tdi_type "
          "selects between TDI_XYZ (cross-channel 3x3 invC) and TDI_AET/TDI_AE "
          "(diagonal invC).")
     .def("gb_fd_swap_ll", &GBComputationGroupWrap::gb_fd_swap_ll,
+         // Same GIL release + safety argument as gb_fd_fill_global.
+         nb::call_guard<nb::gil_scoped_release>(),
          "FD analog of gb_wdm_swap_ll: returns the five inner products "
          "<d|h_add>, <d|h_remove>, <h_add|h_add>, <h_remove|h_remove>, "
          "<h_add|h_remove> needed for an RJMCMC swap proposal.")
@@ -1289,19 +1300,33 @@ void gbgpu_part(nb::module_ &m) {
          "the per-binary derivatives of ll_diff = L(after swap) - L(before "
          "swap) with respect to theta_add and theta_remove respectively.")
     .def("gb_wdm_het_fill_global", &GBComputationGroupWrap::gb_wdm_het_fill_global,
+         // GIL released for the wrap body: the rj/in-model band engine fans
+         // per-device shards out on host threads, and holding the GIL here
+         // serialized every lane's kernel call (one device idled at ~5%
+         // while the other ran). Python-free after nanobind's argument
+         // conversion; the wdm_het_*_impl static device-struct caches that
+         // made concurrent calls unsafe were replaced by per-call
+         // upload+free in LAT's lat_chunked_het_kernels.hh.
+         nb::call_guard<nb::gil_scoped_release>(),
          "Chunked-heterodyne fill_global. Builds the WDM-domain GB template by "
          "iterating over precomputed chunks (chunk_t_starts / keep_lo / keep_hi / "
          "n_global_offset). Each block (chunk) walks all binaries so per-chunk "
          "PSD/data slabs are reused. grid_dim picks the launch grid (use "
          "chunked_het_grid_dim).")
     .def("gb_wdm_het_get_ll", &GBComputationGroupWrap::gb_wdm_het_get_ll,
+         // Same GIL release + safety argument as gb_wdm_het_fill_global.
+         nb::call_guard<nb::gil_scoped_release>(),
          "Chunked-heterodyne get_ll. Returns <d|h> and <h|h> per binary, "
          "matching gb_wdm_get_ll up to numerical precision.")
     .def("gb_wdm_het_swap_ll", &GBComputationGroupWrap::gb_wdm_het_swap_ll,
+         // Same GIL release + safety argument as gb_wdm_het_fill_global.
+         nb::call_guard<nb::gil_scoped_release>(),
          "Chunked-heterodyne swap_ll. Returns the same five inner products as "
          "gb_wdm_swap_ll: <d|h_add>, <d|h_remove>, <h_add|h_add>, "
          "<h_remove|h_remove>, <h_add|h_remove>.")
     .def("gb_wdm_het_get_fstat_ll", &GBComputationGroupWrap::gb_wdm_het_get_fstat_ll,
+         // Same GIL release + safety argument as gb_wdm_het_fill_global.
+         nb::call_guard<nb::gil_scoped_release>(),
          "Chunked-heterodyne F-stat. Returns per-binary N_arr (4,) = "
          "<d|A_i> and M_mat (10,) = <A_i|A_j> upper-triangle (4 basis "
          "filters per Cornish & Crowder '05). Python computes "
@@ -1319,10 +1344,20 @@ void gbgpu_part(nb::module_ &m) {
          "fold iterates only the N_sparse_fd nonzero bins. Stage 2b will fill "
          "X_het in-kernel from the source-class heterodyned sparse rfft.")
     .def("gb_signal_het_v3_get_ll", &GBComputationGroupWrap::gb_signal_het_v3_get_ll,
+         // GIL released for the wrap body: the sig-het in-model scorer runs
+         // one lane per GPU on host threads (per-lane comp replicas keep the
+         // reference stashes disjoint), and holding the GIL here serializes
+         // every lane's kernel call. Python-free after nanobind's argument
+         // conversion; all device scratch is allocated per call.
+         nb::call_guard<nb::gil_scoped_release>(),
          "Signal-het V3: ratio-spline candidate build straight into the bin-fold")
     .def("gb_signal_het_v4_get_ll", &GBComputationGroupWrap::gb_signal_het_v4_get_ll,
+         // Same GIL release + safety argument as gb_signal_het_v3_get_ll.
+         nb::call_guard<nb::gil_scoped_release>(),
          "Signal-het V3: ratio-spline candidate build straight into the bin-fold")
     .def("gb_signal_het_v5_get_ll", &GBComputationGroupWrap::gb_signal_het_v5_get_ll,
+         // Same GIL release + safety argument as gb_signal_het_v3_get_ll.
+         nb::call_guard<nb::gil_scoped_release>(),
          "Signal-het V5: v4-banded with the per-candidate fold scratch "
          "(r_sparse / dr_sparse) ELIMINATED rather than relocated. They are "
          "an M-fold replication of r_pix modulated by one candidate-"
@@ -1361,6 +1396,9 @@ void gbgpu_part(nb::module_ &m) {
          "gb_tdi_on_the_fly.cu for the dlnA-clamp and ratio-pole "
          "rationale.")
     .def("gb_signal_het_get_ll_in_kernel", &GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel,
+         // Same GIL release + safety argument as gb_signal_het_v3_get_ll
+         // (per-call transient buffers; tdi_wrap is only read).
+         nb::call_guard<nb::gil_scoped_release>(),
          "Stage 2b in-kernel sparse-FD signal-het get_ll. Fuses "
          "gb_run_fd_wave_tdi (sparse heterodyned rfft from the GB source "
          "class) with the polyphase + bin-fold pipeline. Takes a "
