@@ -1339,6 +1339,11 @@ void gbgpu_part(nb::module_ &m) {
          "achieved blocks/SM for the launch.")
     .def("gb_signal_het_fstat_get_ll",
          &GBComputationGroupWrap::gb_signal_het_fstat_get_ll,
+         // GIL released for the wrap body: the multi-device fstat fan-out
+         // runs one lane per GPU on host threads, and holding the GIL here
+         // serializes every lane's kernel call (the wrap touches no Python
+         // objects after nanobind's argument conversion).
+         nb::call_guard<nb::gil_scoped_release>(),
          "Signal-het F-stat: per-candidate N (num_bin, 4) = <d|A_i> and "
          "M_upper (num_bin, 10) = <A_i|A_j> row-major upper triangle for "
          "the 4 Cornish & Crowder basis filters (A=2, iota=pi/2, "
@@ -1378,6 +1383,10 @@ void gbgpu_part(nb::module_ &m) {
          "must be supplied by the caller (no default).")
     .def("gb_signal_het_make_reference",
          &GBComputationGroupWrap::gb_signal_het_make_reference,
+         // Same GIL release as the fstat scorer: each fan-out lane builds
+         // its own reference blocks, and concurrent per-device builds only
+         // parallelize if the wrap body runs without the GIL.
+         nb::call_guard<nb::gil_scoped_release>(),
          "Reference producer: run gb_run_fd_wave_tdi on the REFERENCE params + "
          "the same polyphase as get_ll over ALL Nf_active layers, emitting the "
          "complex WDM c0 at the sparse grid (c0_sparse_out) and full Nt "
