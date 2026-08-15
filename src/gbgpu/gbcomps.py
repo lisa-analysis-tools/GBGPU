@@ -15,6 +15,7 @@
 #   * GB-specific code     -> GBGPU
 #   * SOBBH-specific code  -> BBHx
 #   * Shared GB <-> SOBBH  -> LISAanalysistools (lisatools)
+import os
 from copy import deepcopy
 from typing import Optional
 
@@ -40,6 +41,11 @@ from lisatools.response.tdiconfig import TDIConfig
 from .parallelbase import GBGPUParallelModule as FastLISAResponseParallelModule
 
 from .wdm_het import USE_RECOMMENDED_TUKEY
+
+# Index-bound sanity asserts (debugging aids): each ``int(arr.max())`` is a
+# full device sync per engine call on CuPy. Default OFF in production;
+# opt back in with GB_INDEX_ASSERTS=1. Checked ONCE at import.
+_GB_INDEX_ASSERTS = os.environ.get("GB_INDEX_ASSERTS", "0") == "1"
 
 
 class GBWDMComputations(WDMComputationsBase):
@@ -404,8 +410,9 @@ class GBFDComputations(FastLISAResponseParallelModule):
             noise_index = self.xp.zeros(num_bin, dtype=self.xp.int32)
         else:
             noise_index = self.xp.asarray(noise_index).astype(self.xp.int32)
-        assert int(data_index.max()) < b.num_rows
-        assert int(noise_index.max()) < b.num_noise
+        if _GB_INDEX_ASSERTS:
+            assert int(data_index.max()) < b.num_rows
+            assert int(noise_index.max()) < b.num_noise
 
         self.backend.GBComputationGroupWrap().gb_fd_get_ll(
             d_h_out, h_h_out,
@@ -445,8 +452,9 @@ class GBFDComputations(FastLISAResponseParallelModule):
         else:
             noise_index = self.xp.asarray(noise_index).astype(self.xp.int32)
 
-        assert int(data_index.max()) < b.num_rows
-        assert int(noise_index.max()) < b.num_noise
+        if _GB_INDEX_ASSERTS:
+            assert int(data_index.max()) < b.num_rows
+            assert int(noise_index.max()) < b.num_noise
 
         self.backend.GBComputationGroupWrap().gb_fd_swap_ll(
             d_h_a, d_h_r, aa, rr, ar,
@@ -645,7 +653,8 @@ class GBFDComputations(FastLISAResponseParallelModule):
             factors = self.xp.ones(num_bin, dtype=float)
         else:
             factors = self.xp.asarray(factors, dtype=float)
-        assert int(data_index.max()) < num_templates
+        if _GB_INDEX_ASSERTS:
+            assert int(data_index.max()) < num_templates
 
         if template_start_inds is None:
             template_start_inds = default_starts
@@ -894,7 +903,8 @@ class GBFDComputations(FastLISAResponseParallelModule):
             noise_index = self.xp.zeros(num_bin, dtype=self.xp.int32)
         else:
             noise_index = self.xp.asarray(noise_index).astype(self.xp.int32)
-        assert int(noise_index.max()) < b.num_noise
+        if _GB_INDEX_ASSERTS:
+            assert int(noise_index.max()) < b.num_noise
 
         if batch_size is None or batch_size <= 0:
             batch_size = num_bin
