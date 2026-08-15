@@ -1345,25 +1345,90 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         xp = self.xp
         p = xp.asarray(xp.atleast_2d(params))
         if param_eps is None:
-            param_eps = self.chunked.default_param_eps(p.shape[1]) \
-                if hasattr(self.chunked, "default_param_eps") \
-                else xp.full(p.shape[1], 1e-7)
+            # The chunked delegate's GB-oriented per-parameter step table
+            # (amp ~1e-25, f0 ~2e-14 Hz, ...). The old probe looked for a
+            # ``default_param_eps`` attribute that does not exist, so it
+            # silently fell to a UNIFORM 1e-7 -- ~1e15x too large for amp,
+            # ~5e6x too large for f0: the "curvature" it measured was global
+            # likelihood structure, not the local peak.
+            if hasattr(self.chunked, "_info_matrix_param_eps"):
+                param_eps = self.chunked._info_matrix_param_eps(
+                    int(p.shape[1]), None)
+            elif hasattr(self.chunked, "_default_param_eps"):
+                param_eps = self.chunked._default_param_eps(int(p.shape[1]))
+            else:
+                raise RuntimeError(
+                    "SIGHET_INFOMAT: no per-parameter eps table on the "
+                    "chunked delegate and no explicit param_eps -- refusing "
+                    "to guess a uniform step (a wrong step silently builds "
+                    "wrong proposal covariances).")
         eps = xp.asarray(param_eps, dtype=xp.float64) * float(
             infomat_knob("SIGHET_INFOMAT_EPS_SCALE", 1.0))
 
-        di = xp.asarray(data_index)
+        di = xp.asarray(data_index).reshape(-1)
+        if int(di.shape[0]) != int(p.shape[0]):
+            raise ValueError(
+                f"SIGHET_INFOMAT: data_index has {int(di.shape[0])} rows but "
+                f"params has {int(p.shape[0])} -- the caller must pass one "
+                "buffer slot per source, sliced with the same rows as params "
+                "(a full-length slot array against a row subset misindexes "
+                "every source).")
+        # Fail FAST (before ~1e2 kernel launches per source) if any slot has
+        # no live reference in THIS comp's slot->ref map. This is the loud
+        # tripwire for slot-space mismatches: the map is keyed in the same
+        # slot space setup_in_model was fed (global buffer slots on a
+        # single-shard buffer, INTRA-shard rows when a multi-shard router
+        # partitioned them), so a caller passing ids from any other space --
+        # e.g. global slots reaching a per-device replica keyed intra-shard
+        # -- dies here instead of building covariances from the wrong
+        # sources' references. (Collisions that land on a valid-but-wrong
+        # reference cannot be detected at this layer; the router must
+        # partition consistently -- see route_information_matrix.)
+        slots_host = np.asarray(
+            di.get() if hasattr(di, "get") else di, dtype=int)
+        n_map = len(self._slot_to_ref)
+        bad = (slots_host < 0) | (slots_host >= n_map)
+        ok = ~bad
+        if ok.any():
+            bad[ok] = self._slot_to_ref[slots_host[ok]] < 0
+        if bad.any():
+            raise RuntimeError(
+                f"SIGHET_INFOMAT: {int(bad.sum())}/{len(slots_host)} "
+                "data_index slots have no in-model reference on this comp. "
+                "Either setup_in_model was not run for them, or the caller "
+                "passed slots in the wrong slot space (e.g. GLOBAL buffer "
+                "slots to a per-device replica whose map is keyed by "
+                "INTRA-shard rows).")
 
         def _call_ll(rows):
-            # Rows are the SAME sources repeated per corner, so the data_index
-            # tiles with them.
+            # Rows are whole per-corner blocks of the SAME n sources
+            # (information_matrix_from_ll aligns its batch boundaries to
+            # multiples of n), so the slot array tiles with them exactly.
+            if int(rows.shape[0]) % int(di.shape[0]) != 0:
+                raise RuntimeError(
+                    f"SIGHET_INFOMAT: batch of {int(rows.shape[0])} rows is "
+                    f"not a multiple of the {int(di.shape[0])}-source block "
+                    "-- the slot tiling would misalign sources and "
+                    "references (information_matrix_from_ll must align its "
+                    "batches to whole blocks).")
             reps = int(rows.shape[0] // di.shape[0])
             return self.get_ll_wdm(rows, wdm_holder,
                                    data_index=xp.tile(di, reps),
                                    noise_index=xp.tile(di, reps))
 
+        # psd_project=False: this matrix is in RAW physical units, where the
+        # per-parameter curvature scales span ~40 decades (amp ~ h_h/amp^2
+        # vs angles ~ h_h) -- regularize's RELATIVE eigen-floor
+        # (1e-10 * max_eig) would flatten every small-scale direction (f0,
+        # fdot) into the floor, destroying exactly the curvature the
+        # proposal needs. The chunked delegate returns unprojected too, and
+        # the caller (_compute_proposal_cholesky) handles indefiniteness
+        # itself with abs(evals) + a relative floor AFTER the Jacobian
+        # rescale into the (well-conditioned) sampling basis.
         G = information_matrix_from_ll(
             _call_ll, p, xp=xp, param_eps=eps, inds=inds,
             one_sided=bool(infomat_knob("SIGHET_INFOMAT_ONESIDED", False)),
+            psd_project=False,
         )
 
         if infomat_knob("SIGHET_INFOMAT_VALIDATE", False):
