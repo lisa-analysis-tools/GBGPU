@@ -559,6 +559,23 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         repeat proposal scores through the fused shared-memory kernel with
         zero H2D traffic.
         """
+        # The |r| clip is a v2-ONLY kernel argument: gb_signal_het_v3_get_ll
+        # and gb_signal_het_v4_get_ll (which v5 also routes through) take no
+        # max_r at all, so on those paths the clip is unconditionally OFF.
+        # That is the CORRECT setting -- and it is the default -- but a
+        # request for max_r > 0 on a v3/v4/v5 engine used to be accepted and
+        # then silently ignored, so a diagnostic sweep of the knob would have
+        # produced identical numbers at every value and read as "the clip
+        # does not matter". Refuse it instead.
+        if float(max_r) > 0.0 and (int(v3_n_nodes) or int(v4_knots)):
+            raise NotImplementedError(
+                f"max_r={float(max_r)} was requested, but the "
+                f"{'v4/v5' if int(v4_knots) else 'v3'} likelihood kernel "
+                "takes no heterodyne-ratio clip -- it would be silently "
+                "ignored. Use max_r=0 (the default, clip off), or run the v2 "
+                "path (v3_n_nodes=0, v4_knots=0) if you specifically need "
+                "the clip as a diagnostic."
+            )
         wdm = chunked_comp.wdm_settings
         self = cls.__new__(cls)
         # backend name is "gbgpu_<flavor>"; re-passing the plain flavor
