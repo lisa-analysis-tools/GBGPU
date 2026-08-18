@@ -657,6 +657,29 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                        n_cp_build=_resolve_n_cp(n_cp_build, Tobs),
                        v3_n_nodes=int(v3_n_nodes), v4_knots=int(v4_knots),
                        v4_band=int(v4_band), v5=int(v5))
+        # RESOLVED-CONFIG ECHO. Nothing else in the stack prints what the
+        # sig-het engine actually ended up with: the stock builder logs only
+        # "GB in-model likelihood: SIGNAL-HET", run_settings.log does not
+        # record these fields, and the values here are the END of a chain of
+        # env reads, dataclass defaults, divisor snapping and device clamps.
+        # So an accuracy A/B on any of these knobs had no way to confirm the
+        # knob took -- and the obvious proxy (kernel wall time) is useless at
+        # production batch sizes, which are 24-48 sources and therefore
+        # launch-bound, well under the ~256 where the node stage starts to
+        # show. Measured 2026-08-18: a 32-vs-128 node A/B moved
+        # ``inmodel_repeats`` by 2%, which is neither confirmation nor
+        # refutation. One INFO line at build removes that whole class of
+        # ambiguity; it fires once per engine.
+        logger.info(
+            "sig-het engine resolved: v3_n_nodes=%d v4_knots=%d v4_band=%d "
+            "v5=%d | nt_layer=%d (stride %d) N_sparse_t=%d n_sparse_fd=%d "
+            "n_cp_build=%d m_half=%d max_r=%g | Nf=%d Nt=%d Nt_active=%d "
+            "Tobs=%.6gs -> sparse spacing %.1f h",
+            int(v3_n_nodes), int(v4_knots), int(v4_band), int(v5),
+            int(nt_layer), int(stride), int(N_sparse_t), int(n_sparse_fd),
+            _resolve_n_cp(n_cp_build, Tobs), self.m_half, float(max_r),
+            Nf, Nt, Nt_active, Tobs, stride * Nf * dt / 3600.0,
+        )
         # Deltas are what the in-model repeats consume; keep the chunked
         # delegate's d_d convention so absolute ll values line up too.
         self.d_d = float(getattr(chunked_comp, "d_d", 0.0))
