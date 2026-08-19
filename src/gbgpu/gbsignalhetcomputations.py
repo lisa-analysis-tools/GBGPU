@@ -72,17 +72,36 @@ def _resolve_n_cp(n_cp_build, Tobs):
 
     ``n_cp_build`` semantics: 0 -> direct per-point evaluation (legacy
     path); > 1 -> explicit count; < 0 -> AUTO: one node per
-    ``SIGHET_N_CP_SPACING`` seconds of Tobs (default 4 days -- keeps the
-    cubic-spline phase error of the annual Doppler/response modulation
-    below ~1e-4 rad across the GB band), clamped to [32, 256]. The upper
-    clamp bounds the shared-memory arena (~253 B/node); the lower keeps
-    the fit far inside the chunked engine's validated density.
+    ``SIGHET_N_CP_SPACING`` seconds of Tobs, clamped to [32, 256]. The
+    upper clamp bounds the shared-memory arena (~253 B/node); the lower
+    keeps the fit far inside the chunked engine's validated density.
+
+    SPACING DEFAULT 0.35 days (2026-08-19; was 4 days). The 4-day law was
+    set by a PHASE criterion (~1e-4 rad spline error of the annual
+    Doppler/response modulation) -- sufficient for every per-channel
+    quantity, but NOT for the X+Y+Z null-combination coherence of the
+    reconstruction: the true GW template cancels in the null direction to
+    ~1e-10 of its power, while independent per-channel spline errors at
+    4-day spacing leave ~1e-5 there. Under the near-singular low-f XYZ
+    inverse covariance (null eigenvalue 54-7500x the differential ones)
+    that spurious null power inflated in-model <h|h> by up to ~27x at the
+    ANCHOR in the v4 production run (h_h-only corruption: d_h clean at
+    0.99-1.06 across all severity classes -- the residual lies in the
+    non-null subspace). Measured on the production 3-month grid
+    (gb_sighet_bfold_gpu_probe.py, 64 low-f edge-on-heavy sources):
+    null-direction excess 3e5x at 32 nodes -> 148x at 256; scored anchor
+    hh max |log ratio| 0.31 -> 1.5e-4; setup cost +2.6%. At 3 months AUTO
+    now resolves to the 256 ceiling. NOTE for Tobs >~ 6 months the ceiling
+    caps the density below this criterion again (23-month: 2.7-day
+    effective spacing) -- longer runs need the arena raised or the
+    B moments built from the exact task-b fill (see
+    project_signal_het_amp_phase_redesign).
     """
     if n_cp_build == 0:
         return 0
     if n_cp_build > 1:
         return int(n_cp_build)
-    spacing = float(os.environ.get("SIGHET_N_CP_SPACING", 4.0 * 86400.0))
+    spacing = float(os.environ.get("SIGHET_N_CP_SPACING", 0.35 * 86400.0))
     return int(np.clip(int(math.ceil(float(Tobs) / spacing)) + 1, 32, 256))
 
 
