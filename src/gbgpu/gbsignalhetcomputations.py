@@ -516,7 +516,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     @classmethod
     def for_band_engine(cls, chunked_comp, *, nt_layer=64, n_sparse_fd=1024,
                         m_active_half_width=2, max_r=0.0, n_cp_build=-1,
-                        v3_n_nodes=0, v4_knots=0, v4_band=0, v5=0):
+                        v3_n_nodes=0, v4_knots=0, v4_band=0, v5=0,
+                        tukey_alpha=None):
         """Build a data-less engine-mode instance around ``chunked_comp``.
 
         ``max_r=0`` disables the kernel's heterodyne-ratio magnitude clip.
@@ -629,9 +630,31 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
 
         # The chunked comp stores the raw ctor value (possibly the -1 AUTO
         # sentinel); the kernels consume the RESOLVED alpha.
-        tukey_alpha = float(getattr(
-            chunked_comp, "resolved_tukey_alpha",
-            getattr(chunked_comp, "tukey_alpha", 0.0)))
+        # TUKEY SEMANTICS (root-caused 2026-08-19, the flat ~1.6% h_h bias
+        # that showed as the production dissect's high-f 0.984 "deflation").
+        # The chunked delegate's resolved alpha is a PER-CHUNK stitching
+        # fraction, and its tapered chunk edges are DISCARDED via n_pad --
+        # net zero effect on the stitched template. THIS engine's kernels
+        # apply tukey_alpha as a fraction of the WHOLE OBSERVATION
+        # (make_reference / gb_run_fd_wave_tdi: "first/last alpha/2 fraction
+        # of the N sparse samples") and the tapered region is KEPT. The same
+        # number therefore means an 8x wider window here, and inheriting the
+        # delegate's 0.05 put a 54-layer taper against a 20-layer time crop
+        # -- 34 suppressed layers per side INSIDE the active region,
+        # violating the EC >= taper rule (see _recommended_edge_cut and the
+        # 2026-06-18 real-projection notes: "sig-het uses the SAME edge-cut
+        # as dense/chunked (EC >= taper)"). Measured: alpha 0.05 -> h_h
+        # deficit 1.02%; alpha <= 2*ind_min_t/Nt -> exact (1.0000).
+        #
+        # tukey_alpha=None keeps the legacy inheritance for byte-compat;
+        # pass it EXPLICITLY (pinned-alpha policy) -- and either way the
+        # EC >= taper guard below refuses the silent-bias configuration.
+        _explicit_tukey = tukey_alpha is not None
+        if tukey_alpha is None:
+            tukey_alpha = float(getattr(
+                chunked_comp, "resolved_tukey_alpha",
+                getattr(chunked_comp, "tukey_alpha", 0.0)))
+        tukey_alpha = float(tukey_alpha)
         if tukey_alpha < 0.0:
             tukey_alpha = 0.0
 
@@ -645,6 +668,29 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         self.tdi_wrap = gb_gen.wave_gen
         self._keep_alive = dict(gb_gen=gb_gen, orbits=orbits,
                                 tdi_config=tdi_config)
+
+        # EC >= taper guard (see the tukey-semantics note above). The taper
+        # must be SUBSUMED by the WDM time crop or it suppresses the
+        # reference inside the active region -- a silent flat h_h bias.
+        _taper_layers = math.ceil(0.5 * tukey_alpha * Nt)
+        if _taper_layers > ind_min_t:
+            _safe = 2.0 * ind_min_t / Nt
+            if _explicit_tukey:
+                raise ValueError(
+                    f"for_band_engine tukey_alpha={tukey_alpha} tapers "
+                    f"{_taper_layers} WDM layers per side but the time crop "
+                    f"is only ind_min_t={ind_min_t}: {_taper_layers - ind_min_t} "
+                    f"tapered layers per side sit INSIDE the active region "
+                    f"and suppress the reference (EC >= taper rule; measured "
+                    f"~1% h_h deficit at 0.05/crop 20). Use tukey_alpha <= "
+                    f"{_safe:.4f}.")
+            logger.warning(
+                "for_band_engine: inherited tukey_alpha=%.4f tapers %d "
+                "layers/side against a %d-layer crop -- CLAMPING to %.4f so "
+                "the taper is subsumed (EC >= taper). Pass tukey_alpha "
+                "explicitly to silence this.",
+                tukey_alpha, _taper_layers, ind_min_t, _safe)
+            tukey_alpha = _safe
 
         self._g = dict(Nf=Nf, Nt=Nt, Nf_active=Nf_active, Nt_active=Nt_active,
                        nt_layer=int(nt_layer), N_sparse_t=N_sparse_t,
