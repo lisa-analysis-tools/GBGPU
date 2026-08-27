@@ -47,6 +47,19 @@ from .wdm_het import USE_RECOMMENDED_TUKEY
 # opt back in with GB_INDEX_ASSERTS=1. Checked ONCE at import.
 _GB_INDEX_ASSERTS = os.environ.get("GB_INDEX_ASSERTS", "0") == "1"
 
+# Fused phase-max sign contract for the FD family (see the chunked-family
+# constants in lisatools.chunked_het and _QUAD_SIGN_SIGHET in
+# gbsignalhetcomputations for the full story). Normalize the raw kernel Im
+# outputs to EXACTLY "the same inner product at phi0 + pi/2". Pinned
+# EMPIRICALLY by tests/test_phase_max_fused.py; the swap cross term
+# <h_add|h_rem> holds the add template in the CONJUGATED slot, so its
+# phasor turns opposite to <d|h_add>'s -- hence its own constant.
+_QUAD_SIGN_FD = +1.0
+_QUAD_SIGN_FD_SWAP_ADD = +1.0
+# Pinned -1 by test_phase_max_fused (2026-08-27): the conjugated add slot
+# flips the phasor exactly as predicted.
+_QUAD_SIGN_FD_SWAP_CROSS = -1.0
+
 
 class GBWDMComputations(WDMComputationsBase):
     """Source-side WDM-domain GB likelihood (chunked-heterodyne path).
@@ -68,6 +81,9 @@ class GBWDMComputations(WDMComputationsBase):
     # GB chunked-het uses gbgpu_<flavor> backends (carry
     # GBComputationGroupWrap + the gb_wdm_het_* kernel family).
     _BACKEND_PREFIX = "gbgpu"
+    # GBGPU's gb_wdm_het_{get_ll, swap_ll} bindings carry the trailing fused
+    # phase-max quadrature arrays (see WDMComputationsBase._FUSED_QUAD_KERNELS).
+    _FUSED_QUAD_KERNELS = True
     _WRAP_ATTR = "GBComputationGroupWrap"
     _METHOD_PREFIX = "gb_wdm_het"
     _NPARAMS = 9
@@ -402,6 +418,7 @@ class GBFDComputations(FastLISAResponseParallelModule):
         num_bin = p.shape[0]
         d_h_out = self.xp.zeros(num_bin)
         h_h_out = self.xp.zeros(num_bin)
+        d_h_im = self.xp.zeros(num_bin)   # fused phase-max quadrature
         if data_index is None:
             data_index = self.xp.zeros(num_bin, dtype=self.xp.int32)
         else:
@@ -424,9 +441,11 @@ class GBFDComputations(FastLISAResponseParallelModule):
             self.nchannels,
             self.backend.TDITypeDict[self.tdi_type],
             self.tukey_alpha, self.edge_frac,
+            d_h_im,
         )
         self.d_h_out = d_h_out
         self.h_h_out = h_h_out
+        self.d_h_im_out = _QUAD_SIGN_FD * d_h_im
         return -0.5 * (self.d_d + h_h_out - 2.0 * d_h_out)
 
     def get_swap_ll_fd(self, params_add, params_remove, fd_holder,
@@ -442,6 +461,8 @@ class GBFDComputations(FastLISAResponseParallelModule):
         d_h_a = self.xp.zeros(num_bin); d_h_r = self.xp.zeros(num_bin)
         aa    = self.xp.zeros(num_bin); rr    = self.xp.zeros(num_bin)
         ar    = self.xp.zeros(num_bin)
+        d_h_a_im = self.xp.zeros(num_bin)   # fused phase-max quadratures
+        ar_im    = self.xp.zeros(num_bin)   #   (ADD-linear terms)
 
         if data_index is None:
             data_index = self.xp.zeros(num_bin, dtype=self.xp.int32)
@@ -466,7 +487,10 @@ class GBFDComputations(FastLISAResponseParallelModule):
             self.nchannels,
             self.backend.TDITypeDict[self.tdi_type],
             self.tukey_alpha, self.edge_frac,
+            d_h_a_im, ar_im,
         )
+        self.d_h_add_im_out = _QUAD_SIGN_FD_SWAP_ADD * d_h_a_im
+        self.add_remove_im_out = _QUAD_SIGN_FD_SWAP_CROSS * ar_im
         like_add = -0.5 * (self.d_d + aa - 2.0 * d_h_a)
         like_rem = -0.5 * (self.d_d + rr - 2.0 * d_h_r)
         return like_add, like_rem, d_h_a, d_h_r, aa, rr, ar

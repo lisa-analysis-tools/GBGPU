@@ -116,7 +116,8 @@ void GBComputationGroupWrap::gb_fd_get_ll(
     array_type<double> params_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
     int num_bin, int nparams, double T, double t_start, double t_ref,
-    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac)
+    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac,
+    array_type<double> d_h_im_out)
 {
     gb_fd_get_ll_wrap(
         return_pointer_and_check_length(d_h_out, "d_h_out", num_bin, 1),
@@ -125,7 +126,11 @@ void GBComputationGroupWrap::gb_fd_get_ll(
         return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
-        num_bin, nparams, T, t_start, t_ref, N_sparse, nchannels, tdi_type, tukey_alpha, edge_frac);
+        num_bin, nparams, T, t_start, t_ref, N_sparse, nchannels, tdi_type, tukey_alpha, edge_frac,
+        (d_h_im_out.size() > 0
+             ? return_pointer_and_check_length(d_h_im_out, "d_h_im_out",
+                                               num_bin, 1)
+             : nullptr));
 }
 
 void GBComputationGroupWrap::gb_fd_swap_ll(
@@ -137,7 +142,8 @@ void GBComputationGroupWrap::gb_fd_swap_ll(
     array_type<double> params_add_all, array_type<double> params_remove_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
     int num_bin, int nparams, double T, double t_start, double t_ref,
-    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac)
+    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac,
+    array_type<double> d_h_add_im_out, array_type<double> add_remove_im_out)
 {
     gb_fd_swap_ll_wrap(
         return_pointer_and_check_length(d_h_add_out, "d_h_add_out", num_bin, 1),
@@ -150,7 +156,15 @@ void GBComputationGroupWrap::gb_fd_swap_ll(
         return_pointer_and_check_length(params_remove_all, "params_remove_all", nparams, num_bin),
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
-        num_bin, nparams, T, t_start, t_ref, N_sparse, nchannels, tdi_type, tukey_alpha, edge_frac);
+        num_bin, nparams, T, t_start, t_ref, N_sparse, nchannels, tdi_type, tukey_alpha, edge_frac,
+        (d_h_add_im_out.size() > 0
+             ? return_pointer_and_check_length(d_h_add_im_out,
+                                               "d_h_add_im_out", num_bin, 1)
+             : nullptr),
+        (add_remove_im_out.size() > 0
+             ? return_pointer_and_check_length(add_remove_im_out,
+                                               "add_remove_im_out", num_bin, 1)
+             : nullptr));
 }
 
 void GBComputationGroupWrap::gb_fd_get_ll_grad(
@@ -295,7 +309,8 @@ void GBComputationGroupWrap::gb_wdm_het_get_ll(
     array_type<int> binary_perm, array_type<int> group_starts, array_type<int> group_ends,
     array_type<int> group_m_lo, array_type<int> group_m_hi, int n_groups,
     int m_band_half_width,
-    int Nf_slab, array_type<int> slab_min_f)   // task-b per-band slab (0/empty = off)
+    int Nf_slab, array_type<int> slab_min_f,   // task-b per-band slab (0/empty = off)
+    array_type<double> d_h_im_out)             // fused phase-max quadrature (empty = off)
 {
     const int gn = (n_groups > 0) ? n_groups : 1;
     // Task-b: per-band slab covers Nf_slab layers (full Nf_active when Nf_slab<=0).
@@ -346,7 +361,11 @@ void GBComputationGroupWrap::gb_wdm_het_get_ll(
         n_groups, m_band_half_width,
         Nf_slab,
         (slab_min_f.size() > 0
-             ? return_pointer(slab_min_f, "slab_min_f") : nullptr));
+             ? return_pointer(slab_min_f, "slab_min_f") : nullptr),
+        (d_h_im_out.size() > 0
+             ? return_pointer_and_check_length(d_h_im_out, "d_h_im_out",
+                                               num_bin, 1)
+             : nullptr));
 }
 
 void GBComputationGroupWrap::gb_wdm_het_swap_ll(
@@ -372,7 +391,9 @@ void GBComputationGroupWrap::gb_wdm_het_swap_ll(
     array_type<int> group_m_lo, array_type<int> group_m_hi, int n_groups,
     array_type<int> pair_m_lo_b, array_type<int> pair_m_hi_b,
     int m_band_half_width,
-    int Nf_slab, array_type<int> slab_min_f)   // task-b per-band slab (0/empty = off)
+    int Nf_slab, array_type<int> slab_min_f,   // task-b per-band slab (0/empty = off)
+    array_type<double> d_h_add_im_out,         // fused phase-max quadratures
+    array_type<double> add_remove_im_out)      //   (ADD-linear; empty = off)
 {
     const int gn = (n_groups > 0) ? n_groups : 1;
     // Task-b: per-band slab covers Nf_slab layers (full Nf_active when Nf_slab<=0).
@@ -430,7 +451,15 @@ void GBComputationGroupWrap::gb_wdm_het_swap_ll(
         m_band_half_width,
         Nf_slab,
         (slab_min_f.size() > 0
-             ? return_pointer(slab_min_f, "slab_min_f") : nullptr));
+             ? return_pointer(slab_min_f, "slab_min_f") : nullptr),
+        (d_h_add_im_out.size() > 0
+             ? return_pointer_and_check_length(d_h_add_im_out,
+                                               "d_h_add_im_out", num_bin, 1)
+             : nullptr),
+        (add_remove_im_out.size() > 0
+             ? return_pointer_and_check_length(add_remove_im_out,
+                                               "add_remove_im_out", num_bin, 1)
+             : nullptr));
 }
 
 void GBComputationGroupWrap::gb_wdm_het_get_fstat_ll(
@@ -666,7 +695,7 @@ void GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel(
     double T_obs, double t_start,
     int nchannels, int tdi_type,
     int N_sparse_fd, double tukey_alpha, double max_r, int project_real,
-    int n_cp_sig)
+    int n_cp_sig, array_type<double> d_h_im_out)
 {
     (void) Nt_layer;
     const size_t b_xyz  = (size_t) num_data * nchannels * nchannels
@@ -712,7 +741,9 @@ void GBComputationGroupWrap::gb_signal_het_get_ll_in_kernel(
         layer_df, dt,
         T_obs, t_start,
         nchannels, tdi_type,
-        N_sparse_fd, tukey_alpha, max_r, project_real, n_cp_sig);
+        N_sparse_fd, tukey_alpha, max_r, project_real, n_cp_sig,
+        return_pointer_and_check_length(d_h_im_out, "d_h_im_out",
+                                        num_bin, 1));
 }
 
 void GBComputationGroupWrap::gb_signal_het_v3_get_ll(
@@ -737,7 +768,8 @@ void GBComputationGroupWrap::gb_signal_het_v3_get_ll(
     int m_active_half_width,
     double layer_df, double dt,
     double T_obs, double t_start,
-    int nchannels, int tdi_type, int project_real)
+    int nchannels, int tdi_type, int project_real,
+    array_type<double> d_h_im_out)
 {
     const size_t b_xyz  = (size_t) num_data * nchannels * nchannels
                         * Nf_active * N_sparse_t;
@@ -780,7 +812,9 @@ void GBComputationGroupWrap::gb_signal_het_v3_get_ll(
         m_active_half_width,
         layer_df, dt,
         T_obs, t_start,
-        nchannels, tdi_type, project_real);
+        nchannels, tdi_type, project_real,
+        return_pointer_and_check_length(d_h_im_out, "d_h_im_out",
+                                        num_bin, 1));
 }
 
 void GBComputationGroupWrap::gb_signal_het_v4_get_ll(
@@ -806,7 +840,8 @@ void GBComputationGroupWrap::gb_signal_het_v4_get_ll(
     int m_active_half_width,
     double layer_df, double dt,
     double T_obs, double t_start,
-    int nchannels, int tdi_type, int project_real)
+    int nchannels, int tdi_type, int project_real,
+    array_type<double> d_h_im_out)
 {
     const size_t b_xyz  = (size_t) num_data * nchannels * nchannels
                         * Nf_active * N_sparse_t;
@@ -850,7 +885,9 @@ void GBComputationGroupWrap::gb_signal_het_v4_get_ll(
         m_active_half_width,
         layer_df, dt,
         T_obs, t_start,
-        nchannels, tdi_type, project_real);
+        nchannels, tdi_type, project_real,
+        return_pointer_and_check_length(d_h_im_out, "d_h_im_out",
+                                        num_bin, 1));
 }
 
 // ---- signal-het V5: the v4 body with c0_sparse_all -> c0_mask_all (the
@@ -879,7 +916,7 @@ void GBComputationGroupWrap::gb_signal_het_v5_get_ll(
     double layer_df, double dt,
     double T_obs, double t_start,
     int nchannels, int tdi_type, int project_real,
-    int v5_mode)
+    int v5_mode, array_type<double> d_h_im_out)
 {
     const size_t b_xyz  = (size_t) num_data * nchannels * nchannels
                         * Nf_active * N_sparse_t;
@@ -928,7 +965,9 @@ void GBComputationGroupWrap::gb_signal_het_v5_get_ll(
         layer_df, dt,
         T_obs, t_start,
         nchannels, tdi_type, project_real,
-        v5_mode);
+        v5_mode,
+        return_pointer_and_check_length(d_h_im_out, "d_h_im_out",
+                                        num_bin, 1));
 }
 
 // ---- signal-het F-STAT: (N, M) for the 4 basis filters against shared

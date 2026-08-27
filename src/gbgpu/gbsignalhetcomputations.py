@@ -157,6 +157,17 @@ def _recommended_edge_cut(Nt, tukey_alpha, margin=8):
 #: only has to be conservative, not exact.
 _SIGHET_STATIC_SHARED_RESERVE = 2048
 
+#: Fused phase-max sign contract. The scorers accumulate a complex sum whose
+#: real part is 2<d|h>; a physical phi0 shift is a unit phasor on every
+#: candidate-linear term, so Im of that sum is +/- the SAME inner product at
+#: phi0 + pi/2. This constant normalizes the raw kernel Im to EXACTLY
+#: "d_h at phi0 + pi/2" (one constant for the whole family: v2/v3/v4/v5 all
+#: build the same heterodyne ratio r, validated against each other, so they
+#: share the phasor direction). Pinned EMPIRICALLY by the signed stash-parity
+#: asserts in tests/test_phase_max_fused.py -- |D| is sign-blind, so never
+#: "derive" this analytically; flip it only if that test says so.
+_QUAD_SIGN_SIGHET = +1.0
+
 
 def _al16(x):
     """16-byte alignment helper -- mirror of ``GB_SIGHET_V5_AL``."""
@@ -1559,6 +1570,10 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 noise_index=noise_index, **kwargs)
             self.d_h_out = self.chunked.d_h_out
             self.h_h_out = self.chunked.h_h_out
+            # Fused quadrature (comp-normalized by the delegate; None on
+            # backends without the fused output, e.g. JAX -> the engine
+            # mixin falls back to the two-call path).
+            self.d_h_im_out = getattr(self.chunked, "d_h_im_out", None)
             return ll
         # Slot -> reference lookup stays ON DEVICE. The old path did
         # ``data_index.get()`` (a full D2H of the slot array, forcing a sync),
@@ -1585,6 +1600,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 "reference; setup_in_model was not run for it.")
         self.d_h_out = self.last_d_h
         self.h_h_out = self.last_h_h
+        self.d_h_im_out = self.last_d_h_im
         return ll
 
     def get_ll(self, params, data_index=None, phase_maximize=False):
@@ -1601,21 +1617,18 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         """
         xp = self.xp
         if phase_maximize:
+            # FUSED: the quadrature d_h(phi0 + pi/2) rides out of the SAME
+            # kernel call as Im of the complex accumulator (last_d_h_im),
+            # so one call replaces the old second evaluation at the shifted
+            # phase. h_h needs nothing: it comes from the same call.
             ll_0 = self.get_ll(params, data_index=data_index)
-            d_h_0, h_h = self.last_d_h.copy(), self.last_h_h.copy()
-            # FORCED copy: the quadrature shift must not mutate the
-            # caller's params through an ascontiguousarray view.
-            x_q = xp.atleast_2d(xp.array(xp.asarray(params), dtype=float,
-                                         copy=True))
-            x_q[:, 4] = x_q[:, 4] + np.pi / 2
-            self.get_ll(x_q, data_index=data_index)
-            d_h_90 = self.last_d_h.copy()
+            d_h_0 = self.last_d_h
+            d_h_90 = self.last_d_h_im     # comp-normalized, see _QUAD_SIGN
             D = d_h_0 + 1j * d_h_90
             d_h_max = xp.abs(D)
             self.non_marg_d_h = d_h_0
             self.phase_angle = xp.arctan2(D.imag, D.real)
             self.last_d_h = d_h_max
-            self.last_h_h = h_h
             return ll_0 + (d_h_max - d_h_0)
         self.phase_angle = None
         # Arrays live on the run's device (cupy on CUDA): candidate params
@@ -1628,6 +1641,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
               else xp.ascontiguousarray(xp.asarray(data_index, dtype=xp.int32)))
         d_h = xp.zeros(N, dtype=xp.float64)
         h_h = xp.zeros(N, dtype=xp.float64)
+        d_h_im = xp.zeros(N, dtype=xp.float64)   # fused quadrature output
         num_data = int(self.params_ref_all.shape[0])
         g = self._g
         if g.get("v4_knots", 0) and self._v4_band_arrays is None:
@@ -1687,9 +1701,10 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 g["ind_min_t"], g["ind_min_f"], g["m_half"],
                 g["layer_df"], g["dt"], g["Tobs"], g["t0"],
                 3, 0, 1,                      # XYZ, project_real=1
-                _v5_mode)
+                _v5_mode, d_h_im)
             self.last_d_h = d_h.copy()
             self.last_h_h = h_h.copy()
+            self.last_d_h_im = _QUAD_SIGN_SIGHET * d_h_im
             return -0.5 * self.d_d + d_h - 0.5 * h_h
         if g.get("v4_knots", 0):
             # V4: fixed-knot ratio evaluation. Same node-eval + log-polar
@@ -1716,9 +1731,11 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 g["nt_layer"], g["N_sparse_t"], g["stride"],
                 g["ind_min_t"], g["ind_min_f"], g["m_half"],
                 g["layer_df"], g["dt"], g["Tobs"], g["t0"],
-                3, 0, 1)                      # XYZ, project_real=1
+                3, 0, 1,                      # XYZ, project_real=1
+                d_h_im)
             self.last_d_h = d_h.copy()
             self.last_h_h = h_h.copy()
+            self.last_d_h_im = _QUAD_SIGN_SIGHET * d_h_im
             return -0.5 * self.d_d + d_h - 0.5 * h_h
         if g.get("v3_n_nodes", 0):
             # V3: ratio-spline candidate build straight into the bin-fold
@@ -1736,9 +1753,11 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 g["nt_layer"], g["N_sparse_t"], g["stride"],
                 g["ind_min_t"], g["ind_min_f"], g["m_half"],
                 g["layer_df"], g["dt"], g["Tobs"], g["t0"],
-                3, 0, 1)                      # XYZ, project_real=1
+                3, 0, 1,                      # XYZ, project_real=1
+                d_h_im)
             self.last_d_h = d_h.copy()
             self.last_h_h = h_h.copy()
+            self.last_d_h_im = _QUAD_SIGN_SIGHET * d_h_im
             return -0.5 * self.d_d + d_h - 0.5 * h_h
         self.cpp.gb_signal_het_get_ll_in_kernel(
             self.tdi_wrap, d_h, h_h, self.c0_sparse_all,
@@ -1753,7 +1772,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             g["layer_df"], g["dt"], g["Tobs"], g["t0"],
             3, 0, g["n_sparse_fd"],
             g["tukey_alpha"], g["max_r"], 1,     # project_real=1
-            g["n_cp_build"])
+            g["n_cp_build"], d_h_im)
         self.last_d_h = d_h.copy()
         self.last_h_h = h_h.copy()
+        self.last_d_h_im = _QUAD_SIGN_SIGHET * d_h_im
         return -0.5 * self.d_d + d_h - 0.5 * h_h

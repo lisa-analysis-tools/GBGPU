@@ -632,7 +632,9 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<int> data_index_all, array_type<int> noise_index_all,
         int num_bin, int nparams, double T, double t_start, double t_ref,
         int N_sparse, int nchannels, int tdi_type, double tukey_alpha,
-        double edge_frac);
+        double edge_frac,
+        // fused phase-max quadrature <d|h>(phi0+pi/2) (empty = off)
+        array_type<double> d_h_im_out);
 
     void gb_fd_swap_ll(
         array_type<double> d_h_add_out, array_type<double> d_h_remove_out,
@@ -644,7 +646,10 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<int> data_index_all, array_type<int> noise_index_all,
         int num_bin, int nparams, double T, double t_start, double t_ref,
         int N_sparse, int nchannels, int tdi_type, double tukey_alpha,
-        double edge_frac);
+        double edge_frac,
+        // fused phase-max quadratures (ADD-linear terms; empty = off)
+        array_type<double> d_h_add_im_out,
+        array_type<double> add_remove_im_out);
 
     // Chain-rule parameter gradients of gb_fd_get_ll / gb_fd_swap_ll.
     // param_eps[k] is the per-parameter central-FD step (length nparams);
@@ -716,7 +721,9 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<int> group_m_lo, array_type<int> group_m_hi, int n_groups,
         int m_band_half_width,
         // task-b per-band slab (chunked_het.py always passes: 0 + empty = off).
-        int Nf_slab, array_type<int> slab_min_f);
+        int Nf_slab, array_type<int> slab_min_f,
+        // fused phase-max quadrature <d|h>(phi0+pi/2) (empty = off).
+        array_type<double> d_h_im_out);
 
     void gb_wdm_het_swap_ll(
         array_type<double> d_h_add_out, array_type<double> d_h_remove_out,
@@ -742,7 +749,10 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<int> pair_m_lo_b, array_type<int> pair_m_hi_b,
         int m_band_half_width,
         // task-b per-band slab (chunked_het.py always passes: 0 + empty = off).
-        int Nf_slab, array_type<int> slab_min_f);
+        int Nf_slab, array_type<int> slab_min_f,
+        // fused phase-max quadratures (ADD-linear terms; empty = off).
+        array_type<double> d_h_add_im_out,
+        array_type<double> add_remove_im_out);
 
     void gb_wdm_het_get_fstat_ll(
         array_type<double> N_arr_re_out, array_type<double> N_arr_im_out,
@@ -851,7 +861,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         double T_obs, double t_start,
         int nchannels, int tdi_type,
         int N_sparse_fd, double tukey_alpha, double max_r, int project_real,
-        int n_cp_sig);
+        int n_cp_sig, array_type<double> d_h_im_out);
 
     // Signal-het V3 -- ratio-spline candidate build: raw TDI at n_nodes for
     // candidate + reference, cubic ratio splines, r straight into the v2
@@ -879,7 +889,8 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         int m_active_half_width,
         double layer_df, double dt,
         double T_obs, double t_start,
-        int nchannels, int tdi_type, int project_real);
+        int nchannels, int tdi_type, int project_real,
+        array_type<double> d_h_im_out);
 
     void gb_signal_het_v4_get_ll(
         GBTDIonTheFlyWrap *tdi_wrap,
@@ -904,7 +915,8 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         int m_active_half_width,
         double layer_df, double dt,
         double T_obs, double t_start,
-        int nchannels, int tdi_type, int project_real);
+        int nchannels, int tdi_type, int project_real,
+        array_type<double> d_h_im_out);
 
     // Signal-het V5 -- v4-banded with the per-candidate fold scratch
     // eliminated. Same argument shape as v4 with ``c0_sparse_all`` replaced
@@ -936,7 +948,7 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         double layer_df, double dt,
         double T_obs, double t_start,
         int nchannels, int tdi_type, int project_real,
-        int v5_mode);
+        int v5_mode, array_type<double> d_h_im_out);
 
     // Signal-het F-STAT: per-candidate (N (num_bin, 4), M_upper
     // (num_bin, 10)) for the 4 Cornish & Crowder basis filters against

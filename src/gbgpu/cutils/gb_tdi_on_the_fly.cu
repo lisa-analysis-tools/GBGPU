@@ -945,12 +945,17 @@ inline void gbfd_accumulate_ll(double *d_h_acc, double *h_h_acc,
                                cmplx *tdi_chan, int N_sparse, int nchannels,
                                FDDomain *fd, int kf0,
                                int data_index, int noise_index, int tdi_type,
-                               double tau_d_h, double tau_h_h)
+                               double tau_d_h, double tau_h_h,
+                               double *d_h_im_acc = nullptr,
+                               double tau_d_h_im = 0.0)
 {
     // tau_*: previous accumulator values to add into (so caller can pre-zero
     // its registers and pass them in).  We simply accumulate per (c1,c2).
+    // d_h_im_acc (optional): Im of the same conj(d)*h products -- the fused
+    // phase-max quadrature (a phi0 shift is a unit phasor on h).
     double dh = tau_d_h;
     double hh = tau_h_h;
+    double dh_im = tau_d_h_im;
 
     const int N = N_sparse;
     const int C = nchannels;
@@ -975,6 +980,7 @@ inline void gbfd_accumulate_ll(double *d_h_acc, double *h_h_acc,
                         gcmplx::conj(tdi_chan[c1 * N + m]) * h_c2;
                     dh += prod_dh.real() * invc;
                     hh += prod_hh.real() * invc;
+                    dh_im += prod_dh.imag() * invc;
                 }
             }
         }
@@ -998,12 +1004,14 @@ inline void gbfd_accumulate_ll(double *d_h_acc, double *h_h_acc,
                                + h_c.imag() * h_c.imag();
                 dh += prod_dh.real() * invc;
                 hh += mag_h2 * invc;
+                dh_im += prod_dh.imag() * invc;
             }
         }
     }
 
     *d_h_acc = dh;
     *h_h_acc = hh;
+    if (d_h_im_acc) *d_h_im_acc = dh_im;
 }
 
 #ifdef __CUDACC__
@@ -1013,7 +1021,8 @@ void gb_fd_get_ll_kernel(double *d_h_out, double *h_h_out,
     double *params, int *data_index_all, int *noise_index_all,
     double t_start, double Tobs,
     int N, int num_bin, int n_params, int nchannels, int log2N, int tdi_type,
-    double tukey_alpha, double edge_frac)
+    double tukey_alpha, double edge_frac,
+    double *d_h_im_out)
 {
     extern CUDA_SHARED char shared_mem[];
     CUDA_SHARED double d_h_tmp[NUM_THREADS_HERE];
@@ -1039,11 +1048,11 @@ void gb_fd_get_ll_kernel(double *d_h_out, double *h_h_out,
                               N, nchannels, n_params, bin_i, log2N,
                               &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, edge_frac);
 
-        double dh_local = 0.0, hh_local = 0.0;
+        double dh_local = 0.0, hh_local = 0.0, dh_im_local = 0.0;
         gbfd_accumulate_ll(&dh_local, &hh_local, tdi_chan, N, nchannels,
                            fd, kf0,
                            data_index_all[bin_i], noise_index_all[bin_i],
-                           tdi_type, 0.0, 0.0);
+                           tdi_type, 0.0, 0.0, &dh_im_local, 0.0);
 
         int tid = threadIdx.x;
         d_h_tmp[tid] = dh_local;
@@ -1052,10 +1061,20 @@ void gb_fd_get_ll_kernel(double *d_h_out, double *h_h_out,
 
         double dh_sum = block_reduce(d_h_tmp);
         double hh_sum = block_reduce(h_h_tmp);
+        // Quadrature reduce re-stages d_h_tmp (zero extra shared; see the
+        // sig-het in-kernel kernel for the barrier argument).
+        double dh_im_sum = 0.0;
+        if (d_h_im_out != nullptr)
+        {
+            d_h_tmp[tid] = dh_im_local;
+            dh_im_sum = block_reduce(d_h_tmp);
+        }
         if (THREAD_ZERO)
         {
             d_h_out[bin_i] = 4.0 * fd->df * dh_sum;
             h_h_out[bin_i] = 4.0 * fd->df * hh_sum;
+            if (d_h_im_out != nullptr)
+                d_h_im_out[bin_i] = 4.0 * fd->df * dh_im_sum;
         }
         CUDA_SYNC_THREADS;
     }
@@ -1066,7 +1085,8 @@ void GBComputationGroup::gb_fd_get_ll_wrap(double *d_h_out, double *h_h_out,
     Orbits* orbits, TDIConfig *tdi_config, FDDomain *fd,
     double *params_all, int *data_index_all, int *noise_index_all,
     int num_bin, int nparams, double T, double t_start, double t_ref,
-    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac)
+    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac,
+    double *d_h_im_out)
 {
     int log2N = 0;
     {
@@ -1106,7 +1126,7 @@ void GBComputationGroup::gb_fd_get_ll_wrap(double *d_h_out, double *h_h_out,
         d_h_out, h_h_out, d_gb, d_fd,
         params_all, data_index_all, noise_index_all,
         t_start, T, N_sparse, num_bin, nparams, nchannels, log2N, tdi_type,
-        tukey_alpha, edge_frac);
+        tukey_alpha, edge_frac, d_h_im_out);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
     cudaFree(d_orbits);
@@ -1129,12 +1149,13 @@ void GBComputationGroup::gb_fd_get_ll_wrap(double *d_h_out, double *h_h_out,
                               N_sparse, nchannels, nparams, bin_i, log2N,
                               &tdi_chan, &kf0, &f0g, &dts, tukey_alpha, edge_frac);
 
-        double dh = 0.0, hh = 0.0;
+        double dh = 0.0, hh = 0.0, dh_im = 0.0;
         gbfd_accumulate_ll(&dh, &hh, tdi_chan, N_sparse, nchannels, fd, kf0,
                            data_index_all[bin_i], noise_index_all[bin_i],
-                           tdi_type, 0.0, 0.0);
+                           tdi_type, 0.0, 0.0, &dh_im, 0.0);
         d_h_out[bin_i] = 4.0 * fd->df * dh;
         h_h_out[bin_i] = 4.0 * fd->df * hh;
+        if (d_h_im_out) d_h_im_out[bin_i] = 4.0 * fd->df * dh_im;
     }
     delete[] shared_mem;
 #endif
@@ -1302,7 +1323,8 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
     double *params_add_all, double *params_remove_all,
     int *data_index_all, int *noise_index_all,
     int num_bin, int nparams, double T, double t_start, double t_ref,
-    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac)
+    int N_sparse, int nchannels, int tdi_type, double tukey_alpha, double edge_frac,
+    double *d_h_add_im_out, double *add_remove_im_out)
 {
     // Reuse get_ll for the diagonal-in-source accumulators, then explicitly
     // form the cross term (h_add | h_remove) per source.
@@ -1332,6 +1354,7 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
     (void) num_bin; (void) nparams; (void) T;
     (void) t_start; (void) t_ref; (void) N_sparse;
     (void) nchannels; (void) tdi_type; (void) tukey_alpha; (void) edge_frac;
+    (void) d_h_add_im_out; (void) add_remove_im_out;
     printf("gb_fd_swap_ll_wrap GPU path not implemented yet.\n");
 #else
     int shared_bytes = tof.get_gb_fd_buffer_size(N_sparse, nchannels);
@@ -1347,11 +1370,13 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
         gbfd_build_one_source(&tof, (void*) shared_mem_a, params_add_all,
                               t_start, T, N_sparse, nchannels, nparams,
                               bin_i, log2N, &h_add, &kf0_a, &f0g_a, &dts_a, tukey_alpha, edge_frac);
-        // (d|h_add), (h_add|h_add)
-        double dh_a = 0.0, hh_aa = 0.0;
+        // (d|h_add), (h_add|h_add) (+ the fused phase-max quadrature of
+        // (d|h_add))
+        double dh_a = 0.0, hh_aa = 0.0, dh_a_im = 0.0;
         gbfd_accumulate_ll(&dh_a, &hh_aa, h_add, N_sparse, nchannels, fd,
                            kf0_a, data_index_all[bin_i],
-                           noise_index_all[bin_i], tdi_type, 0.0, 0.0);
+                           noise_index_all[bin_i], tdi_type, 0.0, 0.0,
+                           &dh_a_im, 0.0);
         // h_add lives in shared_mem_a; build h_remove in a separate buffer.
         cmplx *h_rem = NULL;
         int    kf0_r = 0;
@@ -1368,7 +1393,7 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
         // by the two sparse supports.  Each side knows its own (kf0, m_signed)
         // mapping; iterate over h_add bins and look up the matching h_remove
         // bin by absolute dense bin (k - kf0_r) modulo N_sparse.
-        double hh_ar = 0.0;
+        double hh_ar = 0.0, hh_ar_im = 0.0;
         const int N = N_sparse;
         if (tdi_type == TDI_XYZ)
         {
@@ -1392,6 +1417,11 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
                             k, c1, c2, noise_index_all[bin_i]);
                         cmplx prod = gcmplx::conj(ha) * hr;
                         hh_ar += prod.real() * invc;
+                        // Fused phase-max quadrature: NOTE the add template
+                        // sits in the CONJUGATED slot here, so this term's
+                        // phasor turns opposite to (d|h_add)'s -- hence the
+                        // separate empirical sign constant python-side.
+                        hh_ar_im += prod.imag() * invc;
                     }
                 }
             }
@@ -1416,6 +1446,7 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
                         k, c, noise_index_all[bin_i]);
                     cmplx prod = gcmplx::conj(ha) * hr;
                     hh_ar += prod.real() * invc;
+                    hh_ar_im += prod.imag() * invc;
                 }
             }
         }
@@ -1426,6 +1457,8 @@ void GBComputationGroup::gb_fd_swap_ll_wrap(
         add_add_out[bin_i]      = k4df * hh_aa;
         remove_remove_out[bin_i] = k4df * hh_rr;
         add_remove_out[bin_i]   = k4df * hh_ar;
+        if (d_h_add_im_out)    d_h_add_im_out[bin_i]    = k4df * dh_a_im;
+        if (add_remove_im_out) add_remove_im_out[bin_i] = k4df * hh_ar_im;
     }
     delete[] shared_mem_a;
     delete[] shared_mem_b;
@@ -1874,7 +1907,8 @@ void GBComputationGroup::gb_wdm_het_get_ll_wrap(
     int *binary_perm, int *group_starts, int *group_ends,
     int *group_m_lo, int *group_m_hi, int n_groups,
     int m_band_half_width,
-    int Nf_slab, int *slab_min_f)   // task-b per-band slab (0/null = off)
+    int Nf_slab, int *slab_min_f,   // task-b per-band slab (0/null = off)
+    double *d_h_im_out)             // fused phase-max quadrature (null = off)
 {
     wdm_het_get_ll_impl<GBTDIonTheFly>(
         d_h_out, h_h_out, orbits, tdi_config,
@@ -1889,7 +1923,7 @@ void GBComputationGroup::gb_wdm_het_get_ll_wrap(
         grid_dim, N_cp_sig, N_cp_orbit,
         binary_perm, group_starts, group_ends,
         group_m_lo, group_m_hi, n_groups, m_band_half_width,
-        Nf_slab, slab_min_f);
+        Nf_slab, slab_min_f, d_h_im_out);
 }
 
 void GBComputationGroup::gb_wdm_het_swap_ll_wrap(
@@ -1912,7 +1946,9 @@ void GBComputationGroup::gb_wdm_het_swap_ll_wrap(
     int *group_m_lo, int *group_m_hi, int n_groups,
     int *pair_m_lo_b, int *pair_m_hi_b,
     int m_band_half_width,
-    int Nf_slab, int *slab_min_f)   // task-b per-band slab (0/null = off)
+    int Nf_slab, int *slab_min_f,   // task-b per-band slab (0/null = off)
+    double *d_h_add_im_out,         // fused phase-max quadratures
+    double *add_remove_im_out)      //   (ADD-linear terms; null = off)
 {
     wdm_het_swap_ll_impl<GBTDIonTheFly>(
         d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
@@ -1929,7 +1965,7 @@ void GBComputationGroup::gb_wdm_het_swap_ll_wrap(
         binary_perm, group_starts, group_ends,
         group_m_lo, group_m_hi, n_groups,
         pair_m_lo_b, pair_m_hi_b, m_band_half_width,
-        Nf_slab, slab_min_f);
+        Nf_slab, slab_min_f, d_h_add_im_out, add_remove_im_out);
 }
 
 
@@ -2199,7 +2235,9 @@ void gb_signal_het_consume_one_source(
     cmplx  *fold_s,      // (nchannels * M * Nt_layer) scratch
     cmplx  *c1_sparse,   // (nchannels * M * N_sparse_t) scratch
     cmplx  *r_sparse,    // (nchannels * M * N_sparse_t) scratch
-    cmplx  *dr_sparse)   // (nchannels * M * N_sparse_t) scratch
+    cmplx  *dr_sparse,   // (nchannels * M * N_sparse_t) scratch
+    double *dh_im_partial = nullptr)  // optional quadrature partial (fused
+                                      // phase max: Im of the SAME accumulator)
 {
     const int    M        = 2 * m_active_half_width + 1;
     const double FLOOR_EPS = 1e-12;
@@ -2422,6 +2460,10 @@ void gb_signal_het_consume_one_source(
 
     *dh_partial = d_h_raw.real();
     *hh_partial = h_h_raw.real();
+    // Fused phase max: a physical phi0 shift is a unit phasor on every
+    // candidate-linear term above, so Im(d_h_raw) is (up to the family's
+    // empirical sign) the SAME inner product at phi0 + pi/2.
+    if (dh_im_partial) *dh_im_partial = d_h_raw.imag();
 }
 
 
@@ -2674,7 +2716,8 @@ void GBComputationGroup::gb_signal_het_get_ll_sparse_wrap(
     int     m_active_half_width,
     double  layer_df, double dt,
     int     nchannels, int tdi_type,
-    int     N_sparse_fd, double max_r, int project_real)
+    int     N_sparse_fd, double max_r, int project_real,
+    double *d_h_im_out)
 {
     gb_sighet_check_m_half(m_active_half_width);
     // project_real != 0: compute the REAL WDM likelihood. <d|h> is exact via the
@@ -2702,7 +2745,7 @@ void GBComputationGroup::gb_signal_het_get_ll_sparse_wrap(
     std::vector<cmplx> dr_sparse((size_t) nchannels * M * N_sparse_t);
 
     for (int bin = 0; bin < num_bin; ++bin) {
-        double dh_partial = 0.0, hh_partial = 0.0;
+        double dh_partial = 0.0, hh_partial = 0.0, dh_im_partial = 0.0;
         gb_signal_het_consume_one_source(
             &dh_partial, &hh_partial,
             X_het_all + (size_t) bin * nchannels * N_sparse_fd,
@@ -2721,9 +2764,11 @@ void GBComputationGroup::gb_signal_het_get_ll_sparse_wrap(
             nchannels, tdi_type,
             max_r, project_real,
             fold_s.data(), c1_sparse.data(),
-            r_sparse.data(), dr_sparse.data());
+            r_sparse.data(), dr_sparse.data(),
+            &dh_im_partial);
         d_h_out[bin] = 0.5 * dh_partial;
         h_h_out[bin] = 0.5 * hh_partial;
+        if (d_h_im_out) d_h_im_out[bin] = 0.5 * dh_im_partial;
     }
 #endif
 }
@@ -2775,7 +2820,8 @@ void gb_signal_het_get_ll_in_kernel_kernel(
     int nchannels, int tdi_type,
     int N_sparse_fd, int log2N,
     double tukey_alpha, double max_r, int project_real,
-    size_t consumer_offset, int n_cp_sig)
+    size_t consumer_offset, int n_cp_sig,
+    double *d_h_im_out)
 {
     extern CUDA_SHARED char shared_mem[];
     CUDA_SHARED double d_h_tmp[NUM_THREADS_HERE];
@@ -2809,7 +2855,7 @@ void gb_signal_het_get_ll_in_kernel_kernel(
         cur += (size_t) nchannels * M * N_sparse_t * sizeof(cmplx);
         cmplx *dr_s   = (cmplx*) cur;
 
-        double dh_partial = 0.0, hh_partial = 0.0;
+        double dh_partial = 0.0, hh_partial = 0.0, dh_im_partial = 0.0;
         gb_signal_het_consume_one_source(
             &dh_partial, &hh_partial,
             tdi_chan, N_sparse_fd, /*fft_order_scale=*/1.0 / dt,
@@ -2826,7 +2872,8 @@ void gb_signal_het_get_ll_in_kernel_kernel(
             layer_df, dt,
             nchannels, tdi_type,
             max_r, project_real,
-            fold_s, c1_s, r_s, dr_s);
+            fold_s, c1_s, r_s, dr_s,
+            &dh_im_partial);
 
         const int tid = threadIdx.x;
         d_h_tmp[tid] = dh_partial;
@@ -2835,10 +2882,20 @@ void gb_signal_het_get_ll_in_kernel_kernel(
 
         const double dh_sum = block_reduce(d_h_tmp);
         const double hh_sum = block_reduce(h_h_tmp);
+        // Quadrature reduce RE-STAGES d_h_tmp (its first-pass result is in
+        // registers by now): zero extra shared memory, uniform branch, and
+        // block_reduce's entry sync is the required barrier before reuse.
+        double dh_im_sum = 0.0;
+        if (d_h_im_out != nullptr)
+        {
+            d_h_tmp[tid] = dh_im_partial;
+            dh_im_sum = block_reduce(d_h_tmp);
+        }
         if (THREAD_ZERO)
         {
             d_h_out[bin_i] = 0.5 * dh_sum;
             h_h_out[bin_i] = 0.5 * hh_sum;
+            if (d_h_im_out != nullptr) d_h_im_out[bin_i] = 0.5 * dh_im_sum;
         }
         CUDA_SYNC_THREADS;
     }
@@ -2867,7 +2924,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
     double  T_obs, double t_start,
     int     nchannels, int tdi_type,
     int     N_sparse_fd, double tukey_alpha, double max_r, int project_real,
-    int     n_cp_sig)
+    int     n_cp_sig, double *d_h_im_out)
 {
     gb_sighet_check_m_half(m_active_half_width);
     // Validate the polyphase divisibility contract in ONE place for both
@@ -2956,7 +3013,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
         nchannels, tdi_type,
         N_sparse_fd, log2N,
         tukey_alpha, max_r, project_real,
-        consumer_offset, n_cp_sig);
+        consumer_offset, n_cp_sig, d_h_im_out);
 
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
@@ -3027,7 +3084,7 @@ void GBComputationGroup::gb_signal_het_get_ll_in_kernel_wrap(
         m_active_half_width,
         layer_df, dt,
         nchannels, tdi_type,
-        N_sparse_fd, max_r, project_real);
+        N_sparse_fd, max_r, project_real, d_h_im_out);
 #endif
 }
 
@@ -4061,7 +4118,8 @@ void gb_signal_het_v3_score_one_source(
     int     Nf, int Nf_active, int N_sparse_t, int stride,
     int     ind_min_t, int ind_min_f, int m_active_half_width,
     double  layer_df, double dt, double T_obs, double t_start,
-    int     nchannels, int tdi_type, int project_real)
+    int     nchannels, int tdi_type, int project_real,
+    double *dh_im_partial = nullptr)
 {
     const int    M         = 2 * m_active_half_width + 1;
     const double FLOOR_EPS = 1e-12;
@@ -4364,6 +4422,9 @@ void gb_signal_het_v3_score_one_source(
 
     *dh_partial = d_h_raw.real();
     *hh_partial = h_h_raw.real();
+    // Fused phase max: Im of the same accumulator (see
+    // gb_signal_het_consume_one_source).
+    if (dh_im_partial) *dh_im_partial = d_h_raw.imag();
 }
 
 
@@ -4383,7 +4444,8 @@ void gb_signal_het_v3_get_ll_kernel(
     int Nf, int Nf_active, int N_sparse_t, int stride,
     int ind_min_t, int ind_min_f, int m_active_half_width,
     double layer_df, double dt, double T_obs, double t_start,
-    int nchannels, int tdi_type, int project_real)
+    int nchannels, int tdi_type, int project_real,
+    double *d_h_im_out)
 {
     extern CUDA_SHARED char shared_mem[];
     CUDA_SHARED double d_h_tmp[NUM_THREADS_HERE];
@@ -4395,7 +4457,7 @@ void gb_signal_het_v3_get_ll_kernel(
 
     for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X)
     {
-        double dh_partial = 0.0, hh_partial = 0.0;
+        double dh_partial = 0.0, hh_partial = 0.0, dh_im_partial = 0.0;
         gb_signal_het_v3_score_one_source(
             &dh_partial, &hh_partial,
             &tof, (void *) shared_mem,
@@ -4408,7 +4470,8 @@ void gb_signal_het_v3_get_ll_kernel(
             Nf, Nf_active, N_sparse_t, stride,
             ind_min_t, ind_min_f, m_active_half_width,
             layer_df, dt, T_obs, t_start,
-            nchannels, tdi_type, project_real);
+            nchannels, tdi_type, project_real,
+            &dh_im_partial);
 
         const int tid = threadIdx.x;
         d_h_tmp[tid] = dh_partial;
@@ -4416,10 +4479,19 @@ void gb_signal_het_v3_get_ll_kernel(
         CUDA_SYNC_THREADS;
         const double dh_sum = block_reduce(d_h_tmp);
         const double hh_sum = block_reduce(h_h_tmp);
+        // Quadrature reduce re-stages d_h_tmp (zero extra shared; see the
+        // in-kernel v2 kernel for the barrier argument).
+        double dh_im_sum = 0.0;
+        if (d_h_im_out != nullptr)
+        {
+            d_h_tmp[tid] = dh_im_partial;
+            dh_im_sum = block_reduce(d_h_tmp);
+        }
         if (THREAD_ZERO)
         {
             d_h_out[bin_i] = 0.5 * dh_sum;
             h_h_out[bin_i] = 0.5 * hh_sum;
+            if (d_h_im_out != nullptr) d_h_im_out[bin_i] = 0.5 * dh_im_sum;
         }
         CUDA_SYNC_THREADS;
     }
@@ -4445,7 +4517,8 @@ void GBComputationGroup::gb_signal_het_v3_get_ll_wrap(
     int     m_active_half_width,
     double  layer_df, double dt,
     double  T_obs, double t_start,
-    int     nchannels, int tdi_type, int project_real)
+    int     nchannels, int tdi_type, int project_real,
+    double *d_h_im_out)
 {
     gb_sighet_check_m_half(m_active_half_width);
     if (n_nodes < 4) {
@@ -4504,7 +4577,7 @@ void GBComputationGroup::gb_signal_het_v3_get_ll_wrap(
         Nf, Nf_active, N_sparse_t, stride,
         ind_min_t, ind_min_f, m_active_half_width,
         layer_df, dt, T_obs, t_start,
-        nchannels, tdi_type, project_real);
+        nchannels, tdi_type, project_real, d_h_im_out);
 
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
@@ -4517,7 +4590,7 @@ void GBComputationGroup::gb_signal_het_v3_get_ll_wrap(
     std::vector<char> scratch(shared_bytes);
     for (int bin = 0; bin < num_bin; ++bin)
     {
-        double dh_partial = 0.0, hh_partial = 0.0;
+        double dh_partial = 0.0, hh_partial = 0.0, dh_im_partial = 0.0;
         gb_signal_het_v3_score_one_source(
             &dh_partial, &hh_partial,
             tdi_on_fly, (void *) scratch.data(),
@@ -4530,9 +4603,11 @@ void GBComputationGroup::gb_signal_het_v3_get_ll_wrap(
             Nf, Nf_active, N_sparse_t, stride,
             ind_min_t, ind_min_f, m_active_half_width,
             layer_df, dt, T_obs, t_start,
-            nchannels, tdi_type, project_real);
+            nchannels, tdi_type, project_real,
+            &dh_im_partial);
         d_h_out[bin] = 0.5 * dh_partial;
         h_h_out[bin] = 0.5 * hh_partial;
+        if (d_h_im_out) d_h_im_out[bin] = 0.5 * dh_im_partial;
     }
 #endif
 }
@@ -4600,7 +4675,8 @@ void gb_signal_het_v4_score_one_source(
     int     Nf, int Nf_active, int N_sparse_t, int stride,
     int     ind_min_t, int ind_min_f, int m_active_half_width,
     double  layer_df, double dt, double T_obs, double t_start,
-    int     nchannels, int tdi_type, int project_real)
+    int     nchannels, int tdi_type, int project_real,
+    double *dh_im_partial = nullptr)
 {
     const int    M         = 2 * m_active_half_width + 1;
     const double FLOOR_EPS = 1e-12;
@@ -5002,6 +5078,9 @@ void gb_signal_het_v4_score_one_source(
 
     *dh_partial = d_h_raw.real();
     *hh_partial = h_h_raw.real();
+    // Fused phase max: Im of the same accumulator (see
+    // gb_signal_het_consume_one_source).
+    if (dh_im_partial) *dh_im_partial = d_h_raw.imag();
 }
 
 #ifdef __CUDACC__
@@ -5021,7 +5100,8 @@ void gb_signal_het_v4_get_ll_kernel(
     int Nf, int Nf_active, int N_sparse_t, int stride,
     int ind_min_t, int ind_min_f, int m_active_half_width,
     double layer_df, double dt, double T_obs, double t_start,
-    int nchannels, int tdi_type, int project_real)
+    int nchannels, int tdi_type, int project_real,
+    double *d_h_im_out)
 {
     extern CUDA_SHARED char shared_mem[];
     CUDA_SHARED double d_h_tmp[NUM_THREADS_HERE];
@@ -5033,7 +5113,7 @@ void gb_signal_het_v4_get_ll_kernel(
 
     for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X)
     {
-        double dh_partial = 0.0, hh_partial = 0.0;
+        double dh_partial = 0.0, hh_partial = 0.0, dh_im_partial = 0.0;
         gb_signal_het_v4_score_one_source(
             &dh_partial, &hh_partial,
             band_w, band_j0, band_len,
@@ -5047,7 +5127,8 @@ void gb_signal_het_v4_get_ll_kernel(
             Nf, Nf_active, N_sparse_t, stride,
             ind_min_t, ind_min_f, m_active_half_width,
             layer_df, dt, T_obs, t_start,
-            nchannels, tdi_type, project_real);
+            nchannels, tdi_type, project_real,
+            &dh_im_partial);
 
         const int tid = threadIdx.x;
         d_h_tmp[tid] = dh_partial;
@@ -5055,10 +5136,19 @@ void gb_signal_het_v4_get_ll_kernel(
         CUDA_SYNC_THREADS;
         const double dh_sum = block_reduce(d_h_tmp);
         const double hh_sum = block_reduce(h_h_tmp);
+        // Quadrature reduce re-stages d_h_tmp (zero extra shared; see the
+        // in-kernel v2 kernel for the barrier argument).
+        double dh_im_sum = 0.0;
+        if (d_h_im_out != nullptr)
+        {
+            d_h_tmp[tid] = dh_im_partial;
+            dh_im_sum = block_reduce(d_h_tmp);
+        }
         if (THREAD_ZERO)
         {
             d_h_out[bin_i] = 0.5 * dh_sum;
             h_h_out[bin_i] = 0.5 * hh_sum;
+            if (d_h_im_out != nullptr) d_h_im_out[bin_i] = 0.5 * dh_im_sum;
         }
         CUDA_SYNC_THREADS;
     }
@@ -5085,7 +5175,8 @@ void GBComputationGroup::gb_signal_het_v4_get_ll_wrap(
     int     m_active_half_width,
     double  layer_df, double dt,
     double  T_obs, double t_start,
-    int     nchannels, int tdi_type, int project_real)
+    int     nchannels, int tdi_type, int project_real,
+    double *d_h_im_out)
 {
     gb_sighet_check_m_half(m_active_half_width);
     if (n_nodes < 4) {
@@ -5146,7 +5237,7 @@ void GBComputationGroup::gb_signal_het_v4_get_ll_wrap(
         Nf, Nf_active, N_sparse_t, stride,
         ind_min_t, ind_min_f, m_active_half_width,
         layer_df, dt, T_obs, t_start,
-        nchannels, tdi_type, project_real);
+        nchannels, tdi_type, project_real, d_h_im_out);
 
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
@@ -5159,7 +5250,7 @@ void GBComputationGroup::gb_signal_het_v4_get_ll_wrap(
     std::vector<char> scratch(shared_bytes);
     for (int bin = 0; bin < num_bin; ++bin)
     {
-        double dh_partial = 0.0, hh_partial = 0.0;
+        double dh_partial = 0.0, hh_partial = 0.0, dh_im_partial = 0.0;
         gb_signal_het_v4_score_one_source(
             &dh_partial, &hh_partial,
             band_w, band_j0, band_len,
@@ -5173,9 +5264,11 @@ void GBComputationGroup::gb_signal_het_v4_get_ll_wrap(
             Nf, Nf_active, N_sparse_t, stride,
             ind_min_t, ind_min_f, m_active_half_width,
             layer_df, dt, T_obs, t_start,
-            nchannels, tdi_type, project_real);
+            nchannels, tdi_type, project_real,
+            &dh_im_partial);
         d_h_out[bin] = 0.5 * dh_partial;
         h_h_out[bin] = 0.5 * hh_partial;
+        if (d_h_im_out) d_h_im_out[bin] = 0.5 * dh_im_partial;
     }
 #endif
 }
@@ -5423,7 +5516,8 @@ void gb_signal_het_v5_score_one_source(
     int     Nf, int Nf_active, int N_sparse_t, int stride,
     int     ind_min_t, int ind_min_f, int m_active_half_width,
     double  layer_df, double dt, double T_obs, double t_start,
-    int     nchannels, int tdi_type, int project_real)
+    int     nchannels, int tdi_type, int project_real,
+    double *dh_im_partial = nullptr)
 {
     const int M      = 2 * m_active_half_width + 1;
     const int nwords = (N_sparse_t + 63) / 64;
@@ -5845,6 +5939,9 @@ void gb_signal_het_v5_score_one_source(
 
     *dh_partial = d_h_raw.real();
     *hh_partial = h_h_raw.real();
+    // Fused phase max: Im of the same accumulator (see
+    // gb_signal_het_consume_one_source).
+    if (dh_im_partial) *dh_im_partial = d_h_raw.imag();
 }
 
 
@@ -5865,7 +5962,8 @@ void gb_signal_het_v5_get_ll_kernel(
     int Nf, int Nf_active, int N_sparse_t, int stride,
     int ind_min_t, int ind_min_f, int m_active_half_width,
     double layer_df, double dt, double T_obs, double t_start,
-    int nchannels, int tdi_type, int project_real)
+    int nchannels, int tdi_type, int project_real,
+    double *d_h_im_out)
 {
     extern CUDA_SHARED char shared_mem[];
     CUDA_SHARED double d_h_tmp[NUM_THREADS_HERE];
@@ -5877,7 +5975,7 @@ void gb_signal_het_v5_get_ll_kernel(
 
     for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X)
     {
-        double dh_partial = 0.0, hh_partial = 0.0;
+        double dh_partial = 0.0, hh_partial = 0.0, dh_im_partial = 0.0;
         gb_signal_het_v5_score_one_source(
             &dh_partial, &hh_partial,
             band_w, band_j0, band_len,
@@ -5891,7 +5989,8 @@ void gb_signal_het_v5_get_ll_kernel(
             Nf, Nf_active, N_sparse_t, stride,
             ind_min_t, ind_min_f, m_active_half_width,
             layer_df, dt, T_obs, t_start,
-            nchannels, tdi_type, project_real);
+            nchannels, tdi_type, project_real,
+            &dh_im_partial);
 
         const int tid = threadIdx.x;
         d_h_tmp[tid] = dh_partial;
@@ -5899,10 +5998,19 @@ void gb_signal_het_v5_get_ll_kernel(
         CUDA_SYNC_THREADS;
         const double dh_sum = block_reduce(d_h_tmp);
         const double hh_sum = block_reduce(h_h_tmp);
+        // Quadrature reduce re-stages d_h_tmp: zero extra shared memory, so
+        // the v5 occupancy carve (27.6 KB, 5 blocks/SM) is untouched.
+        double dh_im_sum = 0.0;
+        if (d_h_im_out != nullptr)
+        {
+            d_h_tmp[tid] = dh_im_partial;
+            dh_im_sum = block_reduce(d_h_tmp);
+        }
         if (THREAD_ZERO)
         {
             d_h_out[bin_i] = 0.5 * dh_sum;
             h_h_out[bin_i] = 0.5 * hh_sum;
+            if (d_h_im_out != nullptr) d_h_im_out[bin_i] = 0.5 * dh_im_sum;
         }
         CUDA_SYNC_THREADS;
     }
@@ -5930,7 +6038,7 @@ void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
     double  layer_df, double dt,
     double  T_obs, double t_start,
     int     nchannels, int tdi_type, int project_real,
-    int     v5_mode)
+    int     v5_mode, double *d_h_im_out)
 {
     gb_sighet_check_m_half(m_active_half_width);
     if (n_nodes < 4) {
@@ -5996,7 +6104,7 @@ void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
         Nf, Nf_active, N_sparse_t, stride,
         ind_min_t, ind_min_f, m_active_half_width,
         layer_df, dt, T_obs, t_start,
-        nchannels, tdi_type, project_real);
+        nchannels, tdi_type, project_real, d_h_im_out);
 
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
@@ -6036,7 +6144,7 @@ void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
     std::vector<char> scratch(shared_bytes);
     for (int bin = 0; bin < num_bin; ++bin)
     {
-        double dh_partial = 0.0, hh_partial = 0.0;
+        double dh_partial = 0.0, hh_partial = 0.0, dh_im_partial = 0.0;
         gb_signal_het_v5_score_one_source(
             &dh_partial, &hh_partial,
             band_w, band_j0, band_len,
@@ -6050,9 +6158,11 @@ void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
             Nf, Nf_active, N_sparse_t, stride,
             ind_min_t, ind_min_f, m_active_half_width,
             layer_df, dt, T_obs, t_start,
-            nchannels, tdi_type, project_real);
+            nchannels, tdi_type, project_real,
+            &dh_im_partial);
         d_h_out[bin] = 0.5 * dh_partial;
         h_h_out[bin] = 0.5 * hh_partial;
+        if (d_h_im_out) d_h_im_out[bin] = 0.5 * dh_im_partial;
     }
 #endif
 }

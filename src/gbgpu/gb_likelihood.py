@@ -98,8 +98,17 @@ class TwoQuadraturePhaseMaxMixin:
     lands on exactly this maximum. Validated end-to-end by
     ``LISAanalysistools/scripts/gb_chunked_het/gb_phase_max_validate.py``.
 
-    Cost: one extra kernel call per phase-maximised batch (the quadrature
-    evaluation); ``h_h`` is phase-invariant so it is not recomputed.
+    Cost: FUSED path (C++ backends) -- ZERO extra kernel calls: the kernels
+    accumulate the candidate-linear inner products as complex sums and hand
+    the quadrature out as ``d_h_im_out`` / ``swap_*_im`` stashes
+    (comp-normalized to "value at phi0 + pi/2"; see the per-family
+    ``_QUAD_SIGN_*`` constants), so one call carries both quadratures.
+    Fused and two-call agree exactly in exact arithmetic and to float
+    rounding (~1e-12 relative) in practice -- parity pinned by GBGPU
+    ``tests/test_phase_max_fused.py``. An engine that stashes ``None``
+    (e.g. the JAX chunked backend) falls back to the legacy second
+    evaluation at ``phi0 + pi/2``; ``h_h`` is phase-invariant so it is
+    never recomputed on either path.
     """
 
     def _get_ll_phase_max(
@@ -119,18 +128,25 @@ class TwoQuadraturePhaseMaxMixin:
             data_index=data_index, noise_index=noise_index, N_vals=N_vals,
             phase_maximize=False, waveform_kwargs=waveform_kwargs,
         )
-        d_h_0 = self.d_h_out.copy()
-        h_h = self.h_h_out.copy()
-        kept = self.kept_out.copy()
-
-        params_q = params_phys.copy()
-        params_q[:, PHYS_IDX_PHI0] = params_q[:, PHYS_IDX_PHI0] + np.pi / 2
-        self.get_ll(
-            buffer_aca, params_q,
-            data_index=data_index, noise_index=noise_index, N_vals=N_vals,
-            phase_maximize=False, waveform_kwargs=waveform_kwargs,
-        )
-        d_h_90 = self.d_h_out.copy()
+        d_h_90 = getattr(self, "d_h_im_out", None)
+        if d_h_90 is not None:
+            # FUSED: quadrature came out of the same kernel call.
+            d_h_0 = self.d_h_out
+        else:
+            # Legacy two-call fallback (backend without the fused output).
+            d_h_0 = self.d_h_out.copy()
+            h_h = self.h_h_out.copy()
+            kept = self.kept_out.copy()
+            params_q = params_phys.copy()
+            params_q[:, PHYS_IDX_PHI0] = params_q[:, PHYS_IDX_PHI0] + np.pi / 2
+            self.get_ll(
+                buffer_aca, params_q,
+                data_index=data_index, noise_index=noise_index, N_vals=N_vals,
+                phase_maximize=False, waveform_kwargs=waveform_kwargs,
+            )
+            d_h_90 = self.d_h_out.copy()
+            self.h_h_out = h_h
+            self.kept_out = kept
 
         D = d_h_0 + 1j * d_h_90
         d_h_max = xp.abs(D)
@@ -141,9 +157,7 @@ class TwoQuadraturePhaseMaxMixin:
 
         self.non_marg_d_h = d_h_0
         self.d_h_out = d_h_max
-        self.h_h_out = h_h
         self.phase_angle = xp.arctan2(D.imag, D.real)
-        self.kept_out = kept
         if return_inner_products:
             return ll, self.d_h_out, self.h_h_out, self.phase_angle
         return ll
@@ -165,20 +179,26 @@ class TwoQuadraturePhaseMaxMixin:
             data_index=data_index, noise_index=noise_index, N_vals=N_vals,
             phase_maximize=False, waveform_kwargs=waveform_kwargs,
         )
-        params_q = params_add_phys.copy()
-        params_q[:, PHYS_IDX_PHI0] = params_q[:, PHYS_IDX_PHI0] + np.pi / 2
-        res_90 = self.get_swap_ll(
-            buffer_aca, params_remove_phys, params_q,
-            data_index=data_index, noise_index=noise_index, N_vals=N_vals,
-            phase_maximize=False, waveform_kwargs=waveform_kwargs,
-        )
+        d_h_add_90 = getattr(self, "swap_d_h_add_im", None)
+        hh_cross_90 = getattr(self, "swap_add_remove_im", None)
+        if d_h_add_90 is None or hh_cross_90 is None:
+            # Legacy two-call fallback (backend without the fused outputs).
+            params_q = params_add_phys.copy()
+            params_q[:, PHYS_IDX_PHI0] = params_q[:, PHYS_IDX_PHI0] + np.pi / 2
+            res_90 = self.get_swap_ll(
+                buffer_aca, params_remove_phys, params_q,
+                data_index=data_index, noise_index=noise_index, N_vals=N_vals,
+                phase_maximize=False, waveform_kwargs=waveform_kwargs,
+            )
+            d_h_add_90 = res_90.d_h_add
+            hh_cross_90 = res_90.hh_cross
 
         # Only the ADD template's phase is maximised; the terms linear in
         # h_add are d_h_add and hh_cross, entering ll_diff as
         # G = d_h_add - hh_cross. Maximise G, then evaluate each linear
         # functional at the same delta*.
         D_g = (res_0.d_h_add - res_0.hh_cross) + 1j * (
-            res_90.d_h_add - res_90.hh_cross
+            d_h_add_90 - hh_cross_90
         )
         delta = xp.arctan2(D_g.imag, D_g.real)
         rot = xp.exp(1j * delta)
@@ -186,8 +206,8 @@ class TwoQuadraturePhaseMaxMixin:
         def _at_max(g_0, g_90):
             return (xp.conj(g_0 + 1j * g_90) * rot).real
 
-        d_h_add = _at_max(res_0.d_h_add, res_90.d_h_add)
-        hh_cross = _at_max(res_0.hh_cross, res_90.hh_cross)
+        d_h_add = _at_max(res_0.d_h_add, d_h_add_90)
+        hh_cross = _at_max(res_0.hh_cross, hh_cross_90)
         gain = (d_h_add - hh_cross) - (res_0.d_h_add - res_0.hh_cross)
         ll_diff = xp.where(
             res_0.ll_diff > -1e290, res_0.ll_diff + gain, res_0.ll_diff
@@ -513,6 +533,9 @@ class FDBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         ll = xp.full(num, -1e300)
         self.d_h_out = xp.zeros(num)
         self.h_h_out = xp.zeros(num)
+        # Fused phase-max quadrature: zeros on bounds-rejected rows (gain 0,
+        # sentinel ll preserved), filled per N-group below.
+        self.d_h_im_out = xp.zeros(num)
         self.phase_angle = None
 
         rows_keep = xp.arange(num)[keep]
@@ -528,6 +551,7 @@ class FDBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
                 ll[r] = ll_r
                 self.d_h_out[r] = comp.d_h_out
                 self.h_h_out[r] = comp.h_h_out
+                self.d_h_im_out[r] = comp.d_h_im_out
         if return_inner_products:
             return ll, self.d_h_out, self.h_h_out, self.phase_angle
         return ll
@@ -590,6 +614,9 @@ class FDBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         hh_remove = xp.zeros(num)
         hh_cross = xp.zeros(num)
         opt_snr = xp.zeros(num)
+        # Fused phase-max quadratures (zeros on rejected rows).
+        swap_a_im = xp.zeros(num)
+        swap_ar_im = xp.zeros(num)
 
         rows_keep = xp.arange(num)[keep]
         if len(rows_keep):
@@ -608,6 +635,11 @@ class FDBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
                 hh_remove[r] = rr
                 hh_cross[r] = ar
                 opt_snr[r] = xp.sqrt(xp.maximum(aa, 0.0))
+                swap_a_im[r] = comp.d_h_add_im_out
+                swap_ar_im[r] = comp.add_remove_im_out
+
+        self.swap_d_h_add_im = swap_a_im
+        self.swap_add_remove_im = swap_ar_im
 
         return SwapLLResult(
             ll_diff=ll_diff,
@@ -766,6 +798,10 @@ class WDMBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         # skips out-of-band layers, so kept_out is all-True here.
         self.d_h_out = self.gb_comps.d_h_out.copy()
         self.h_h_out = self.gb_comps.h_h_out.copy()
+        # Fused phase-max quadrature (None on backends without it -> the
+        # mixin's two-call fallback).
+        _im = getattr(self.gb_comps, "d_h_im_out", None)
+        self.d_h_im_out = None if _im is None else _im.copy()
         self.phase_angle = None
         self.kept_out = self.gb_comps.xp.ones(params_phys.shape[0], dtype=bool)
         if return_inner_products:
@@ -834,6 +870,12 @@ class WDMBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         hh_add = xp.zeros(num_prop, dtype=xp.float64)
         hh_remove = xp.zeros(num_prop, dtype=xp.float64)
         hh_cross = xp.zeros(num_prop, dtype=xp.float64)
+        # Fused phase-max quadratures (zeros off-keep, exactly what the
+        # legacy second call would produce there); dropped to None below if
+        # the comp lacks the fused outputs.
+        swap_a_im = xp.zeros(num_prop, dtype=xp.float64)
+        swap_ar_im = xp.zeros(num_prop, dtype=xp.float64)
+        fused_quad = True
 
         if bool(keep.any() if hasattr(keep, "any") else keep.any()):
             keep_idx = keep
@@ -876,6 +918,16 @@ class WDMBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             hh_remove[keep_idx] = rr
             hh_cross[keep_idx] = ar
             opt_snr[keep_idx] = xp.sqrt(xp.maximum(aa, 0.0))
+            _im_a = getattr(self.gb_comps, "d_h_add_im_out", None)
+            _im_ar = getattr(self.gb_comps, "add_remove_im_out", None)
+            if _im_a is None or _im_ar is None:
+                fused_quad = False
+            else:
+                swap_a_im[keep_idx] = _im_a
+                swap_ar_im[keep_idx] = _im_ar
+
+        self.swap_d_h_add_im = swap_a_im if fused_quad else None
+        self.swap_add_remove_im = swap_ar_im if fused_quad else None
 
         return SwapLLResult(
             ll_diff=ll_diff,

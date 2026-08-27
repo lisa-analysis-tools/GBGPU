@@ -309,7 +309,8 @@ class GBComputationGroup{
         int *binary_perm, int *group_starts, int *group_ends,
         int *group_m_lo, int *group_m_hi, int n_groups,
         int m_band_half_width,
-        int Nf_slab = 0, int *slab_min_f = nullptr);  // task-b per-band slab
+        int Nf_slab = 0, int *slab_min_f = nullptr,   // task-b per-band slab
+        double *d_h_im_out = nullptr);                // fused phase-max quadrature
 
     void gb_wdm_het_swap_ll_wrap(
         double *d_h_add_out, double *d_h_remove_out,
@@ -333,7 +334,9 @@ class GBComputationGroup{
         int *group_m_lo, int *group_m_hi, int n_groups,
         int *pair_m_lo_b, int *pair_m_hi_b,
         int m_band_half_width,
-        int Nf_slab = 0, int *slab_min_f = nullptr);  // task-b per-band slab
+        int Nf_slab = 0, int *slab_min_f = nullptr,   // task-b per-band slab
+        double *d_h_add_im_out = nullptr,             // fused phase-max
+        double *add_remove_im_out = nullptr);         //   quadratures (ADD-linear)
 
     // F-stat (chunked-heterodyne). Builds the 4 Cornish & Crowder '05 basis
     // filters per binary and writes:
@@ -430,7 +433,7 @@ class GBComputationGroup{
         double *params_all, int *data_index_all, int *noise_index_all,
         int num_bin, int nparams, double T, double t_start, double t_ref,
         int N_sparse, int nchannels, int tdi_type, double tukey_alpha,
-        double edge_frac);
+        double edge_frac, double *d_h_im_out = nullptr);
 
     void gb_fd_swap_ll_wrap(
         double *d_h_add_out, double *d_h_remove_out,
@@ -440,7 +443,8 @@ class GBComputationGroup{
         int *data_index_all, int *noise_index_all,
         int num_bin, int nparams, double T, double t_start, double t_ref,
         int N_sparse, int nchannels, int tdi_type, double tukey_alpha,
-        double edge_frac);
+        double edge_frac,
+        double *d_h_add_im_out = nullptr, double *add_remove_im_out = nullptr);
 
     // Chain-rule parameter gradients of the two FD likelihood kernels.
     // Same convention as the WDM counterparts:
@@ -547,7 +551,8 @@ class GBComputationGroup{
         int     m_active_half_width,
         double  layer_df, double dt,
         int     nchannels, int tdi_type,
-        int     N_sparse_fd, double max_r, int project_real);
+        int     N_sparse_fd, double max_r, int project_real,
+        double *d_h_im_out = nullptr);
 
     // Reference producer (V2 sig-het) -- EMIT the reference WDM ``c0`` from the
     // backend (replaces the Python polyphase ``_compute_sparse_complex_wdm``).
@@ -605,7 +610,7 @@ class GBComputationGroup{
         double  T_obs, double t_start,
         int     nchannels, int tdi_type,
         int     N_sparse_fd, double tukey_alpha, double max_r, int project_real,
-        int     n_cp_sig = 0);
+        int     n_cp_sig = 0, double *d_h_im_out = nullptr);
 
     // Signal-het V3 -- RATIO-SPLINE candidate build (2026-07-30). Models the
     // heterodyne ratio r directly: raw TDI for candidate + reference at
@@ -632,7 +637,8 @@ class GBComputationGroup{
         int     m_active_half_width,
         double  layer_df, double dt,
         double  T_obs, double t_start,
-        int     nchannels, int tdi_type, int project_real);
+        int     nchannels, int tdi_type, int project_real,
+        double *d_h_im_out = nullptr);
 
     void gb_signal_het_v4_get_ll_wrap(
         GBTDIonTheFly *tdi_on_fly,
@@ -654,7 +660,8 @@ class GBComputationGroup{
         int     m_active_half_width,
         double  layer_df, double dt,
         double  T_obs, double t_start,
-        int     nchannels, int tdi_type, int project_real);
+        int     nchannels, int tdi_type, int project_real,
+        double *d_h_im_out = nullptr);
 
     // Signal-het V5 -- v4-banded with the per-candidate fold scratch
     // (r_sparse, dr_sparse) ELIMINATED rather than relocated: they are an
@@ -695,7 +702,7 @@ class GBComputationGroup{
         double  layer_df, double dt,
         double  T_obs, double t_start,
         int     nchannels, int tdi_type, int project_real,
-        int     v5_mode);
+        int     v5_mode, double *d_h_im_out = nullptr);
 
     // Signal-het F-STAT -- per-candidate (N (4,), M_upper (10,)) for the 4
     // Cornish & Crowder basis filters against SHARED heterodyne references,
