@@ -86,7 +86,12 @@ class GBWDMComputations(WDMComputationsBase):
     _FUSED_QUAD_KERNELS = True
     # GBGPU's gb_wdm_het_get_fstat_ll binding carries the trailing basis-filter
     # fold argument (see WDMComputationsBase._FSTAT_FOLD_KERNELS). The fold
-    # itself still defaults OFF -- GB_FSTAT_FOLD=1 turns it on.
+    # itself now defaults ON (2026-08-28); GB_FSTAT_FOLD=0 restores the
+    # 4-filter path bit-for-bit.
+    #
+    # This flag is a hard constant, NOT probed from the compiled binding, so a
+    # STALE .so is a loud TypeError at the first F-stat call (the trailing arg
+    # is passed unconditionally, fold on or off) rather than a silent no-op.
     _FSTAT_FOLD_KERNELS = True
     _WRAP_ATTR = "GBComputationGroupWrap"
     _METHOD_PREFIX = "gb_wdm_het"
