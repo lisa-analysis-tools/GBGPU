@@ -29,7 +29,9 @@ Contracts pinned here:
 * **End-to-end** -- ``fstat_maximized_extrinsics`` agrees on the folded path,
   ``F`` included.
 
-CPU-only (numpy), same small grid as ``test_phase_max_fused``.
+Backend-agnostic: the fixture allocates through the COMP's own array module,
+so this runs on whichever backend ``GBWDMComputations`` resolves. Same small
+grid as ``test_phase_max_fused``.
 """
 
 import os
@@ -38,6 +40,7 @@ import unittest
 import numpy as np
 
 from lisatools.detector import ESAOrbits
+from lisatools.utils.utility import get_array_module
 from lisatools.domains import WDMSettings
 from lisatools.sampling.fstat_proposal import fstat_maximized_extrinsics
 from lisatools.utils.constants import YRSID_SI
@@ -64,14 +67,30 @@ _TRIU = [(0, 0), (0, 1), (0, 2), (0, 3), (1, 1),
 
 
 class _TwoSlotHolder:
-    """Minimal wdm_holder: N buffer slots (residual slab + XYZ invC slab)."""
+    """Minimal wdm_holder: N buffer slots (residual slab + XYZ invC slab).
+
+    The kernel dereferences these as DEVICE pointers on a GPU backend, so the
+    contiguity pass must go through the slabs' OWN array module. Hard-coding
+    ``np.ascontiguousarray`` here raised ``TypeError: Implicit conversion to a
+    NumPy array is not allowed`` out of cupy and took down setUpClass before a
+    single test ran.
+    """
 
     def __init__(self, data_slabs, invC_slabs):
-        self.linear_data_arr = [np.ascontiguousarray(data_slabs).ravel()]
-        self.linear_psd_arr = [np.ascontiguousarray(invC_slabs).ravel()]
+        xp = get_array_module(data_slabs)
+        self.linear_data_arr = [xp.ascontiguousarray(data_slabs).ravel()]
+        self.linear_psd_arr = [xp.ascontiguousarray(invC_slabs).ravel()]
 
     def __len__(self):
         return 1
+
+
+def _host(a):
+    """Device-or-host array -> numpy, for the host-side assertions.
+
+    ``.get()`` is an exact copy, so the bitwise compares below stay bitwise.
+    """
+    return a.get() if hasattr(a, "get") else np.asarray(a)
 
 
 def _dyn_atol(*arrays):
@@ -168,10 +187,18 @@ class FstatFilterFoldTest(unittest.TestCase):
         cls.chunked, cls.holder, cls.params, cls.di = build_fixture()
 
     def _NM(self, fold):
-        return self.chunked.get_fstat_ll_wdm(
+        """(N, M) for one fold setting, pulled to the HOST.
+
+        Every assertion below is host arithmetic (``np.testing``, the D-flip
+        premise test, ``fstat_maximized_extrinsics``). Pulling once here keeps
+        the device out of the comparison logic entirely; ``.get()`` is exact so
+        the bitwise tests remain bitwise.
+        """
+        N, M = self.chunked.get_fstat_ll_wdm(
             self.params, self.holder,
             data_index=self.di, noise_index=self.di,
             convert_to_ra_dec=False, fstat_fold=fold)
+        return _host(N), _host(M)
 
     # ---- default-off contract ----------------------------------------
 
