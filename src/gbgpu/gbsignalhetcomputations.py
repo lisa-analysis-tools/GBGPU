@@ -1621,9 +1621,21 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             # kernel call as Im of the complex accumulator (last_d_h_im),
             # so one call replaces the old second evaluation at the shifted
             # phase. h_h needs nothing: it comes from the same call.
+            # GB_PHASE_MAX_FUSED=0 = the production rollback lever: run the
+            # legacy explicit second call at phi0 + pi/2 instead.
             ll_0 = self.get_ll(params, data_index=data_index)
             d_h_0 = self.last_d_h
-            d_h_90 = self.last_d_h_im     # comp-normalized, see _QUAD_SIGN
+            if os.environ.get("GB_PHASE_MAX_FUSED", "1") != "0":
+                d_h_90 = self.last_d_h_im  # comp-normalized, see _QUAD_SIGN
+            else:
+                d_h_0 = self.last_d_h.copy()
+                h_h = self.last_h_h.copy()
+                x_q = xp.atleast_2d(xp.array(xp.asarray(params), dtype=float,
+                                             copy=True))
+                x_q[:, 4] = x_q[:, 4] + np.pi / 2
+                self.get_ll(x_q, data_index=data_index)
+                d_h_90 = self.last_d_h.copy()
+                self.last_h_h = h_h
             D = d_h_0 + 1j * d_h_90
             d_h_max = xp.abs(D)
             self.non_marg_d_h = d_h_0

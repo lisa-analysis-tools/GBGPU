@@ -28,6 +28,7 @@ Contracts pinned here:
 CPU-only (numpy), same small grid as ``test_sighet_infomat``.
 """
 
+import os
 import unittest
 
 import numpy as np
@@ -251,6 +252,32 @@ class SigHetFusedTest(_GridFixture):
 
     def test_v5_fused(self):
         self._fused_parity_sighet(self.sighet["v5"])
+
+    def test_kill_switch_comp_two_call_matches_fused(self):
+        """GB_PHASE_MAX_FUSED=0 on the sig-het comp's own phase-max branch:
+        the legacy two-call body must run and agree with the fused result."""
+        comp = self.sighet["v2"]
+        ll_f = np.asarray(comp.get_ll(self.params, data_index=self.di,
+                                      phase_maximize=True))
+        d_h_f = np.asarray(comp.last_d_h).copy()
+        ang_f = np.asarray(comp.phase_angle).copy()
+        saved = os.environ.get("GB_PHASE_MAX_FUSED")
+        os.environ["GB_PHASE_MAX_FUSED"] = "0"
+        try:
+            ll_2 = np.asarray(comp.get_ll(self.params, data_index=self.di,
+                                          phase_maximize=True))
+            d_h_2 = np.asarray(comp.last_d_h).copy()
+            ang_2 = np.asarray(comp.phase_angle).copy()
+        finally:
+            if saved is None:
+                os.environ.pop("GB_PHASE_MAX_FUSED", None)
+            else:
+                os.environ["GB_PHASE_MAX_FUSED"] = saved
+        np.testing.assert_allclose(ll_2, ll_f, rtol=RTOL,
+                                   atol=_dyn_atol(ll_f))
+        np.testing.assert_allclose(d_h_2, d_h_f, rtol=RTOL,
+                                   atol=_dyn_atol(d_h_f))
+        _assert_angles_close(ang_2, ang_f)
 
     def test_get_ll_wdm_stashes_quadrature_in_model(self):
         """The engine-facing route must carry the stash on both paths."""
@@ -519,6 +546,67 @@ class _NoQuadStubEngine(TwoQuadraturePhaseMaxMixin):
         self.d_h_im_out = None          # <- no fused quadrature available
         self.phase_angle = None
         return -0.5 * (self.h_h_out - 2.0 * d_h)
+
+
+class _QuadStubEngine(_NoQuadStubEngine):
+    """Stub engine WITH the fused quadrature stash (exact analytic value)."""
+
+    def get_ll(self, buffer_aca, params_phys, *, data_index, noise_index,
+               N_vals, phase_maximize=False, return_inner_products=False,
+               waveform_kwargs):
+        ll = super().get_ll(
+            buffer_aca, params_phys, data_index=data_index,
+            noise_index=noise_index, N_vals=N_vals,
+            phase_maximize=phase_maximize,
+            return_inner_products=return_inner_products,
+            waveform_kwargs=waveform_kwargs)
+        if not phase_maximize:
+            phi = np.asarray(params_phys)[:, PHYS_IDX_PHI0]
+            self.d_h_im_out = self.R * np.cos(phi + np.pi / 2 + self.theta)
+        return ll
+
+
+class KillSwitchTest(unittest.TestCase):
+    """GB_PHASE_MAX_FUSED=0 must force the legacy two-call body even when
+    the fused stash is available -- the production rollback lever for the
+    first GPU-validated rows."""
+
+    def _run(self, env_val):
+        eng = _QuadStubEngine(R=7.5, theta=0.9, h_h=56.25)
+        params = np.zeros((4, 9))
+        params[:, PHYS_IDX_PHI0] = [0.0, 1.0, 2.5, 5.0]
+        saved = os.environ.get("GB_PHASE_MAX_FUSED")
+        try:
+            if env_val is None:
+                os.environ.pop("GB_PHASE_MAX_FUSED", None)
+            else:
+                os.environ["GB_PHASE_MAX_FUSED"] = env_val
+            ll = eng.get_ll(None, params, data_index=None, noise_index=None,
+                            N_vals=None, phase_maximize=True,
+                            waveform_kwargs={})
+        finally:
+            if saved is None:
+                os.environ.pop("GB_PHASE_MAX_FUSED", None)
+            else:
+                os.environ["GB_PHASE_MAX_FUSED"] = saved
+        return eng, np.asarray(ll)
+
+    def test_default_is_fused_single_call(self):
+        eng, ll = self._run(None)
+        self.assertEqual(eng.n_calls, 1)
+        np.testing.assert_allclose(np.asarray(eng.d_h_out),
+                                   np.full(4, 7.5), rtol=1e-12)
+
+    def test_kill_switch_forces_two_call_same_answer(self):
+        eng0, ll0 = self._run(None)
+        eng, ll = self._run("0")
+        self.assertEqual(eng.n_calls, 2,
+                         "GB_PHASE_MAX_FUSED=0 must take the two-call body")
+        np.testing.assert_allclose(ll, ll0, rtol=1e-12)
+        np.testing.assert_allclose(np.asarray(eng.d_h_out),
+                                   np.asarray(eng0.d_h_out), rtol=1e-12)
+        _assert_angles_close(np.asarray(eng.phase_angle),
+                             np.asarray(eng0.phase_angle), atol=1e-10)
 
 
 class MixinFallbackTest(unittest.TestCase):

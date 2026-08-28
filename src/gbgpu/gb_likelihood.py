@@ -9,6 +9,7 @@ old lisatools path re-exports these names through a deprecation shim.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
@@ -73,6 +74,14 @@ class SwapLLResult:
 PHYS_IDX_PHI0 = 4
 
 
+def _phase_max_fused_enabled() -> bool:
+    """GB_PHASE_MAX_FUSED=0 forces the legacy two-call phase max even when
+    the fused quadrature stash is available -- the production rollback
+    lever (read per call: negligible next to a kernel batch, and it keeps
+    the knob testable without reimports)."""
+    return os.environ.get("GB_PHASE_MAX_FUSED", "1") != "0"
+
+
 class TwoQuadraturePhaseMaxMixin:
     """Analytic phase maximisation for engines whose kernels return REAL d_h.
 
@@ -128,7 +137,8 @@ class TwoQuadraturePhaseMaxMixin:
             data_index=data_index, noise_index=noise_index, N_vals=N_vals,
             phase_maximize=False, waveform_kwargs=waveform_kwargs,
         )
-        d_h_90 = getattr(self, "d_h_im_out", None)
+        d_h_90 = (getattr(self, "d_h_im_out", None)
+                  if _phase_max_fused_enabled() else None)
         if d_h_90 is not None:
             # FUSED: quadrature came out of the same kernel call.
             d_h_0 = self.d_h_out
@@ -179,8 +189,11 @@ class TwoQuadraturePhaseMaxMixin:
             data_index=data_index, noise_index=noise_index, N_vals=N_vals,
             phase_maximize=False, waveform_kwargs=waveform_kwargs,
         )
-        d_h_add_90 = getattr(self, "swap_d_h_add_im", None)
-        hh_cross_90 = getattr(self, "swap_add_remove_im", None)
+        if _phase_max_fused_enabled():
+            d_h_add_90 = getattr(self, "swap_d_h_add_im", None)
+            hh_cross_90 = getattr(self, "swap_add_remove_im", None)
+        else:
+            d_h_add_90 = hh_cross_90 = None
         if d_h_add_90 is None or hh_cross_90 is None:
             # Legacy two-call fallback (backend without the fused outputs).
             params_q = params_add_phys.copy()
