@@ -773,7 +773,11 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         double T_chunk, double dt, double T, double t_ref, int tdi_type,
         double tukey_alpha, int grid_dim, int m_band_half_width,
         // task-b per-band slab (chunked_het.py always passes: 0 + empty = off).
-        int Nf_slab, array_type<int> slab_min_f);
+        int Nf_slab, array_type<int> slab_min_f,
+        // Basis-filter fold (chunked_het.py always passes; 0 = OFF = the
+        // default unfolded 4-generation path, bit-for-bit the pre-fold
+        // kernel). See the FOLD note in lat_chunked_het_kernels.hh.
+        int fstat_fold);
 
     // Signal-heterodyne (v2 polyphase) -- Stage 1 (CPU-only):
     // takes precomputed rfft(Tukey * td_cand) as input. Production will move

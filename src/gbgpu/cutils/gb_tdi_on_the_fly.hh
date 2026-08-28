@@ -361,7 +361,12 @@ class GBComputationGroup{
         double T_chunk, double dt, double T, double t_ref, int tdi_type,
         double tukey_alpha,
         int grid_dim, int m_band_half_width,
-        int Nf_slab = 0, int *slab_min_f = nullptr);  // task-b per-band slab
+        int Nf_slab = 0, int *slab_min_f = nullptr,   // task-b per-band slab
+        // Basis-filter fold: 0 = OFF (default; the unfolded 4-generation
+        // path, bit-for-bit the pre-fold kernel), 1 = ON (2 psi stages + an
+        // exact constant phi0 rotation). See the FOLD note in
+        // lat_chunked_het_kernels.hh.
+        int fstat_fold = 0);
 
     // Spline-path mirrors. `coarse_dt` (seconds) sets the coarse-grid spacing
     // for the cubic-spline window builder (smaller -> more accurate / more

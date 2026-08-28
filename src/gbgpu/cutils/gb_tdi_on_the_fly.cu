@@ -1987,7 +1987,8 @@ void GBComputationGroup::gb_wdm_het_get_fstat_ll_wrap(
     double T_chunk, double dt, double T, double t_ref, int tdi_type,
     double tukey_alpha,
     int grid_dim, int m_band_half_width,
-    int Nf_slab, int *slab_min_f)   // task-b per-band slab (0/null = off)
+    int Nf_slab, int *slab_min_f,   // task-b per-band slab (0/null = off)
+    int fstat_fold)                 // basis-filter fold (0 = off = default)
 {
     wdm_het_get_fstat_ll_impl<GBTDIonTheFly>(
         N_arr_re_out, N_arr_im_out, M_mat_re_out, M_mat_im_out,
@@ -2000,7 +2001,7 @@ void GBComputationGroup::gb_wdm_het_get_fstat_ll_wrap(
         nchannels, n_rfft_chunk,
         T_chunk, dt, T, t_ref, tdi_type, tukey_alpha,
         grid_dim, m_band_half_width,
-        Nf_slab, slab_min_f);
+        Nf_slab, slab_min_f, fstat_fold);
 }
 
 

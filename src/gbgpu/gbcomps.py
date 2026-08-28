@@ -84,6 +84,10 @@ class GBWDMComputations(WDMComputationsBase):
     # GBGPU's gb_wdm_het_{get_ll, swap_ll} bindings carry the trailing fused
     # phase-max quadrature arrays (see WDMComputationsBase._FUSED_QUAD_KERNELS).
     _FUSED_QUAD_KERNELS = True
+    # GBGPU's gb_wdm_het_get_fstat_ll binding carries the trailing basis-filter
+    # fold argument (see WDMComputationsBase._FSTAT_FOLD_KERNELS). The fold
+    # itself still defaults OFF -- GB_FSTAT_FOLD=1 turns it on.
+    _FSTAT_FOLD_KERNELS = True
     _WRAP_ATTR = "GBComputationGroupWrap"
     _METHOD_PREFIX = "gb_wdm_het"
     _NPARAMS = 9
