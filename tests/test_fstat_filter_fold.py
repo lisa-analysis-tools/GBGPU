@@ -23,8 +23,9 @@ Contracts pinned here:
   demonstrates this). A wrong sign would leave F and ln_snr perfect while
   silently corrupting the recovered ``(phi0_max, psi_max)`` of every F-stat
   birth.
-* **Default OFF** -- ``fstat_fold`` defaults to 0 (the unfolded path) so a plain
-  pull + rebuild changes nothing; ``GB_FSTAT_FOLD=1`` opts in.
+* **Default ON** (2026-08-28) -- ``fstat_fold`` defaults to 1. The fold is
+  exact, so it is the production path; ``GB_FSTAT_FOLD=0`` restores the
+  unfolded 4-generation path bit-for-bit as a reference.
 * **End-to-end** -- ``fstat_maximized_extrinsics`` agrees on the folded path,
   ``F`` included.
 
@@ -112,6 +113,15 @@ def build_fixture():
         force_backend=backend, d_d=0.0, tdi_type="XYZ",
     )
     chunked.convert_to_ra_dec = False
+    # Allocate through the COMP's own array module, not hard-coded numpy.
+    # ``force_backend="cpu"`` above is a request, not a guarantee: on a
+    # GPU-only install it can still resolve to a cupy-backed comp, and
+    # ``fill_global_wdm`` then asserts ``isinstance(templates,
+    # self.xp.ndarray)`` and fails in setUpClass before a single fold test
+    # runs. Building the slabs with ``chunked.xp`` makes the fixture work
+    # on either backend, which is what lets the parity gate run on the
+    # cluster GPU -- the place where it actually matters.
+    xp = chunked.xp
 
     f0_A = (int(3e-3 / layer_df) + 0.37) * layer_df
     f0_C = (int(5e-3 / layer_df) + 0.62) * layer_df
@@ -121,16 +131,16 @@ def build_fixture():
     ilo, ihi = wdm_set.ind_min_f, wdm_set.ind_max_f + 1
     slabs, invCs = [], []
     for p in (A, C):
-        h = np.zeros((3, Nf, Nt))
+        h = xp.zeros((3, Nf, Nt))
         chunked.fill_global_wdm(p[None, :], h, convert_to_ra_dec=False)
-        h_act = np.ascontiguousarray(h[:, ilo:ihi, wdm_set.active_slice_t])
+        h_act = xp.ascontiguousarray(h[:, ilo:ihi, wdm_set.active_slice_t])
         slabs.append(h_act)
         nch, nfa, nta = h_act.shape
-        invC = np.zeros((nch, nch, nfa, nta))
+        invC = xp.zeros((nch, nch, nfa, nta))
         for c in range(nch):
             invC[c, c] = 1.0
         invCs.append(invC)
-    holder = _TwoSlotHolder(np.stack(slabs), np.stack(invCs))
+    holder = _TwoSlotHolder(xp.stack(slabs), xp.stack(invCs))
 
     # Scoring batch: the two references + jittered copies spanning generic
     # phases, amplitudes and small f0 offsets (so the fold is exercised at
@@ -165,31 +175,38 @@ class FstatFilterFoldTest(unittest.TestCase):
 
     # ---- default-off contract ----------------------------------------
 
-    def test_default_is_unfolded(self):
-        """The shipped default must be the unfolded path.
+    def test_default_is_folded(self):
+        """The shipped default is now the FOLDED path (user ruling
+        2026-08-28, promoted from opt-in once parity passed on GPU).
 
-        A plain pull + rebuild has to change nothing on the cluster, so both
-        the env seed and the resolved instance attribute must read 0.
+        The fold is exact, so there is no reason to default to the slower
+        path. ``GB_FSTAT_FOLD=0`` still restores it bit-for-bit -- which is
+        what ``test_default_call_equals_explicit_off_bitwise`` and the
+        parity tests below exercise.
         """
         self.assertIsNone(os.environ.get("GB_FSTAT_FOLD"),
                           "GB_FSTAT_FOLD leaked into the test environment")
-        self.assertEqual(int(GBWDMComputations.fstat_fold), 0)
-        self.assertEqual(int(self.chunked.fstat_fold), 0)
+        self.assertEqual(int(GBWDMComputations.fstat_fold), 1)
+        self.assertEqual(int(self.chunked.fstat_fold), 1)
         # ... and that default is what an unspecified call sends to C++.
         self.assertEqual(
-            self.chunked._fstat_fold_kernel_args(None), (0,))
+            self.chunked._fstat_fold_kernel_args(None), (1,))
         self.assertEqual(
             self.chunked._fstat_fold_kernel_args(1), (1,))
 
-    def test_default_call_equals_explicit_off_bitwise(self):
-        """``fstat_fold=None`` must resolve to the same kernel path as 0.
+    def test_default_call_equals_the_default_path_bitwise(self):
+        """``fstat_fold=None`` must resolve to the SHIPPED default path.
 
-        Bit equality is required here (same branch, same arithmetic) -- this
-        is what makes the golden captured against the pre-change binary a
-        valid proof for the default call path too.
+        Bit equality is required here (same branch, same arithmetic), so
+        an unspecified call is provably the same code as an explicit one.
+        The default is now 1 (2026-08-28); ``_fstat_fold_kernel_args`` is
+        the single place that resolves None, and this pins that it agrees
+        with what the kernel actually runs rather than only with the
+        attribute.
         """
+        default = int(self.chunked._fstat_fold_kernel_args(None)[0])
         N_d, M_d = self._NM(None)
-        N_0, M_0 = self._NM(0)
+        N_0, M_0 = self._NM(default)
         np.testing.assert_array_equal(np.asarray(N_d), np.asarray(N_0))
         np.testing.assert_array_equal(np.asarray(M_d), np.asarray(M_0))
 
