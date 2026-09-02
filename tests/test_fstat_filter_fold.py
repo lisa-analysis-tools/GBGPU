@@ -110,7 +110,13 @@ def build_fixture():
     Module-level (not just a ``setUpClass``) so the golden-capture script used
     for the bit-identity regression can build the IDENTICAL batch.
     """
-    backend = "cpu"
+    # "cpu" is a REQUEST, not a guarantee (see the slab comment below): on a
+    # GPU-only install the comp still resolves to cupy, which is how the
+    # 08-28 fold parity ran on the cluster. On a DUAL-backend install the
+    # request wins, so to deliberately validate the GPU kernel set
+    # GB_FSTAT_FOLD_TEST_BACKEND=gpu (or cuda12x) -- every gate below is
+    # backend-agnostic already.
+    backend = os.environ.get("GB_FSTAT_FOLD_TEST_BACKEND", "cpu")
     dt = 10.0
     Nf, Nt = 256, 512
     t_start = int(0.5 * YRSID_SI / dt) * dt
