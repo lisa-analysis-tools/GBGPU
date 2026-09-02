@@ -481,7 +481,8 @@ void GBComputationGroupWrap::gb_wdm_het_get_fstat_ll(
     double T_chunk, double dt, double T, double t_ref, int tdi_type,
     double tukey_alpha, int grid_dim, int m_band_half_width,
     int Nf_slab, array_type<int> slab_min_f,   // task-b per-band slab (0/empty = off)
-    int fstat_fold)                            // basis-filter fold (0 = off = default)
+    int fstat_fold,                            // basis-filter fold (0 = off = default)
+    int N_cp_orbit)                            // orbit spline cache (0 = off = default)
 {
     // Task-b: per-band slab covers Nf_slab layers (full Nf_active when Nf_slab<=0).
     // The data_d/invC per-slab size checks below key off this extent.
@@ -529,7 +530,7 @@ void GBComputationGroupWrap::gb_wdm_het_get_fstat_ll(
         Nf_slab,
         (slab_min_f.size() > 0
              ? return_pointer(slab_min_f, "slab_min_f") : nullptr),
-        fstat_fold);
+        fstat_fold, N_cp_orbit);
 }
 
 
@@ -1375,7 +1376,10 @@ void gbgpu_part(nb::module_ &m) {
          "(WDM coefficients are real). Trailing fstat_fold: 0 = OFF "
          "(default; 4 independent basis generations, bit-for-bit the "
          "pre-fold kernel), 1 = fold to the 2 psi stages + an exact "
-         "constant phi0 rotation (same (N, M) to FP reassociation).")
+         "constant phi0 rotation (same (N, M) to FP reassociation). "
+         "Trailing N_cp_orbit: 0 = direct orbit lookups (default); > 0 "
+         "routes the basis TD-builds through the same per-chunk shared-mem "
+         "orbit spline cache get_ll uses.")
     .def("gb_signal_het_get_ll", &GBComputationGroupWrap::gb_signal_het_get_ll,
          "Signal-heterodyne (v2 polyphase) get_ll. Takes precomputed "
          "rfft(Tukey*td) per binary plus reference c0_sparse/A0/A1/B0/B1; "

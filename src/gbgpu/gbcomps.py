@@ -93,6 +93,12 @@ class GBWDMComputations(WDMComputationsBase):
     # STALE .so is a loud TypeError at the first F-stat call (the trailing arg
     # is passed unconditionally, fold on or off) rather than a silent no-op.
     _FSTAT_FOLD_KERNELS = True
+    # Same contract for the trailing N_cp_orbit arg (orbit spline cache,
+    # 2026-09-01): hard constant, passed unconditionally (cache on or off), so
+    # a stale .so is again a loud TypeError -- which also makes THIS rebuild
+    # boundary loud for the whole 09-01 kernel batch (per-m fold completion +
+    # invC hoist ride the same recompile).
+    _FSTAT_ORBIT_CACHE_KERNELS = True
     _WRAP_ATTR = "GBComputationGroupWrap"
     _METHOD_PREFIX = "gb_wdm_het"
     _NPARAMS = 9

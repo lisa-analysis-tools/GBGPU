@@ -366,7 +366,13 @@ class GBComputationGroup{
         // path, bit-for-bit the pre-fold kernel), 1 = ON (2 psi stages + an
         // exact constant phi0 rotation). See the FOLD note in
         // lat_chunked_het_kernels.hh.
-        int fstat_fold = 0);
+        int fstat_fold = 0,
+        // Orbit spline-cache density per chunk (0 = direct orbit lookups;
+        // the pre-cache behaviour). Same contract as get_ll's N_cp_orbit:
+        // > 0 routes the basis TD-builds through the shared-mem cubic
+        // spline cache, so the F-stat scores with the same orbit
+        // approximation as the likelihood.
+        int N_cp_orbit = 0);
 
     // Spline-path mirrors. `coarse_dt` (seconds) sets the coarse-grid spacing
     // for the cubic-spline window builder (smaller -> more accurate / more

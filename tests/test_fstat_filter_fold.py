@@ -322,6 +322,63 @@ class FstatFilterFoldTest(unittest.TestCase):
         self.assertTrue(np.all(np.abs(ALPHA) == 1.0))
         self.assertNotEqual(np.cos(3.0 * np.pi / 2.0), 0.0)
 
+    # ---- orbit spline cache (2026-09-01 port) -------------------------
+
+    def _NM_with_orbit_cache(self, n_cp, armed=True):
+        """(N, M) with the comp's ``N_cp_orbit`` / arm switch temporarily set.
+
+        Both are read at CALL time by ``_fstat_orbit_cache_kernel_args``, so a
+        set/restore around one call is the whole mechanism -- no rebuild.
+        """
+        saved = (self.chunked.N_cp_orbit, self.chunked.fstat_orbit_cache)
+        try:
+            self.chunked.N_cp_orbit = int(n_cp)
+            self.chunked.fstat_orbit_cache = 1 if armed else 0
+            return self._NM(1)   # folded = the production path
+        finally:
+            self.chunked.N_cp_orbit, self.chunked.fstat_orbit_cache = saved
+
+    def test_orbit_cache_matches_direct_NM(self):
+        """Cached orbit evals reproduce direct lookups on (N, M).
+
+        Unlike the fold this is an APPROXIMATION (per-chunk cubic spline of
+        the orbit tables), but get_ll's contract is that at N_cp_orbit >= 32
+        the LTT/position residuals sit below float64 precision over typical
+        chunk lengths -- so the SAME fold-parity tolerance must hold. Signed
+        per-element compare, same reasoning as the fold gate.
+        """
+        N_d, M_d = self._NM_with_orbit_cache(0)
+        N_c, M_c = self._NM_with_orbit_cache(32)
+        # Guard against a silently-ignored N_cp_orbit: the spline is an
+        # approximation, so SOMEWHERE in the batch it must differ from the
+        # direct path in the last bits. Bitwise equality everywhere means the
+        # kernel never engaged the cache and this test is blind.
+        self.assertTrue(
+            np.any(np.asarray(N_c) != np.asarray(N_d))
+            or np.any(np.asarray(M_c) != np.asarray(M_d)),
+            "cached == direct BITWISE everywhere -- orbit cache never engaged")
+        np.testing.assert_allclose(
+            np.asarray(N_c), np.asarray(N_d), rtol=RTOL,
+            atol=_dyn_atol(np.asarray(N_d)),
+            err_msg="orbit-cached N != direct N")
+        np.testing.assert_allclose(
+            np.asarray(M_c), np.asarray(M_d), rtol=RTOL,
+            atol=_dyn_atol(np.asarray(M_d)),
+            err_msg="orbit-cached M != direct M")
+
+    def test_orbit_cache_disarm_is_bitwise_off(self):
+        """``fstat_orbit_cache = 0`` forces the kernel's direct-lookup path.
+
+        With the arm switch off the python layer passes N_cp_orbit = 0
+        regardless of the comp's setting, so the result must be BITWISE equal
+        to a plain N_cp_orbit = 0 call -- same code path, not merely close.
+        This is the ``GB_FSTAT_ORBIT_CACHE=0`` safety valve.
+        """
+        N_0, M_0 = self._NM_with_orbit_cache(0)
+        N_x, M_x = self._NM_with_orbit_cache(32, armed=False)
+        np.testing.assert_array_equal(np.asarray(N_x), np.asarray(N_0))
+        np.testing.assert_array_equal(np.asarray(M_x), np.asarray(M_0))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -777,7 +777,11 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         // Basis-filter fold (chunked_het.py always passes; 0 = OFF = the
         // default unfolded 4-generation path, bit-for-bit the pre-fold
         // kernel). See the FOLD note in lat_chunked_het_kernels.hh.
-        int fstat_fold);
+        int fstat_fold,
+        // Orbit spline-cache density per chunk (chunked_het.py always
+        // passes; 0 = direct orbit lookups). Same contract as get_ll's
+        // N_cp_orbit.
+        int N_cp_orbit);
 
     // Signal-heterodyne (v2 polyphase) -- Stage 1 (CPU-only):
     // takes precomputed rfft(Tukey * td_cand) as input. Production will move
