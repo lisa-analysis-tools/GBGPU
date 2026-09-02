@@ -2,7 +2,7 @@ from ast import Mod
 import numpy as np
 import warnings
 
-from lisatools.utils.constants import *
+from lisatools.utils.constants import MSUN_SI, G_SI, C_SI, PC_SI, fstar, YRSID_SI
 
 try:
     from lisatools import sensitivity as tdi
@@ -201,7 +201,7 @@ def get_chirp_mass_from_f_fdot(f, fdot):
     return Mc
 
 
-def get_N(amp, f0, Tobs, oversample=1):
+def get_N(amp, f0, Tobs, oversample=1, armlength=None):
     """Determine sampling rate for slow part of FastGB waveform.
 
     Args:
@@ -211,11 +211,17 @@ def get_N(amp, f0, Tobs, oversample=1):
         oversample (int, optional): Oversampling factor. This function will return
             ``oversample * N``, if N is the determined sample number.
             (Default: ``1``).
+        armlength (double, optional): Constellation arm length in meters, used for the
+            transfer frequency. If ``None``, uses the nominal LISA value. Pass
+            ``orbits.armlength`` for L1 or Mojito orbits, whose arm length differs.
+            (Default: ``None``).
 
     Returns:
         int xp.ndarray: N values for each binary entered.
 
     """
+    # The transfer frequency must follow the orbits in use, not the nominal constant.
+    transfer_freq = fstar if armlength is None else C_SI / (armlength * 2 * np.pi)
 
     # make sure they are arrays
     amp = np.atleast_1d(amp)
@@ -251,7 +257,7 @@ def get_N(amp, f0, Tobs, oversample=1):
     # if a sensitivity curve is available, verify the SNR is not too high
     # if it is, needs more points
     if tdi_available:
-        fonfs = f0 / fstar
+        fonfs = f0 / transfer_freq
 
         SnX = np.sqrt(tdi.X1TDISens.get_Sn(f0))
 
@@ -277,10 +283,11 @@ def get_N(amp, f0, Tobs, oversample=1):
     Nmax = 2048
     N_out = np.minimum(N_out, Nmax)
 
-    if np.any(N_out) == 0:
-        breakpoint()
+    # np.any(N_out) == 0 tested whether every entry was zero, not whether any was.
+    if np.any(N_out == 0):
+        raise ValueError("get_N produced zero-length waveforms for at least one binary.")
 
-    return N_out    
+    return N_out
 
 
 def cuda_set_device(dev):
