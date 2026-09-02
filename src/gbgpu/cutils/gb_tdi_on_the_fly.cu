@@ -6729,8 +6729,19 @@ void gb_signal_het_fstat_score_one_source(
                               b, N_sparse_t, Dn, &r, &dr);
             f_st[st] = A0_all[coef_i] * r + A1_all[coef_i] * dr;
         }
-        for (int fi = 0; fi < GB_FSTAT_N_FILTERS; ++fi)
-            N_partial[fi] += (alpha[fi] * f_st[s_of[fi]]).real();
+        if (n_stages == 2) {
+            // Folded: alpha = {+1, -1, +i, -i} on stages {0, 1, 0, 1},
+            // applied as EXACT component picks (Re(i z) = -Im z). Replaces
+            // 4 complex multiplies per pixel by cos/sin-valued constants --
+            // and removes their cos(3pi/2) = -1.8e-16 impurity while at it.
+            N_partial[0] += f_st[0].real();
+            N_partial[1] -= f_st[1].real();
+            N_partial[2] -= f_st[0].imag();
+            N_partial[3] += f_st[1].imag();
+        } else {
+            for (int fi = 0; fi < GB_FSTAT_N_FILTERS; ++fi)
+                N_partial[fi] += (alpha[fi] * f_st[s_of[fi]]).real();
+        }
     }
 
     if (tdi_type == 0)
@@ -6770,6 +6781,65 @@ void gb_signal_het_fstat_score_one_source(
             if (project_real) {
                 b0n = B0nc_all[coef_i];
                 b1n = B1nc_all[coef_i];
+            }
+            if (n_stages == 2) {
+                // ---- folded fast path (EXACT restructure) -------------
+                // The pair loop's expensive core
+                //   K(si,sj) = b0 conj(r1_si) r2_sj
+                //            + b1 (conj(r1_si) dr2_sj + conj(dr1_si) r2_sj)
+                // takes only the 4 (si,sj) stage combos, but the generic
+                // loop computed it 10x (once per filter pair) and rotated
+                // each by conj(alpha_i) alpha_j. Compute the 4 cores once;
+                // every pair is then a signed Re/Im pick, since folded
+                // conj(alpha_i) alpha_j is in {+1, -1, +i, -i} (component
+                // picks are exact -- no cos/sin constants). The anomalous
+                // (project_real) part rotates by alpha_i alpha_j instead,
+                // hence its OWN pick table: pairs (2,2), (2,3), (3,3)
+                // carry the b0/b1 core with the SAME sign as (0,0), (0,1),
+                // (1,1) but the ANOMALOUS core with the OPPOSITE sign --
+                // exactly the complex-Gram structure. Do NOT "simplify"
+                // the two tables into one. gb_sighet_fstat_parity.py
+                // (folded vs 4-filter mode) is the gate.
+                cmplx K[2][2];
+                for (int si = 0; si < 2; ++si)
+                    for (int sj = 0; sj < 2; ++sj)
+                        K[si][sj] =
+                            b0 * (gcmplx::conj(r1[si]) * r2[sj])
+                            + b1 * (gcmplx::conj(r1[si]) * dr2[sj]
+                                    + gcmplx::conj(dr1[si]) * r2[sj]);
+                double v10[GB_FSTAT_N_M_UPPER];
+                v10[0] =  K[0][0].real();
+                v10[1] = -K[0][1].real();
+                v10[2] = -K[0][0].imag();
+                v10[3] =  K[0][1].imag();
+                v10[4] =  K[1][1].real();
+                v10[5] =  K[1][0].imag();
+                v10[6] = -K[1][1].imag();
+                v10[7] =  K[0][0].real();
+                v10[8] = -K[0][1].real();
+                v10[9] =  K[1][1].real();
+                if (project_real) {
+                    cmplx Kn[2][2];
+                    for (int si = 0; si < 2; ++si)
+                        for (int sj = 0; sj < 2; ++sj)
+                            Kn[si][sj] =
+                                b0n * (r1[si] * r2[sj])
+                                + b1n * (r1[si] * dr2[sj]
+                                         + dr1[si] * r2[sj]);
+                    v10[0] += Kn[0][0].real();
+                    v10[1] -= Kn[0][1].real();
+                    v10[2] -= Kn[0][0].imag();
+                    v10[3] += Kn[0][1].imag();
+                    v10[4] += Kn[1][1].real();
+                    v10[5] += Kn[1][0].imag();
+                    v10[6] -= Kn[1][1].imag();
+                    v10[7] -= Kn[0][0].real();
+                    v10[8] += Kn[0][1].real();
+                    v10[9] -= Kn[1][1].real();
+                }
+                for (int k = 0; k < GB_FSTAT_N_M_UPPER; ++k)
+                    M_partial[k] += v10[k];
+                continue;
             }
             for (int fi = 0; fi < GB_FSTAT_N_FILTERS; ++fi) {
                 for (int fj = fi; fj < GB_FSTAT_N_FILTERS; ++fj) {
@@ -6818,6 +6888,53 @@ void gb_signal_het_fstat_score_one_source(
             if (project_real) {
                 b0n = B0nc_all[coef_i];
                 b1n = B1nc_all[coef_i];
+            }
+            if (n_stages == 2) {
+                // Folded fast path -- identical restructure and pick
+                // tables to the TDI_XYZ branch above (see its comment),
+                // with r1/dr1 on both sides. K(0,1) != K(1,0) still (the
+                // conj sits on the FIRST argument), so all 4 cores are
+                // needed here too.
+                cmplx K[2][2];
+                for (int si = 0; si < 2; ++si)
+                    for (int sj = 0; sj < 2; ++sj)
+                        K[si][sj] =
+                            b0 * (gcmplx::conj(r1[si]) * r1[sj])
+                            + b1 * (gcmplx::conj(r1[si]) * dr1[sj]
+                                    + gcmplx::conj(dr1[si]) * r1[sj]);
+                double v10[GB_FSTAT_N_M_UPPER];
+                v10[0] =  K[0][0].real();
+                v10[1] = -K[0][1].real();
+                v10[2] = -K[0][0].imag();
+                v10[3] =  K[0][1].imag();
+                v10[4] =  K[1][1].real();
+                v10[5] =  K[1][0].imag();
+                v10[6] = -K[1][1].imag();
+                v10[7] =  K[0][0].real();
+                v10[8] = -K[0][1].real();
+                v10[9] =  K[1][1].real();
+                if (project_real) {
+                    cmplx Kn[2][2];
+                    for (int si = 0; si < 2; ++si)
+                        for (int sj = 0; sj < 2; ++sj)
+                            Kn[si][sj] =
+                                b0n * (r1[si] * r1[sj])
+                                + b1n * (r1[si] * dr1[sj]
+                                         + dr1[si] * r1[sj]);
+                    v10[0] += Kn[0][0].real();
+                    v10[1] -= Kn[0][1].real();
+                    v10[2] -= Kn[0][0].imag();
+                    v10[3] += Kn[0][1].imag();
+                    v10[4] += Kn[1][1].real();
+                    v10[5] += Kn[1][0].imag();
+                    v10[6] -= Kn[1][1].imag();
+                    v10[7] -= Kn[0][0].real();
+                    v10[8] += Kn[0][1].real();
+                    v10[9] -= Kn[1][1].real();
+                }
+                for (int k = 0; k < GB_FSTAT_N_M_UPPER; ++k)
+                    M_partial[k] += v10[k];
+                continue;
             }
             for (int fi = 0; fi < GB_FSTAT_N_FILTERS; ++fi) {
                 for (int fj = fi; fj < GB_FSTAT_N_FILTERS; ++fj) {
