@@ -1417,7 +1417,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         
         # Solve M * a = N for maximum-likelihood amplitude vector a_i
         # Avoiding explicit matrix inversion M^{-1} reduces numerical error
-        a_coeffs = self.xp.linalg.solve(M_mat, N_arr)
+        a_coeffs = self.xp.linalg.solve(M_mat, N_arr[..., None])[..., 0]
 
         # Profile log-likelihood: F = 1/2 * (a . N) = 1/2 * (N^T * M^{-1} * N)
         fstat_logl = 0.5 * self.xp.sum(a_coeffs * N_arr, axis=-1)
@@ -1448,7 +1448,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
         self.A_max = 0.5 * two_amp
         cos_iota = self.xp.clip(-amp_cross / two_amp, -1.0, 1.0)
-        self.iota_max = self.xp.arccos(cos_iota) % np.pi
+        self.iota_max = self.xp.arccos(cos_iota)
 
         # Decoupled phase angles:
         #   theta_minus = atan2(u_sin_minus, u_cos_minus) = 2*psi - phi0
