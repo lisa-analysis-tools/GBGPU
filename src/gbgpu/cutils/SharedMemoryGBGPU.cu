@@ -19,11 +19,61 @@
 #include <vector>
 #include <complex>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 
 // # TODO: remove this
 CUDA_CALLABLE_MEMBER double Clight = 299792458.0;
 using namespace std;
+
+#ifdef __CUDACC__
+#define GBGPU_REPORT_RANGE_ERROR(where, index_value, limit_value)                 \
+    printf("%s: index %d outside [0, %d)\n", where, (int)(index_value), (int)(limit_value))
+#else
+#define GBGPU_REPORT_RANGE_ERROR(where, index_value, limit_value)                 \
+    throw std::runtime_error(std::string(where) + ": index " +                     \
+                             std::to_string((long long)(index_value)) +            \
+                             " outside [0, " +                                     \
+                             std::to_string((long long)(limit_value)) + ")")
+#endif
+
+// Every tree reduction here steps s = 1, 2, 4, ... and reads arr[tid + s], which is
+// only correct for a power-of-two block. Assert it where FFT is in scope.
+#ifdef __CUDACC__
+#define GBGPU_ASSERT_REDUCIBLE_BLOCK(FFT_TYPE)                                    \
+    static_assert((FFT_TYPE::block_dim.x & (FFT_TYPE::block_dim.x - 1)) == 0,     \
+                  "block_dim.x must be a power of two for the tree reductions")
+#else
+#define GBGPU_ASSERT_REDUCIBLE_BLOCK(FFT_TYPE)
+#endif
+
+// build_single_waveform packs X, Y and Z at stride N and runs one in-place transform
+// per channel, so each transform must fit inside its own N elements. cuFFTDx is free
+// to need more than N * sizeof(cmplx), in which case the X transform would overwrite
+// Y and the Z transform would run past the end of the allocation.
+#ifdef __CUDACC__
+#define GBGPU_ASSERT_FFT_FITS_CHANNEL(FFT_TYPE, N_VALUE)                          \
+    static_assert(FFT_TYPE::shared_memory_size <= (N_VALUE) * sizeof(cmplx),      \
+                  "cuFFTDx needs more shared memory per transform than one channel " \
+                  "holds, so the three channels would overlap. Space X, Y and Z by " \
+                  "max(N, FFT::shared_memory_size / sizeof(cmplx)) and size every "  \
+                  "shared_memory_size_mine to match.")
+#else
+#define GBGPU_ASSERT_FFT_FITS_CHANNEL(FFT_TYPE, N_VALUE)
+#endif
+
+#ifndef __CUDACC__
+
+static void check_host_waveform_length(int N)
+{
+    if ((N < 32) || (N > 2048) || ((N & (N - 1)) != 0))
+    {
+        throw std::invalid_argument(
+            "N must be a power of 2 between 32 and 2048, received " + std::to_string(N) + ".");
+    }
+}
+#endif
 
 // Recursive FFT function
 vector<cmplx> fft(const vector<cmplx>& x) {
@@ -155,7 +205,7 @@ template <class FFT>
 CUDA_DEVICE
 void build_single_waveform(
     cmplx *wave,
-    unsigned int *start_ind,
+    int *start_ind,
     double amp,
     double f0,
     double fdot0,
@@ -390,6 +440,8 @@ void build_single_waveform(
         omL = f / f_star;
         SomL = sin(omL);
         fctr = gcmplx::exp(-I * omL);
+        // ! amp is divided out here for dynamic range and restored after the FFT, so
+        // ! amp must be strictly positive. amp = 0 yields NaN, not a zero waveform.
         fctr2 = 4.0 * omL * SomL * fctr / amp;
 
         double w_val = get_window_val(i, N, window_type, window_alpha);
@@ -416,8 +468,12 @@ void build_single_waveform(
     CUDA_SYNCTHREADS;
 
     #ifdef __CUDACC__
+    // Each execute cooperates across the whole block, so the transforms must be
+    // separated rather than allowed to overlap.
     FFT().execute(reinterpret_cast<void *>(X));
+    CUDA_SYNCTHREADS;
     FFT().execute(reinterpret_cast<void *>(Y));
+    CUDA_SYNCTHREADS;
     FFT().execute(reinterpret_cast<void *>(Z));
     #else
     std::vector<cmplx> vecX(X, X + N);
@@ -485,6 +541,8 @@ void build_single_waveform(
         Z[i] = tmp2_switch * fctr3;
     }
 
+    CUDA_SYNCTHREADS;
+
     // convert to A, E, T (they sit in X,Y,Z)
     if ((tdi_channel_setup == TDI_CHANNEL_SETUP_AET) || (tdi_channel_setup == TDI_CHANNEL_SETUP_AE))
     {
@@ -536,7 +594,7 @@ void get_waveform(
     if (tdi_channel_setup == TDI_CHANNEL_SETUP_AE)
         nchannels = 2;
 
-    unsigned int start_ind = 0;
+    int start_ind = 0;
 
 #ifdef __CUDACC__
     extern __shared__ unsigned char shared_mem[];
@@ -622,6 +680,8 @@ void get_waveform_wrap(InputInfo inputs)
 
     using FFT = decltype(Block() + Size<N>() + Type<fft_type::c2c>() + Direction<fft_direction::forward>() +
                          Precision<double>() + ElementsPerThread<8>() + FFTsPerBlock<1>() + SM<Arch>());
+    GBGPU_ASSERT_FFT_FITS_CHANNEL(FFT, N);
+
     using complex_type = cmplx;
 
     // Allocate managed memory for input/output
@@ -768,6 +828,9 @@ void SharedMemoryWaveComp(
     // const unsigned int arch = example::get_cuda_device_arch();
     // simple_block_fft<800>(x);
 #else
+    // The host FFT is radix-2 only, so reject sizes the device build would refuse.
+    check_host_waveform_length(inputs.N);
+
     get_waveform(
         inputs.tdi_out,
         inputs.start_inds_out,
@@ -829,32 +892,28 @@ void add_inner_product_contribution(
     // Local registers to optimize and bound global memory fetches
     cmplx h1_v[3] = {0.0, 0.0, 0.0};
     cmplx h2_v[3] = {0.0, 0.0, 0.0};
-    bool valid = true;
 
-    // int nchannels = 3;
-    // double multi_factor = 1.0;
-    // cmplx h1_i, h2_i;
-    // double n;
-    // if (tdi_channel_setup == TDI_CHANNEL_SETUP_AE) nchannels = 2;
-    
+    int data_range = nchannels * data_length * num_data;
+    int template_range = nchannels * N;
+
     // gather values for all channels
     for (int chan = 0; chan < nchannels; chan += 1)
     {
         if (array_type_1 == ARRAY_TYPE_DATA)
-        {  
+        {
             int data_ind_now = (data_ind * nchannels + chan) * data_length + i_1;
-            if ((data_ind_now >= nchannels * data_length * num_data) || (i_1 > data_length) || (i_1 < 0))
+            if ((i_1 < 0) || (i_1 >= data_length) || (data_ind_now < 0) || (data_ind_now >= data_range))
             {
-                printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_1, data_length);
+                GBGPU_REPORT_RANGE_ERROR("add_inner_product_contribution data h1", data_ind_now, data_range);
             }
             else h1_v[chan] = h1[data_ind_now];
         }
         else
         {
             int template_ind_now = chan * N + i_1;
-            if ((template_ind_now >= nchannels * N) || (i_1 > N))
+            if ((i_1 < 0) || (i_1 >= N))
             {
-                printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, nchannels * N, i_1, N);
+                GBGPU_REPORT_RANGE_ERROR("add_inner_product_contribution template h1", template_ind_now, template_range);
             }
             else h1_v[chan] = h1[template_ind_now];
         }
@@ -862,18 +921,18 @@ void add_inner_product_contribution(
         if (array_type_2 == ARRAY_TYPE_DATA)
         {
             int data_ind_now = (data_ind * nchannels + chan) * data_length + i_2;
-            if ((data_ind_now >= nchannels * data_length * num_data) || (i_2 > data_length))
+            if ((i_2 < 0) || (i_2 >= data_length) || (data_ind_now < 0) || (data_ind_now >= data_range))
             {
-                printf("Above full data range. %d, %d, %d, %d\n", data_ind_now, nchannels * data_length * num_data, i_2, data_length);
+                GBGPU_REPORT_RANGE_ERROR("add_inner_product_contribution data h2", data_ind_now, data_range);
             }
             else h2_v[chan] = h2[data_ind_now];
         }
         else
         {
             int template_ind_now = chan * N + i_2;
-            if ((template_ind_now >= nchannels * N) || (i_2 > N))
+            if ((i_2 < 0) || (i_2 >= N))
             {
-                printf("Above full template range. %d, %d, %d, %d\n", template_ind_now, nchannels * N, i_2, N);
+                GBGPU_REPORT_RANGE_ERROR("add_inner_product_contribution template h2", template_ind_now, template_range);
             }
             else h2_v[chan] = h2[template_ind_now];
         }
@@ -882,40 +941,42 @@ void add_inner_product_contribution(
 
     if ((tdi_channel_setup == TDI_CHANNEL_SETUP_AE) || (tdi_channel_setup == TDI_CHANNEL_SETUP_AET))
     {
+        int noise_range = nchannels * data_length * num_noise;
         for (int chan = 0; chan < nchannels; chan += 1)
         {
             int noise_ind_now = (noise_ind * nchannels + chan) * data_length + noise_i;
-            if ((noise_ind_now >= nchannels * data_length * num_noise) || (noise_i > data_length))
+            if ((noise_i < 0) || (noise_i >= data_length) || (noise_ind_now < 0) || (noise_ind_now >= noise_range))
             {
-                printf("Above full noise range.%d, %d, %d, %d\n", noise_ind_now, nchannels * data_length * num_noise, noise_i, data_length);
+                GBGPU_REPORT_RANGE_ERROR("add_inner_product_contribution noise", noise_ind_now, noise_range);
                 continue;
             }
-            
-            cmplx n = noise[noise_ind_now];
 
-            *contrib_h1_h1 += (gcmplx::conj(h1_v[chan]) * h1_v[chan] * n);
-            *contrib_h2_h2 += (gcmplx::conj(h2_v[chan]) * h2_v[chan] * n);
-            *contrib_h1_h2 += (gcmplx::conj(h1_v[chan]) * h2_v[chan] * n);
+            cmplx noise_val = noise[noise_ind_now];
+
+            *contrib_h1_h1 += (gcmplx::conj(h1_v[chan]) * h1_v[chan] * noise_val);
+            *contrib_h2_h2 += (gcmplx::conj(h2_v[chan]) * h2_v[chan] * noise_val);
+            *contrib_h1_h2 += (gcmplx::conj(h1_v[chan]) * h2_v[chan] * noise_val);
         }
     }
     else
     {
+        int noise_range = nchannels * nchannels * data_length * num_noise;
         for (int chan_1 = 0; chan_1 < nchannels; chan_1 += 1)
         {
             for (int chan_2 = 0; chan_2 < nchannels; chan_2 += 1)
             {
                 int noise_ind_now = ((noise_ind * nchannels + chan_1) * nchannels + chan_2) * data_length + noise_i;
-                if ((noise_ind_now >= nchannels * nchannels * data_length * num_noise) || (noise_i > data_length))
+                if ((noise_i < 0) || (noise_i >= data_length) || (noise_ind_now < 0) || (noise_ind_now >= noise_range))
                 {
-                    printf("Above full noise range.%d, %d, %d, %d\n", noise_ind_now, nchannels * nchannels * data_length * num_noise, noise_i, data_length);
+                    GBGPU_REPORT_RANGE_ERROR("add_inner_product_contribution noise", noise_ind_now, noise_range);
                     continue;
                 }
-                
-                cmplx n = noise[noise_ind_now]; 
 
-                *contrib_h1_h1 += (gcmplx::conj(h1_v[chan_1]) * h1_v[chan_2] * n);
-                *contrib_h2_h2 += (gcmplx::conj(h2_v[chan_1]) * h2_v[chan_2] * n);
-                *contrib_h1_h2 += (gcmplx::conj(h1_v[chan_1]) * h2_v[chan_2] * n);
+                cmplx noise_val = noise[noise_ind_now];
+
+                *contrib_h1_h1 += (gcmplx::conj(h1_v[chan_1]) * h1_v[chan_2] * noise_val);
+                *contrib_h2_h2 += (gcmplx::conj(h2_v[chan_1]) * h2_v[chan_2] * noise_val);
+                *contrib_h1_h2 += (gcmplx::conj(h1_v[chan_1]) * h2_v[chan_2] * noise_val);
             }
         }
     }
@@ -958,7 +1019,7 @@ void get_ll(
 {
     using complex_type = cmplx;
 
-    unsigned int start_ind = 0;
+    int start_ind = 0;
 
 #ifdef __CUDACC__
     extern __shared__ unsigned char shared_mem[];
@@ -971,7 +1032,7 @@ void get_ll(
     cmplx _d_h_temp[1];
     cmplx *d_h_temp = &_d_h_temp[0];
     cmplx _h_h_temp[1];
-    cmplx *h_h_temp = &_d_h_temp[0];
+    cmplx *h_h_temp = &_h_h_temp[0];
 #endif
     int nchannels = 3;
     if (tdi_channel_setup == TDI_CHANNEL_SETUP_AE)
@@ -1114,6 +1175,8 @@ void get_ll_wrap(InputInfo inputs)
 
     using FFT = decltype(Block() + Size<N>() + Type<fft_type::c2c>() + Direction<fft_direction::forward>() +
                          Precision<double>() + ElementsPerThread<8>() + FFTsPerBlock<1>() + SM<Arch>());
+    GBGPU_ASSERT_FFT_FITS_CHANNEL(FFT, N);
+
     using complex_type = cmplx;
 
     // Allocate managed memory for input/output
@@ -1124,6 +1187,8 @@ void get_ll_wrap(InputInfo inputs)
     auto shared_memory_size = std::max((unsigned int)FFT::shared_memory_size, (unsigned int)size_bytes);
 
     // first is waveforms, second is d_h_temp and h_h_temp
+    GBGPU_ASSERT_REDUCIBLE_BLOCK(FFT);
+
     auto shared_memory_size_mine = 3 * N * sizeof(cmplx) + 2 * FFT::block_dim.x * sizeof(cmplx);
     // std::cout << "input [1st FFT]:\n" << size  << "  " << size_bytes << "  " << FFT::shared_memory_size << std::endl;
     // for (size_t i = 0; i < cufftdx::size_of<FFT>::value; i++) {
@@ -1290,6 +1355,9 @@ void SharedMemoryLikeComp(
     }
     }
 #else
+    // The host FFT is radix-2 only, so reject sizes the device build would refuse.
+    check_host_waveform_length(inputs.N);
+
     get_ll(
         inputs.d_h,
         inputs.h_h,
@@ -1384,8 +1452,8 @@ void get_swap_ll_diff(
 {
     using complex_type = cmplx;
 
-    unsigned int start_ind_add = 0;
-    unsigned int start_ind_remove = 0;
+    int start_ind_add = 0;
+    int start_ind_remove = 0;
 
 #ifdef __CUDACC__
     extern __shared__ unsigned char shared_mem[];
@@ -1882,6 +1950,8 @@ void get_swap_ll_diff_wrap(InputInfo inputs)
 
     using FFT = decltype(Block() + Size<N>() + Type<fft_type::c2c>() + Direction<fft_direction::forward>() +
                          Precision<double>() + ElementsPerThread<8>() + FFTsPerBlock<1>() + SM<Arch>());
+    GBGPU_ASSERT_FFT_FITS_CHANNEL(FFT, N);
+
     using complex_type = cmplx;
 
     // Allocate managed memory for input/output
@@ -1892,6 +1962,8 @@ void get_swap_ll_diff_wrap(InputInfo inputs)
     auto shared_memory_size = std::max((unsigned int)FFT::shared_memory_size, (unsigned int)size_bytes);
 
     // first is waveforms, second is d_h_temp and h_h_temp
+    GBGPU_ASSERT_REDUCIBLE_BLOCK(FFT);
+
     auto shared_memory_size_mine = 3 * N * sizeof(cmplx) + 3 * N * sizeof(cmplx) + 5 * FFT::block_dim.x * sizeof(cmplx);
     // std::cout << "input [1st FFT]:\n" << size  << "  " << size_bytes << "  " << FFT::shared_memory_size << std::endl;
     // for (size_t i = 0; i < cufftdx::size_of<FFT>::value; i++) {
@@ -2094,6 +2166,9 @@ void SharedMemorySwapLikeComp(
     }
     }
 #else
+    // The host FFT is radix-2 only, so reject sizes the device build would refuse.
+    check_host_waveform_length(inputs.N);
+
     get_swap_ll_diff(
         inputs.d_h_remove,
         inputs.d_h_add,
@@ -2186,8 +2261,8 @@ void get_chi_squared(
 {
     using complex_type = cmplx;
 
-    unsigned int start_ind_1 = 0;
-    unsigned int start_ind_2 = 0;
+    int start_ind_1 = 0;
+    int start_ind_2 = 0;
 
     
 #ifdef __CUDACC__
@@ -2206,9 +2281,9 @@ void get_chi_squared(
     cmplx _h1_h1_arr[1];
     cmplx *h1_h1_arr = &_h1_h1_arr[0];
     cmplx _h2_h2_arr[1];
-    cmplx *h2_h2_arr = &h2_h2_arr[0];
+    cmplx *h2_h2_arr = &_h2_h2_arr[0];
     cmplx _h1_h2_arr[1];
-    cmplx *h1_h2_arr = &h1_h2_arr[0];
+    cmplx *h1_h2_arr = &_h1_h2_arr[0];
 #endif
     // auto this_block_data = tdi_out
     //+ cufftdx::size_of<FFT>::value * FFT::ffts_per_block * blockIdx.x;
@@ -2565,6 +2640,8 @@ void get_chi_squared_wrap(InputInfo inputs)
 
     using FFT = decltype(Block() + Size<N>() + Type<fft_type::c2c>() + Direction<fft_direction::forward>() +
                          Precision<double>() + ElementsPerThread<8>() + FFTsPerBlock<1>() + SM<Arch>());
+    GBGPU_ASSERT_FFT_FITS_CHANNEL(FFT, N);
+
     using complex_type = cmplx;
 
     // Allocate managed memory for input/output
@@ -2575,6 +2652,8 @@ void get_chi_squared_wrap(InputInfo inputs)
     auto shared_memory_size = std::max((unsigned int)FFT::shared_memory_size, (unsigned int)size_bytes);
 
     // first is waveforms, second is d_h_temp and h_h_temp
+    GBGPU_ASSERT_REDUCIBLE_BLOCK(FFT);
+
     auto shared_memory_size_mine = 3 * N * sizeof(cmplx) + 3 * N * sizeof(cmplx) + 3 * FFT::block_dim.x * sizeof(cmplx);
     // std::cout << "input [1st FFT]:\n" << size  << "  " << size_bytes << "  " << FFT::shared_memory_size << std::endl;
     // for (size_t i = 0; i < cufftdx::size_of<FFT>::value; i++) {
@@ -2752,6 +2831,9 @@ void SharedMemoryChiSquaredComp(
     }
     }
 #else
+    // The host FFT is radix-2 only, so reject sizes the device build would refuse.
+    check_host_waveform_length(inputs.N);
+
     get_chi_squared(
         inputs.h1_h1,
         inputs.h2_h2,
@@ -2878,7 +2960,7 @@ void generate_global_template(
 {
     using complex_type = cmplx;
 
-    unsigned int start_ind = 0;
+    int start_ind = 0;
 
     int nchannels = 3;
     if (tdi_channel_setup == TDI_CHANNEL_SETUP_AE)
@@ -2962,10 +3044,19 @@ void generate_global_template(
             for (int i = start2; i < N; i += incr2)
             {
                 jj = i + start_ind - start_freq_ind;
+
+                if ((jj < 0) || (jj >= data_length))
+                {
+                    GBGPU_REPORT_RANGE_ERROR("generate_global_template frequency bin", jj, data_length);
+                    continue;
+                }
+
+                int write_ind = (template_ind * nchannels + chan) * data_length + jj;
+
 #ifdef __CUDACC__
-                atomicAddComplex(&tmplt[(template_ind * nchannels + chan) * data_length + jj], factor * wave[chan * N + i]);
-#else           
-                tmplt[(template_ind * nchannels + chan) * data_length + jj] = factor * wave[chan * N + i];
+                atomicAddComplex(&tmplt[write_ind], factor * wave[chan * N + i]);
+#else
+                tmplt[write_ind] += factor * wave[chan * N + i];
 #endif
             }
         }
@@ -2996,6 +3087,8 @@ void generate_global_template_wrap(InputInfo inputs)
 
     using FFT = decltype(Block() + Size<N>() + Type<fft_type::c2c>() + Direction<fft_direction::forward>() +
                          Precision<double>() + ElementsPerThread<8>() + FFTsPerBlock<1>() + SM<Arch>());
+    GBGPU_ASSERT_FFT_FITS_CHANNEL(FFT, N);
+
     using complex_type = cmplx;
 
     // Allocate managed memory for input/output
@@ -3157,6 +3250,9 @@ void SharedMemoryGenerateGlobal(
     }
     }
 #else
+    // The host FFT is radix-2 only, so reject sizes the device build would refuse.
+    check_host_waveform_length(inputs.N);
+
     generate_global_template(
         inputs.data_arr,
         inputs.data_index,
@@ -3231,7 +3327,7 @@ void get_fstat_ll(
 {
     using complex_type = cmplx;
 
-    unsigned int start_ind = 0;
+    int start_ind = 0;
 
 #ifdef __CUDACC__
     extern __shared__ unsigned char shared_mem[];
@@ -3379,7 +3475,8 @@ void get_fstat_ll(
             CUDA_SYNCTHREADS;
             if (tid == 0)
             {
-                N_arr[bin_i * 4 + ii] = 4.0 * df * N_temp[0];
+                // * Real inner product, matching the M_mat store below.
+                N_arr[bin_i * 4 + ii] = 4.0 * df * N_temp[0].real();
             }
             CUDA_SYNCTHREADS;
             for (int kk = ii; kk < 4; kk += 1)
@@ -3418,13 +3515,13 @@ void get_fstat_ll(
                     CUDA_SYNCTHREADS;
                 }
                 CUDA_SYNCTHREADS;
+#endif
                 if (tid == 0)
                 {
-                    M_mat[(bin_i * 4 + ii) * 4 + kk] = 4.0 * df * M_temp[0];
-                    M_mat[(bin_i * 4 + kk) * 4 + ii] = 4.0 * df * M_temp[0];
+                    M_mat[(bin_i * 4 + ii) * 4 + kk] = 4.0 * df * M_temp[0].real();
+                    M_mat[(bin_i * 4 + kk) * 4 + ii] = 4.0 * df * M_temp[0].real();
                 }
                 CUDA_SYNCTHREADS;
-#endif
             }
             CUDA_SYNCTHREADS;
         }
@@ -3453,6 +3550,8 @@ void get_fstat_ll_wrap(InputInfo inputs)
 
     using FFT = decltype(Block() + Size<N>() + Type<fft_type::c2c>() + Direction<fft_direction::forward>() +
                          Precision<double>() + ElementsPerThread<8>() + FFTsPerBlock<1>() + SM<Arch>());
+    GBGPU_ASSERT_FFT_FITS_CHANNEL(FFT, N);
+
     using complex_type = cmplx;
 
     // Allocate managed memory for input/output
@@ -3463,6 +3562,8 @@ void get_fstat_ll_wrap(InputInfo inputs)
     auto shared_memory_size = std::max((unsigned int)FFT::shared_memory_size, (unsigned int)size_bytes);
 
     // first is 4 waveforms, second is M_temp and N_temp
+    GBGPU_ASSERT_REDUCIBLE_BLOCK(FFT);
+
     auto shared_memory_size_mine = 4 * 3 * N * sizeof(cmplx) + 2 * FFT::block_dim.x * sizeof(cmplx);
     // std::cout << "input [1st FFT]:\n" << size  << "  " << size_bytes << "  " << FFT::shared_memory_size << std::endl;
     // for (size_t i = 0; i < cufftdx::size_of<FFT>::value; i++) {
@@ -3618,6 +3719,9 @@ void SharedMemoryFstatLikeComp(
     }
     }
 #else
+    // The host FFT is radix-2 only, so reject sizes the device build would refuse.
+    check_host_waveform_length(inputs.N);
+
     get_fstat_ll(
         inputs.M_mat,
         inputs.N_arr,
@@ -3653,10 +3757,11 @@ void SharedMemoryFstatLikeComp(
 
 #ifdef __CUDACC__
 template <class FFT>
-__launch_bounds__(FFT::max_threads_per_block) __global__ 
+__launch_bounds__(FFT::max_threads_per_block) __global__
+#endif
 void get_info_dh_kernel(
     cmplx* d_dh,
-    double* amp, 
+    double* amp,
     double* f0, 
     double* fdot0, 
     double* fddot0, 
@@ -3681,145 +3786,196 @@ void get_info_dh_kernel(
     int window_type, 
     double window_alpha
 ) {
-    int bin_i = blockIdx.x;
-    int deriv_i = blockIdx.y;
-    if (bin_i >= num_bin_all || deriv_i >= num_derivs) return;
-
-    int ind = inds[deriv_i];
-    cmplx* my_dh = &d_dh[(bin_i * num_derivs + deriv_i) * 3 * N];
-
-    double step = eps_scaled[bin_i * num_derivs + deriv_i];
+#ifdef __CUDACC__
+    // One block per (binary, derivative) pair, so each loop below runs exactly once.
+    int start1 = blockIdx.x;
+    int incr1 = gridDim.x;
+    int start2 = blockIdx.y;
+    int incr2 = gridDim.y;
 
     extern __shared__ unsigned char shared_mem[];
     cmplx* wave = (cmplx*)shared_mem;
 
-    unsigned int start_ind = 0;
+    int start3 = threadIdx.x;
+    int incr3 = blockDim.x;
+#else
+    int start1 = 0;
+    int incr1 = 1;
+    int start2 = 0;
+    int incr2 = 1;
 
-    for (int i = threadIdx.x; i < 3 * N; i += blockDim.x) {
-        my_dh[i] = 0.0;
-    }
-    CUDA_SYNCTHREADS;
+    cmplx wave_tmp[3 * N];
+    cmplx* wave = &wave_tmp[0];
 
-    auto build_and_add = [&](double coef, double step_mult) {
-        double p_amp = amp[bin_i];
-        double p_f0 = f0[bin_i];
-        double p_fdot0 = fdot0[bin_i];
-        double p_fddot0 = fddot0[bin_i];
-        double p_phi0 = phi0[bin_i];
-        double p_iota = iota[bin_i];
-        double p_psi = psi[bin_i];
-        double p_lam = lam[bin_i];
-        double p_theta = theta[bin_i];
+    int start3 = 0;
+    int incr3 = 1;
+#endif
 
-        double mod_eps = step_mult * step * eps_orig;
-        if (ind == 0) p_amp += mod_eps;
-        else if (ind == 1) p_f0 += mod_eps;
-        else if (ind == 2) p_fdot0 += mod_eps;
-        else if (ind == 3) p_fddot0 += mod_eps;
-        else if (ind == 4) p_phi0 += mod_eps;
-        else if (ind == 5) p_iota += mod_eps;
-        else if (ind == 6) p_psi += mod_eps;
-        else if (ind == 7) p_lam += mod_eps;
-        else if (ind == 8) p_theta += mod_eps;
+    int start_ind = 0;
 
-        build_single_waveform<FFT>(
-            wave, &start_ind,
-            p_amp, p_f0, p_fdot0, p_fddot0, p_phi0, p_iota, p_psi, p_lam, p_theta,
-            T, dt, N, bin_i, tdi_channel_setup, Ps, L_arm, tdi2, window_type, window_alpha
-        );
-        CUDA_SYNCTHREADS;
+    for (int bin_i = start1; bin_i < num_bin_all; bin_i += incr1)
+    {
+    for (int deriv_i = start2; deriv_i < num_derivs; deriv_i += incr2)
+    {
+        int ind = inds[deriv_i];
+        cmplx* my_dh = &d_dh[(bin_i * num_derivs + deriv_i) * 3 * N];
 
-        for (int i = threadIdx.x; i < 3 * N; i += blockDim.x) {
-            my_dh[i] += coef * wave[i];
+        double step = eps_scaled[bin_i * num_derivs + deriv_i];
+
+        for (int i = start3; i < 3 * N; i += incr3) {
+            my_dh[i] = 0.0;
         }
         CUDA_SYNCTHREADS;
-    };
-    // double abs_step = fabs(step);
-    if (easy_central_difference) {
 
-        build_and_add(1.0 / (2.0 * eps_orig), 1.0);
-        build_and_add(-1.0 / (2.0 * eps_orig), -1.0);
-    } else {
-        build_and_add(-1.0 / (12.0 * eps_orig), 2.0);
-        build_and_add(1.0 / (12.0 * eps_orig), -2.0);
-        build_and_add(8.0 / (12.0 * eps_orig), 1.0);
-        build_and_add(-8.0 / (12.0 * eps_orig), -1.0);
+        auto build_and_add = [&](double coef, double step_mult) {
+            double p_amp = amp[bin_i];
+            double p_f0 = f0[bin_i];
+            double p_fdot0 = fdot0[bin_i];
+            double p_fddot0 = fddot0[bin_i];
+            double p_phi0 = phi0[bin_i];
+            double p_iota = iota[bin_i];
+            double p_psi = psi[bin_i];
+            double p_lam = lam[bin_i];
+            double p_theta = theta[bin_i];
+
+            double mod_eps = step_mult * step * eps_orig;
+            if (ind == 0) p_amp += mod_eps;
+            else if (ind == 1) p_f0 += mod_eps;
+            else if (ind == 2) p_fdot0 += mod_eps;
+            else if (ind == 3) p_fddot0 += mod_eps;
+            else if (ind == 4) p_phi0 += mod_eps;
+            else if (ind == 5) p_iota += mod_eps;
+            else if (ind == 6) p_psi += mod_eps;
+            else if (ind == 7) p_lam += mod_eps;
+            else if (ind == 8) p_theta += mod_eps;
+
+#ifdef __CUDACC__
+            build_single_waveform<FFT>(
+#else
+            build_single_waveform(
+#endif
+                wave, &start_ind,
+                p_amp, p_f0, p_fdot0, p_fddot0, p_phi0, p_iota, p_psi, p_lam, p_theta,
+                T, dt, N, bin_i, tdi_channel_setup, Ps, L_arm, tdi2, window_type, window_alpha
+            );
+            CUDA_SYNCTHREADS;
+
+            for (int i = start3; i < 3 * N; i += incr3) {
+                my_dh[i] += coef * wave[i];
+            }
+            CUDA_SYNCTHREADS;
+        };
+        // double abs_step = fabs(step);
+        if (easy_central_difference) {
+
+            build_and_add(1.0 / (2.0 * eps_orig), 1.0);
+            build_and_add(-1.0 / (2.0 * eps_orig), -1.0);
+        } else {
+            build_and_add(-1.0 / (12.0 * eps_orig), 2.0);
+            build_and_add(1.0 / (12.0 * eps_orig), -2.0);
+            build_and_add(8.0 / (12.0 * eps_orig), 1.0);
+            build_and_add(-8.0 / (12.0 * eps_orig), -1.0);
+        }
+    }
     }
 }
 
+#ifdef __CUDACC__
 template <class FFT>
-__launch_bounds__(FFT::max_threads_per_block) __global__ 
+__launch_bounds__(FFT::max_threads_per_block) __global__
+#endif
 void get_info_inner_kernel(
     double* info_mat, cmplx* d_dh,
     cmplx* noise, int* noise_index, int* start_freq_inds,
     double T, int N, int num_bin_all, int num_derivs,
     int data_length, int tdi_channel_setup
 ) {
-    int bin_i = blockIdx.x;
-    if (bin_i >= num_bin_all) return;
+#ifdef __CUDACC__
+    int start1 = blockIdx.x;
+    int incr1 = gridDim.x;
 
-    extern __shared__ double sdata_info[]; 
+    extern __shared__ double sdata_info[];
+
+    int tid = threadIdx.x;
+    int start2 = threadIdx.x;
+    int incr2 = blockDim.x;
+#else
+    int start1 = 0;
+    int incr1 = 1;
+
+    double _sdata_info[1];
+    double* sdata_info = &_sdata_info[0];
+
+    int tid = 0;
+    int start2 = 0;
+    int incr2 = 1;
+#endif
 
     int nchannels = (tdi_channel_setup == TDI_CHANNEL_SETUP_AE) ? 2 : 3;
     double df = 1.0 / T;
-    int noise_ind = noise_index[bin_i];
-    int start_freq_ind = start_freq_inds[bin_i];
 
-    int tid = threadIdx.x;
+    for (int bin_i = start1; bin_i < num_bin_all; bin_i += incr1)
+    {
+        int noise_ind = noise_index[bin_i];
+        int start_freq_ind = start_freq_inds[bin_i];
 
-    for (int d1 = 0; d1 < num_derivs; d1++) {
-        for (int d2 = d1; d2 < num_derivs; d2++) {
-            cmplx* dh1 = &d_dh[(bin_i * num_derivs + d1) * 3 * N];
-            cmplx* dh2 = &d_dh[(bin_i * num_derivs + d2) * 3 * N];
+        for (int d1 = 0; d1 < num_derivs; d1++) {
+            for (int d2 = d1; d2 < num_derivs; d2++) {
+                cmplx* dh1 = &d_dh[(bin_i * num_derivs + d1) * 3 * N];
+                cmplx* dh2 = &d_dh[(bin_i * num_derivs + d2) * 3 * N];
 
-            double sum = 0.0;
-            for (int i = tid; i < N; i += blockDim.x) {
-                int jj = start_freq_ind + i;
-                if (jj < 0 || jj >= data_length) continue; 
+                double sum = 0.0;
+                for (int i = start2; i < N; i += incr2) {
+                    int jj = start_freq_ind + i;
+                    if (jj < 0 || jj >= data_length) continue;
 
-                if (tdi_channel_setup == TDI_CHANNEL_SETUP_XYZ) {
-                    for (int c1 = 0; c1 < 3; c1++) {
-                        for (int c2 = 0; c2 < 3; c2++) {
-                            int noise_idx = ((noise_ind * 3 + c1) * 3 + c2) * data_length + jj;
-                            cmplx n = noise[noise_idx];
-                            cmplx v1 = dh1[c1 * N + i];
-                            cmplx v2 = dh2[c2 * N + i];
-                            sum += (gcmplx::conj(v1) * n * v2).real();
+                    if (tdi_channel_setup == TDI_CHANNEL_SETUP_XYZ) {
+                        for (int c1 = 0; c1 < 3; c1++) {
+                            for (int c2 = 0; c2 < 3; c2++) {
+                                int noise_idx = ((noise_ind * 3 + c1) * 3 + c2) * data_length + jj;
+                                cmplx noise_val = noise[noise_idx];
+                                cmplx deriv_1_val = dh1[c1 * N + i];
+                                cmplx deriv_2_val = dh2[c2 * N + i];
+                                sum += (gcmplx::conj(deriv_1_val) * noise_val * deriv_2_val).real();
+                            }
+                        }
+                    } else {
+                        for (int c1 = 0; c1 < nchannels; c1++) {
+                            int noise_idx = (noise_ind * nchannels + c1) * data_length + jj;
+                            cmplx noise_val = noise[noise_idx];
+                            cmplx deriv_1_val = dh1[c1 * N + i];
+                            cmplx deriv_2_val = dh2[c1 * N + i];
+                            sum += (gcmplx::conj(deriv_1_val) * noise_val * deriv_2_val).real();
                         }
                     }
-                } else {
-                    for (int c1 = 0; c1 < nchannels; c1++) {
-                        int noise_idx = (noise_ind * nchannels + c1) * data_length + jj;
-                        cmplx n = noise[noise_idx];
-                        cmplx v1 = dh1[c1 * N + i];
-                        cmplx v2 = dh2[c1 * N + i];
-                        sum += (gcmplx::conj(v1) * n * v2).real();
-                    }
                 }
-            }
 
-            sdata_info[tid] = sum;
-            CUDA_SYNCTHREADS;
+                sdata_info[tid] = sum;
+                CUDA_SYNCTHREADS;
 
-            for (unsigned int s = 1; s < blockDim.x; s *= 2) {
-                if (tid % (2 * s) == 0) {
-                    sdata_info[tid] += sdata_info[tid + s];
+#ifdef __CUDACC__
+                for (unsigned int s = 1; s < blockDim.x; s *= 2) {
+                    if (tid % (2 * s) == 0) {
+                        sdata_info[tid] += sdata_info[tid + s];
+                    }
+                    CUDA_SYNCTHREADS;
+                }
+#endif
+
+                if (tid == 0) {
+                    double final_val = 4.0 * df * sdata_info[0];
+                    info_mat[(bin_i * num_derivs + d1) * num_derivs + d2] = final_val;
+                    if (d1 != d2) {
+                        info_mat[(bin_i * num_derivs + d2) * num_derivs + d1] = final_val;
+                    }
                 }
                 CUDA_SYNCTHREADS;
             }
-
-            if (tid == 0) {
-                double final_val = 4.0 * df * sdata_info[0];
-                info_mat[(bin_i * num_derivs + d1) * num_derivs + d2] = final_val;
-                if (d1 != d2) {
-                    info_mat[(bin_i * num_derivs + d2) * num_derivs + d1] = final_val;
-                }
-            }
-            CUDA_SYNCTHREADS;
         }
     }
 }
 
+#ifdef __CUDACC__
 template <unsigned int Arch, unsigned int N>
 void get_info_mat_wrap(InputInfo inputs) {
     using namespace cufftdx;
@@ -3829,6 +3985,7 @@ void get_info_mat_wrap(InputInfo inputs) {
 
     using FFT = decltype(Block() + Size<N>() + Type<fft_type::c2c>() + Direction<fft_direction::forward>() +
                          Precision<double>() + ElementsPerThread<8>() + FFTsPerBlock<1>() + SM<Arch>());
+    GBGPU_ASSERT_FFT_FITS_CHANNEL(FFT, N);
 
     auto size_bytes = FFT::ffts_per_block * cufftdx::size_of<FFT>::value * sizeof(cmplx);
     auto shared_memory_size = std::max((unsigned int)FFT::shared_memory_size, (unsigned int)(3 * N * sizeof(cmplx)));
@@ -3848,6 +4005,8 @@ void get_info_mat_wrap(InputInfo inputs) {
     CUDA_CHECK_AND_EXIT(cudaPeekAtLastError());
 
     dim3 grid2(inputs.num_bin_all);
+    GBGPU_ASSERT_REDUCIBLE_BLOCK(FFT);
+
     size_t smem_reduce = FFT::block_dim.x * sizeof(double);
     CUDA_CHECK_AND_EXIT(cudaFuncSetAttribute(get_info_inner_kernel<FFT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_reduce));
 
@@ -3951,6 +4110,22 @@ void SharedMemoryInfoMatComp(
     default:
         throw std::invalid_argument("N must be a multiple of 2 between 32 and 2048.");
     }
+#else
+    check_host_waveform_length(inputs.N);
+    
+    get_info_dh_kernel(
+        inputs.d_dh_workspace,
+        inputs.amp, inputs.f0, inputs.fdot0, inputs.fddot0, inputs.phi0,
+        inputs.iota, inputs.psi, inputs.lam, inputs.theta,
+        inputs.inds, inputs.eps_scaled, inputs.eps_orig, inputs.easy_central_difference,
+        inputs.T, inputs.dt, inputs.N, inputs.num_bin_all, inputs.num_derivs,
+        inputs.tdi_channel_setup, inputs.Ps, inputs.L_arm, inputs.tdi2,
+        inputs.window_type, inputs.window_alpha);
+
+    get_info_inner_kernel(
+        inputs.info_mat, inputs.d_dh_workspace, inputs.noise, inputs.noise_index,
+        inputs.start_freq_inds, inputs.T, inputs.N, inputs.num_bin_all,
+        inputs.num_derivs, inputs.data_length, inputs.tdi_channel_setup);
 #endif
 }
 
