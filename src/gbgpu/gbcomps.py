@@ -15,6 +15,8 @@
 #   * GB-specific code     -> GBGPU
 #   * SOBBH-specific code  -> BBHx
 #   * Shared GB <-> SOBBH  -> LISAanalysistools (lisatools)
+import warnings
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import Optional
 
@@ -1130,6 +1132,34 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
     def _prep_params(self, params):
         return self.xp.asarray(self.xp.atleast_2d(params)).copy()
 
+    def _envelope_context(self, linear_envelope, group=None):
+        """Per-call `linear_envelope` override, best effort.
+
+        ``stft_comps`` is duck-typed: tests and scripts bind shims carrying only
+        ``cpp_fresnel``/``cpp_domain``, and those cannot swap the evaluator.
+        ``STFTFresnelWrap`` defaults the flag OFF, so an off request is already
+        satisfied there; anything else we cannot honour is warned about rather
+        than applied silently.
+        """
+        target = self.stft_comps if group is None else group
+        override = getattr(target, "envelope_override", None)
+        if override is not None:
+            return override(linear_envelope)
+        if linear_envelope is None:
+            return nullcontext()
+        declared = getattr(target, "linear_envelope", self.linear_envelope)
+        if declared is None:
+            if not linear_envelope:
+                return nullcontext()
+        elif bool(declared) == bool(linear_envelope):
+            return nullcontext()
+        warnings.warn(
+            f"linear_envelope={linear_envelope!r} cannot be applied: "
+            f"{type(target).__name__} does not support envelope_override, so "
+            "the bound evaluator's own setting is used.",
+            RuntimeWarning, stacklevel=3)
+        return nullcontext()
+
     def _resolve_indices(self, num_bin, data_index, noise_index):
         if data_index is None:
             data_index = self.xp.zeros(num_bin, dtype=self.xp.int32)
@@ -1353,6 +1383,11 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         parameter ``k``. The kernel reuses ``get_ll_stft``'s exact forward
         evaluation, so it reproduces a host-side central difference of
         ``get_ll_stft`` to machine precision.
+
+        ``linear_envelope`` defaults to ``False`` here whatever the bound group
+        carries, because the first-moment slope is built from the same TDI stencil
+        and its round-off enters the difference. Pass ``True`` to force it on, 
+        ``None`` to inherit the group's setting.
         """
         p = self._prep_params(params)
         num_bin = p.shape[0]
