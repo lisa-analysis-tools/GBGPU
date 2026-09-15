@@ -1171,8 +1171,20 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
             noise_index = self.xp.asarray(noise_index).astype(self.xp.int32)
         return data_index, noise_index
 
+    def _resolve_start_freq_inds(self, start_freq_inds):
+        """Per-cell window starts as int32; an empty array means the full grid.
+
+        The kernels read ``start_freq_inds[data_index]``, so this is indexed by CELL, not by
+        source, and an empty array reaches C++ as a null pointer.
+        """
+        if start_freq_inds is None:
+            return self.xp.zeros(0, dtype=self.xp.int32)
+        return self.xp.ascontiguousarray(
+            self.xp.asarray(start_freq_inds), dtype=self.xp.int32
+        )
+
     def get_ll_stft(self, params, data_index=None, noise_index=None,
-                    phase_maximize=False):
+                    phase_maximize=False, start_freq_inds=None):
         """Log-likelihood ``-0.5*(<d|d> + <h|h> - 2<d|h>)`` per binary.
 
         Also stores the raw complex ``self.d_h_out`` / ``self.h_h_out`` (handy
@@ -1193,6 +1205,7 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
             p.flatten().copy(), data_index, noise_index,
             num_bin, self.num_params, self.T, self.t_ref,
             self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
+            self._resolve_start_freq_inds(start_freq_inds),
         )
         self.d_h_out = d_h_out
         self.h_h_out = h_h_out
@@ -1201,7 +1214,7 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         return (-0.5 * (d_d + h_h_out - 2.0 * d_h_out)).real
 
     def get_swap_ll_stft(self, params_add, params_remove,
-                         data_index=None, noise_index=None):
+                         data_index=None, noise_index=None, start_freq_inds=None):
         """The 5 RJMCMC source-swap inner-product terms per binary.
 
         On-the-fly STFT analog of :meth:`GBFDComputations.get_swap_ll_fd`.
@@ -1236,6 +1249,7 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
             data_index, noise_index,
             num_bin, self.num_params, self.T, self.t_ref,
             self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
+            self._resolve_start_freq_inds(start_freq_inds),
         )
         self.d_h_add, self.d_h_remove = d_h_a, d_h_r
         self.add_add, self.remove_remove, self.add_remove = aa, rr, ar
@@ -1245,7 +1259,8 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         like_rem = (-0.5 * (d_d + rr - 2.0 * d_h_r)).real
         return like_add, like_rem, d_h_a, d_h_r, aa, rr, ar
 
-    def get_fstat_ll_stft(self, params, data_index=None, noise_index=None):
+    def get_fstat_ll_stft(self, params, data_index=None, noise_index=None,
+                          start_freq_inds=None):
         """F-statistic per binary over the STFT/Fresnel grid.
 
         Builds the 4 Cornish & Crowder '05 basis filters ``A_i`` at the binary's
@@ -1288,6 +1303,7 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
             p.flatten().copy(), data_index, noise_index,
             num_bin, self.num_params, self.T, self.t_ref,
             self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
+            self._resolve_start_freq_inds(start_freq_inds),
         )
         self.N_arr = N_re
         self.M_mat = M_re
@@ -1323,7 +1339,7 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         return two_F
 
     def fill_global_stft(self, params, templates, data_index=None, factors=None,
-                         active_band=True):
+                         active_band=True, start_freq_inds=None):
         """Scatter ``0.5 * factor * fourier_value`` per (time, side-freq, channel)
         pixel into ``templates`` (shape ``(num_templates, nchannels, NT,
         NF_active)`` complex, the layout STFTComputationGroup consumes).
@@ -1348,6 +1364,7 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
             num_bin, self.num_params, self.T, self.t_ref,
             self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
             active_band,
+            self._resolve_start_freq_inds(start_freq_inds),
         )
 
     def setup_in_model(self, buffer_aca, params_ref_phys, data_index,
@@ -1372,7 +1389,9 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
                          param_eps=None,
                          param_scales=None,
                          param_eps_relative=1.0e-6,
-                         data_index=None, noise_index=None):
+                         data_index=None, noise_index=None,
+                         linear_envelope: Optional[bool] = False,
+                         start_freq_inds=None):
         """Per-parameter central finite-difference gradient of
         :meth:`get_ll_stft` (logL = Re(d|h) - 0.5*(h|h); the -0.5*(d|d) constant
         cancels in the difference).
@@ -1398,15 +1417,17 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         )
 
         grad_out = self.xp.zeros(num_bin * nparams, dtype=self.xp.float64)
-        self.backend.GBComputationGroupWrap().gb_stft_get_ll_grad(
-            grad_out,
-            self.cpp_orbits, self.cpp_tdi_config,
-            self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
-            p.flatten().copy(), data_index, noise_index,
-            eps_theta,
-            num_bin, nparams, self.T, self.t_ref,
-            self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
-        )
+        with self._envelope_context(linear_envelope):
+            self.backend.GBComputationGroupWrap().gb_stft_get_ll_grad(
+                grad_out,
+                self.cpp_orbits, self.cpp_tdi_config,
+                self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
+                p.flatten().copy(), data_index, noise_index,
+                eps_theta,
+                num_bin, nparams, self.T, self.t_ref,
+                self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
+                self._resolve_start_freq_inds(start_freq_inds),
+            )
         grad = grad_out.reshape(num_bin, nparams)
         if scales is not None:
             grad = grad * scales[None, :]
@@ -1416,7 +1437,9 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
                               param_eps_add=None, param_eps_remove=None,
                               param_scales_add=None, param_scales_remove=None,
                               param_eps_relative=1.0e-6,
-                              data_index=None, noise_index=None):
+                              data_index=None, noise_index=None,
+                              linear_envelope: Optional[bool] = False,
+                              start_freq_inds=None):
         """Central finite-difference gradients of the swap scalar
         ``S = Re(d|h_add) - Re(d|h_remove) - 0.5*(h_add|h_add)
         - 0.5*(h_remove|h_remove) + Re(h_add|h_remove)`` -- the STFT analog of
@@ -1446,16 +1469,20 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
 
         grad_add_out    = self.xp.zeros(num_bin * nparams, dtype=self.xp.float64)
         grad_remove_out = self.xp.zeros(num_bin * nparams, dtype=self.xp.float64)
-        self.backend.GBComputationGroupWrap().gb_stft_swap_ll_grad(
-            grad_add_out, grad_remove_out,
-            self.cpp_orbits, self.cpp_tdi_config,
-            self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
-            pa.flatten().copy(), pr.flatten().copy(),
-            data_index, noise_index,
-            eps_theta_add, eps_theta_remove,
-            num_bin, nparams, self.T, self.t_ref,
-            self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
-        )
+        # Envelope off by default, as in get_ll_grad_stft: same slope, same
+        # round-off, same amplification in a difference.
+        with self._envelope_context(linear_envelope):
+            self.backend.GBComputationGroupWrap().gb_stft_swap_ll_grad(
+                grad_add_out, grad_remove_out,
+                self.cpp_orbits, self.cpp_tdi_config,
+                self.stft_comps.cpp_fresnel, self.stft_comps.cpp_domain,
+                pa.flatten().copy(), pr.flatten().copy(),
+                data_index, noise_index,
+                eps_theta_add, eps_theta_remove,
+                num_bin, nparams, self.T, self.t_ref,
+                self.n_side_bins, self.window_factor, self.freq_from_tdi_phase,
+                self._resolve_start_freq_inds(start_freq_inds),
+            )
         grad_add = grad_add_out.reshape(num_bin, nparams)
         grad_remove = grad_remove_out.reshape(num_bin, nparams)
         if scales_add is not None:

@@ -676,7 +676,8 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<double> params_all,
         array_type<int> data_index_all, array_type<int> noise_index_all,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        array_type<int> start_freq_inds);
 
     void gb_stft_get_fstat_ll(
         array_type<double> N_re_out, array_type<double> N_im_out,
@@ -686,7 +687,8 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<double> params_all,
         array_type<int> data_index_all, array_type<int> noise_index_all,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        array_type<int> start_freq_inds);
 
     void gb_stft_fill_global(
         array_type<std::complex<double>> template_fill,
@@ -695,7 +697,8 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<double> params_all, array_type<int> data_index_all,
         array_type<double> factors_all,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, double window_factor, bool freq_from_tdi_phase, bool active_band);
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase, bool active_band,
+        array_type<int> start_freq_inds);
 
     void gb_stft_swap_ll(
         array_type<std::complex<double>> d_h_add_out, array_type<std::complex<double>> d_h_remove_out,
@@ -706,7 +709,8 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<double> params_add_all, array_type<double> params_remove_all,
         array_type<int> data_index_all, array_type<int> noise_index_all,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        array_type<int> start_freq_inds);
 
     // get_ll_grad / swap_ll_grad (Stage 3): per-parameter central
     // finite-difference gradients of the STFT log-likelihood. param_eps[k] is
@@ -719,7 +723,8 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<int> data_index_all, array_type<int> noise_index_all,
         array_type<double> param_eps,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        array_type<int> start_freq_inds);
 
     void gb_stft_swap_ll_grad(
         array_type<double> grad_add_out, array_type<double> grad_remove_out,
@@ -729,7 +734,8 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         array_type<int> data_index_all, array_type<int> noise_index_all,
         array_type<double> param_eps_add, array_type<double> param_eps_remove,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        array_type<int> start_freq_inds);
 
     void gb_wdm_het_swap_ll(
         array_type<double> d_h_add_out, array_type<double> d_h_remove_out,

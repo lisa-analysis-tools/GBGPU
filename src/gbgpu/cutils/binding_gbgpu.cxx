@@ -334,6 +334,11 @@ void GBComputationGroupWrap::gb_wdm_het_get_ll(
         n_groups, m_band_half_width);
 }
 
+static int* stft_start_freq_pointer(array_type<int> start_freq_inds)
+{
+    return (start_freq_inds.size() == 0) ? nullptr : start_freq_inds.data();
+}
+
 // ---- STFT/Fresnel GB likelihood bindings (Stage 1) -------------------------
 void GBComputationGroupWrap::gb_stft_get_ll(
     array_type<std::complex<double>> d_h_out, array_type<std::complex<double>> h_h_out,
@@ -342,7 +347,8 @@ void GBComputationGroupWrap::gb_stft_get_ll(
     array_type<double> params_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    array_type<int> start_freq_inds)
 {
     gb_stft_get_ll_wrap(
         reinterpret_cast<cmplx*>(return_pointer_and_check_length(d_h_out, "d_h_out", num_bin, 1)),
@@ -352,7 +358,8 @@ void GBComputationGroupWrap::gb_stft_get_ll(
         return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        stft_start_freq_pointer(start_freq_inds));
 }
 
 void GBComputationGroupWrap::gb_stft_get_fstat_ll(
@@ -363,7 +370,8 @@ void GBComputationGroupWrap::gb_stft_get_fstat_ll(
     array_type<double> params_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    array_type<int> start_freq_inds)
 {
     gb_stft_get_fstat_ll_wrap(
         return_pointer_and_check_length(N_re_out, "N_re_out", num_bin, 4),
@@ -375,7 +383,8 @@ void GBComputationGroupWrap::gb_stft_get_fstat_ll(
         return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        stft_start_freq_pointer(start_freq_inds));
 }
 
 void GBComputationGroupWrap::gb_stft_fill_global(
@@ -385,7 +394,8 @@ void GBComputationGroupWrap::gb_stft_fill_global(
     array_type<double> params_all, array_type<int> data_index_all,
     array_type<double> factors_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase, bool active_band)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase, bool active_band,
+    array_type<int> start_freq_inds)
 {
     gb_stft_fill_global_wrap(
         reinterpret_cast<cmplx*>(return_pointer_no_check(template_fill)),
@@ -394,7 +404,8 @@ void GBComputationGroupWrap::gb_stft_fill_global(
         return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(factors_all, "factors_all", num_bin, 1),
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase, active_band);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase, active_band,
+        stft_start_freq_pointer(start_freq_inds));
 }
 
 void GBComputationGroupWrap::gb_stft_swap_ll(
@@ -406,7 +417,8 @@ void GBComputationGroupWrap::gb_stft_swap_ll(
     array_type<double> params_add_all, array_type<double> params_remove_all,
     array_type<int> data_index_all, array_type<int> noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    array_type<int> start_freq_inds)
 {
     gb_stft_swap_ll_wrap(
         reinterpret_cast<cmplx*>(return_pointer_and_check_length(d_h_add_out, "d_h_add_out", num_bin, 1)),
@@ -420,7 +432,8 @@ void GBComputationGroupWrap::gb_stft_swap_ll(
         return_pointer_and_check_length(params_remove_all, "params_remove_all", nparams, num_bin),
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        stft_start_freq_pointer(start_freq_inds));
 }
 
 // ---- STFT/Fresnel GB gradient bindings (Stage 3) ---------------------------
@@ -432,7 +445,8 @@ void GBComputationGroupWrap::gb_stft_get_ll_grad(
     array_type<int> data_index_all, array_type<int> noise_index_all,
     array_type<double> param_eps,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    array_type<int> start_freq_inds)
 {
     gb_stft_get_ll_grad_wrap(
         return_pointer_and_check_length(grad_out, "grad_out", nparams, num_bin),
@@ -442,7 +456,8 @@ void GBComputationGroupWrap::gb_stft_get_ll_grad(
         return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
         return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
         return_pointer_and_check_length(param_eps, "param_eps", nparams, 1),
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        stft_start_freq_pointer(start_freq_inds));
 }
 
 void GBComputationGroupWrap::gb_stft_swap_ll_grad(
@@ -453,7 +468,8 @@ void GBComputationGroupWrap::gb_stft_swap_ll_grad(
     array_type<int> data_index_all, array_type<int> noise_index_all,
     array_type<double> param_eps_add, array_type<double> param_eps_remove,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    array_type<int> start_freq_inds)
 {
     gb_stft_swap_ll_grad_wrap(
         return_pointer_and_check_length(grad_add_out,    "grad_add_out",    nparams, num_bin),
@@ -466,7 +482,8 @@ void GBComputationGroupWrap::gb_stft_swap_ll_grad(
         return_pointer_and_check_length(noise_index_all,   "noise_index_all",   num_bin, 1),
         return_pointer_and_check_length(param_eps_add,     "param_eps_add",     nparams, 1),
         return_pointer_and_check_length(param_eps_remove,  "param_eps_remove",  nparams, 1),
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        stft_start_freq_pointer(start_freq_inds));
 }
 
 void GBComputationGroupWrap::gb_wdm_het_swap_ll(

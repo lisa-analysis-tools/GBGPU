@@ -369,7 +369,8 @@ class GBComputationGroup{
         STFTFresnel *fresnel, STFTDomain *stft,
         double *params_all, int *data_index_all, int *noise_index_all,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        int *start_freq_inds = nullptr);
 
     void gb_stft_fill_global_wrap(
         cmplx *template_fill,
@@ -378,7 +379,8 @@ class GBComputationGroup{
         double *params_all, int *data_index_all, double *factors_all,
         int num_bin, int nparams, double T, double t_ref,
         int n_side_bins, double window_factor, bool freq_from_tdi_phase,
-        bool active_band);
+        bool active_band,
+        int *start_freq_inds = nullptr);
 
     // swap_ll (Stage 2): the 5 RJMCMC source-swap inner-product terms per
     // binary -- (d|h_add), (d|h_remove), (h_add|h_add), (h_remove|h_remove),
@@ -392,7 +394,8 @@ class GBComputationGroup{
         double *params_add_all, double *params_remove_all,
         int *data_index_all, int *noise_index_all,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        int *start_freq_inds = nullptr);
 
     // get_fstat_ll (Stage 4): F-statistic per binary. Builds the 4 Cornish &
     // Crowder '05 basis filters (GB waveform at fixed extrinsic A/iota/psi/phi0)
@@ -407,7 +410,8 @@ class GBComputationGroup{
         STFTFresnel *fresnel, STFTDomain *stft,
         double *params_all, int *data_index_all, int *noise_index_all,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        int *start_freq_inds = nullptr);
 
     // get_ll_grad / swap_ll_grad (Stage 3): per-parameter central
     // finite-difference gradients of the STFT log-likelihood. Instantiate
@@ -421,7 +425,8 @@ class GBComputationGroup{
         double *params_all, int *data_index_all, int *noise_index_all,
         double *param_eps,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        int *start_freq_inds = nullptr);
 
     void gb_stft_swap_ll_grad_wrap(
         double *grad_add_out, double *grad_remove_out,
@@ -431,7 +436,8 @@ class GBComputationGroup{
         int *data_index_all, int *noise_index_all,
         double *param_eps_add, double *param_eps_remove,
         int num_bin, int nparams, double T, double t_ref,
-        int n_side_bins, double window_factor, bool freq_from_tdi_phase);
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        int *start_freq_inds = nullptr);
 
     // Spline-path mirrors. `coarse_dt` (seconds) sets the coarse-grid spacing
     // for the cubic-spline window builder (smaller -> more accurate / more

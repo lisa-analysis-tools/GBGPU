@@ -1611,13 +1611,15 @@ void GBComputationGroup::gb_stft_get_ll_wrap(
     STFTFresnel *fresnel, STFTDomain *stft,
     double *params_all, int *data_index_all, int *noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int *start_freq_inds)
 {
     stft_get_ll_impl<GBTDIonTheFly>(
         d_h_out, h_h_out, orbits, tdi_config, fresnel, stft,
         params_all, data_index_all, noise_index_all,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor,
-        freq_from_tdi_phase);
+        freq_from_tdi_phase,
+        start_freq_inds);
 }
 
 void GBComputationGroup::gb_stft_fill_global_wrap(
@@ -1627,13 +1629,15 @@ void GBComputationGroup::gb_stft_fill_global_wrap(
     double *params_all, int *data_index_all, double *factors_all,
     int num_bin, int nparams, double T, double t_ref,
     int n_side_bins, double window_factor, bool freq_from_tdi_phase,
-    bool active_band)
+    bool active_band,
+    int *start_freq_inds)
 {
     stft_fill_global_impl<GBTDIonTheFly>(
         template_fill, orbits, tdi_config, fresnel, stft,
         params_all, data_index_all, factors_all,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor,
-        freq_from_tdi_phase, active_band);
+        freq_from_tdi_phase, active_band,
+        start_freq_inds);
 }
 
 void GBComputationGroup::gb_stft_swap_ll_wrap(
@@ -1644,14 +1648,16 @@ void GBComputationGroup::gb_stft_swap_ll_wrap(
     double *params_add_all, double *params_remove_all,
     int *data_index_all, int *noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int *start_freq_inds)
 {
     stft_swap_ll_impl<GBTDIonTheFly>(
         d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
         orbits, tdi_config, fresnel, stft,
         params_add_all, params_remove_all, data_index_all, noise_index_all,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor,
-        freq_from_tdi_phase);
+        freq_from_tdi_phase,
+        start_freq_inds);
 }
 
 // ---- STFT/Fresnel GB F-statistic wrap (Stage 4: get_fstat_ll) --------------
@@ -1665,14 +1671,16 @@ void GBComputationGroup::gb_stft_get_fstat_ll_wrap(
     STFTFresnel *fresnel, STFTDomain *stft,
     double *params_all, int *data_index_all, int *noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int *start_freq_inds)
 {
     stft_get_fstat_ll_impl<GBTDIonTheFly>(
         N_re_out, N_im_out, M_re_out, M_im_out,
         orbits, tdi_config, fresnel, stft,
         params_all, data_index_all, noise_index_all,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor,
-        freq_from_tdi_phase);
+        freq_from_tdi_phase,
+        start_freq_inds);
 }
 
 // ---- STFT/Fresnel GB gradient wraps (Stage 3: get_ll_grad + swap_ll_grad) ---
@@ -1685,13 +1693,15 @@ void GBComputationGroup::gb_stft_get_ll_grad_wrap(
     double *params_all, int *data_index_all, int *noise_index_all,
     double *param_eps,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int *start_freq_inds)
 {
     stft_get_ll_grad_impl<GBTDIonTheFly>(
         grad_out, orbits, tdi_config, fresnel, stft,
         params_all, data_index_all, noise_index_all, param_eps,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor,
-        freq_from_tdi_phase);
+        freq_from_tdi_phase,
+        start_freq_inds);
 }
 
 void GBComputationGroup::gb_stft_swap_ll_grad_wrap(
@@ -1702,14 +1712,16 @@ void GBComputationGroup::gb_stft_swap_ll_grad_wrap(
     int *data_index_all, int *noise_index_all,
     double *param_eps_add, double *param_eps_remove,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int *start_freq_inds)
 {
     stft_swap_ll_grad_impl<GBTDIonTheFly>(
         grad_add_out, grad_remove_out, orbits, tdi_config, fresnel, stft,
         params_add_all, params_remove_all, data_index_all, noise_index_all,
         param_eps_add, param_eps_remove,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor,
-        freq_from_tdi_phase);
+        freq_from_tdi_phase,
+        start_freq_inds);
 }
 
 void GBComputationGroup::gb_wdm_het_swap_ll_wrap(
