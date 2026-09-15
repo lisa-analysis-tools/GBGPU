@@ -21,6 +21,7 @@ except (ImportError, ModuleNotFoundError):
 
 from lisatools.analysiscontainer import AnalysisContainerArray
 from lisatools.domains import DomainSettingsBase, FDSettings, STFTSettings, WDMSettings
+from lisatools.utils.device import device_context
 
 
 @dataclass
@@ -1025,17 +1026,19 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
     def _split_plan(self, buffer_aca: AnalysisContainerArray, data_index, noise_index=None):
         """Partition proposal rows by the ACA split owning their data band.
 
-        Returns ``[(split, row_mask, intra_data_idx, intra_noise_idx, device),
+        Returns ``[(split, rows, intra_data_idx, intra_noise_idx, device),
         ...]`` for every split referenced by ``data_index`` (a row's split is
-        keyed on its data band). ``intra_noise_idx`` is ``None`` when
+        keyed on its data band), where ``rows`` are integer row positions.
+        ``intra_noise_idx`` is ``None`` when
         ``noise_index`` is. Raises if any row's noise band lives in a
         different split than its data band -- per-split kernel dispatch needs
         them co-located (always true in the sub-band buffer, where both are
         the band's AC).
         """
         xp = self.xp
-        split_map = xp.asarray(buffer_aca.split_map)
-        ac_to_intra = xp.asarray(buffer_aca.ac_to_intra)
+        # The routing tables already sit on every shard's device (built with the ACA).
+        caller_device = buffer_aca.gpus[0] if buffer_aca.gpus is not None else None
+        split_map = buffer_aca.split_map_by_split[0]
         d_idx = xp.asarray(data_index).astype(int)
         n_idx = None if noise_index is None else xp.asarray(noise_index).astype(int)
         if n_idx is not None and bool((split_map[d_idx] != split_map[n_idx]).any()):
@@ -1047,27 +1050,36 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         row_split = split_map[d_idx]
         plan = []
         for s in range(len(buffer_aca.cpp_splits)):
-            mask = row_split == s
-            if not bool(mask.any()):
+            # * Integer rows, resolved before any launch: a boolean mask in the caller's loop needs
+            # * its count on the host, which waits for the split launched before it.
+            rows = xp.nonzero(row_split == s)[0]
+            if int(rows.shape[0]) == 0:
                 continue
             device = buffer_aca.gpus[s] if buffer_aca.gpus is not None else None
-            intra_d = ac_to_intra[d_idx[mask]].astype(xp.int32)
-            intra_n = (
-                None if n_idx is None else ac_to_intra[n_idx[mask]].astype(xp.int32)
-            )
-            plan.append((s, mask, intra_d, intra_n, device))
+            # ! Gather the kernel's index arrays ON the split's device, from its own copy of the
+            # ! table. Building them on the caller makes the launch copy them across devices, and
+            # ! that copy waits for the caller's stream, which holds the previous split's kernel.
+            rows_ready = self._stream_event(caller_device)
+            with device_context(xp, device):
+                self._wait_events(rows_ready)
+                ac_to_intra = buffer_aca.ac_to_intra_by_split[s]
+                intra_d = ac_to_intra[d_idx[rows]].astype(xp.int32)
+                intra_n = (
+                    None if n_idx is None else ac_to_intra[n_idx[rows]].astype(xp.int32)
+                )
+                gathered = self._stream_event(device)
 
-        # Every entry point below writes its per-split results into output
-        # arrays allocated on the CALLER's device, from inside the split's own
-        # device_context (``ll[rows] = ...``, ``d_h_c[rows] = ...``), and reads
-        # ``params_phys[rows]`` the same way. cupy enables peer access
-        # automatically where the topology allows it; where it does not, those
-        # stores are an illegal memory access with no useful diagnostic. Check
-        # once per device set. (The per-split COMPS are device-local -- see
-        # ``_comp_for_split`` -- so this is only about the shared output
-        # arrays; making the arm P2P-independent would mean host-routed
-        # assembly, as ``_RoutedBandEngine._assemble`` does on the FD/WDM
-        # arms.)
+            self._wait_events(gathered)
+            plan.append((s, rows, intra_d, intra_n, device))
+
+        # Every entry point below crosses devices twice: a split reads the caller's
+        # ``params_phys[rows]`` from inside its own device_context, and the caller then reads that
+        # split's results back (``ll[rows] = ll_split``). cupy enables peer access automatically
+        # where the topology allows it; where it does not, both are an illegal memory access with
+        # no useful diagnostic. Check once per device set. (The per-split COMPS are device-local --
+        # see ``_comp_for_split`` -- so this is only about the arrays the two sides share; making
+        # the arm P2P-independent would mean host-routed assembly, as
+        # ``_RoutedBandEngine._assemble`` does on the FD/WDM arms.)
         if len(plan) > 1:
             from lisatools.utils.device import assert_peer_access
 
@@ -1109,6 +1121,47 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         comp.stft_comps = buffer_aca.cpp_splits[split]
         return comp
 
+    @staticmethod
+    def _split_start_inds(buffer_aca, split):
+        """This split's persistent window-start store, or None for a full-grid holder (start 0)."""
+        stores = getattr(buffer_aca, "stft_split_start_inds", None)
+        return None if stores is None else stores[split]
+
+    @staticmethod
+    def _stream_event(device):
+        """Event on the current stream, or ``None`` on the CPU path where nothing is ordered."""
+        if device is None:
+            return None
+        event = cp.cuda.Event(block=False, disable_timing=True)
+        event.record()
+        return event
+
+    @staticmethod
+    def _wait_events(events):
+        """Make the current stream wait for ``events``, without blocking the host.
+
+        A split runs on its own stream and exchanges data with the caller's device in BOTH
+        directions: it reads the caller's params and index arrays, and writes its rows back into
+        the caller's output arrays. Peer access makes both legal but NOT ordered, so each side
+        must wait on the other's stream before touching what that side produced. Without the
+        wait a split can read params the caller has not written, or the caller can read output
+        rows the split has not written, and the latter reads as the ``-1e300`` fill, which the
+        moves take for a rejected proposal. Measured on two H100s, repeated identical calls
+        returned different answers until these waits were added.
+
+        ``wait_event`` is a device-side dependency, so the splits still overlap each other and
+        the host never blocks; a stream waits only for what it is about to touch.
+        """
+        if events is None:
+            return
+        stream = None
+        for event in events if isinstance(events, (list, tuple)) else (events,):
+            if event is None:
+                continue
+            if stream is None:
+                stream = cp.cuda.get_current_stream()
+            stream.wait_event(event)
+
     # ---------- bounds-keep ---------------------------------------------------
 
     def _central_bin_keep(self, *params_phys_arrays):
@@ -1143,21 +1196,28 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         params_phys = xp.atleast_2d(xp.asarray(params_phys))
         # N_vals / waveform_kwargs are FD-specific; the Fresnel kernel's band
         # support is n_side_bins, fixed on gb_stft_comp at construction.
-        for s, mask, intra_d, _, device in self._split_plan(buffer_aca, params_index):
+        plan = self._split_plan(buffer_aca, params_index)
+        caller_ready = self._stream_event(plan[0][4]) if plan else None
+        split_events = []
+        for s, rows, intra_d, _, device in plan:
             with buffer_aca.device_context(device):
+                self._wait_events(caller_ready)
                 comp = self._comp_for_split(buffer_aca, s, device)
                 factors_arr = xp.full(
-                    int(mask.sum()), float(factor), dtype=xp.float64
+                    int(rows.shape[0]), float(factor), dtype=xp.float64
                 )
                 # The split's flat buffer IS the (num_bands, nchannels, NT,
                 # NF_active) template stack the kernel scatters into;
                 # intra-split data_index addresses the band slot.
                 comp.fill_global_stft(
-                    params_phys[mask],
+                    params_phys[rows],
                     buffer_aca.linear_data_arr[s],
                     data_index=intra_d,
                     factors=factors_arr,
+                    start_freq_inds=self._split_start_inds(buffer_aca, s),
                 )
+                split_events.append(self._stream_event(device))
+        self._wait_events(split_events)
 
     # ---------- get_ll -------------------------------------------------------
 
@@ -1198,17 +1258,27 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             rows_kept = xp.where(keep)[0]
             d_idx = xp.asarray(data_index)[keep]
             n_idx = xp.asarray(noise_index)[keep]
-            for s, sub_mask, intra_d, intra_n, device in self._split_plan(
-                buffer_aca, d_idx, n_idx
-            ):
-                rows = rows_kept[sub_mask]
+            plan = self._split_plan(buffer_aca, d_idx, n_idx)
+            plan_rows = [rows_kept[sub_rows] for _s, sub_rows, _d, _n, _dev in plan]
+            caller_ready = self._stream_event(plan[0][4]) if plan else None
+            launched = []
+            for (s, sub_rows, intra_d, intra_n, device), rows in zip(plan, plan_rows):
                 with buffer_aca.device_context(device):
+                    self._wait_events(caller_ready)
                     comp = self._comp_for_split(buffer_aca, s, device)
-                    ll[rows] = comp.get_ll_stft(
-                        params_phys[rows], data_index=intra_d, noise_index=intra_n
+                    ll_split = comp.get_ll_stft(
+                        params_phys[rows], data_index=intra_d, noise_index=intra_n,
+                        start_freq_inds=self._split_start_inds(buffer_aca, s),
                     )
-                    d_h_c[rows] = comp.d_h_out
-                    h_h_c[rows] = comp.h_h_out
+                    launched.append(
+                        (rows, ll_split, comp.d_h_out, comp.h_h_out,
+                         self._stream_event(device))
+                    )
+            for rows, ll_split, d_h_split, h_h_split, ready in launched:
+                self._wait_events(ready)
+                ll[rows] = ll_split
+                d_h_c[rows] = d_h_split
+                h_h_c[rows] = h_h_split
 
         self.d_h_out_cmplx = d_h_c
         self.h_h_out_cmplx = h_h_c
@@ -1271,11 +1341,13 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             rows_kept = xp.where(keep)[0]
             d_idx = xp.asarray(data_index)[keep]
             n_idx = xp.asarray(noise_index)[keep]
-            for s, sub_mask, intra_d, intra_n, device in self._split_plan(
-                buffer_aca, d_idx, n_idx
-            ):
-                rows = rows_kept[sub_mask]
+            plan = self._split_plan(buffer_aca, d_idx, n_idx)
+            plan_rows = [rows_kept[sub_rows] for _s, sub_rows, _d, _n, _dev in plan]
+            caller_ready = self._stream_event(plan[0][4]) if plan else None
+            launched = []
+            for (s, sub_rows, intra_d, intra_n, device), rows in zip(plan, plan_rows):
                 with buffer_aca.device_context(device):
+                    self._wait_events(caller_ready)
                     comp = self._comp_for_split(buffer_aca, s, device)
                     (
                         _like_add,
@@ -1290,21 +1362,23 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
                         pr[rows],
                         data_index=intra_d,
                         noise_index=intra_n,
+                        start_freq_inds=self._split_start_inds(buffer_aca, s),
                     )
                     # Same swap algebra as the WDM engine; the STFT kernel
                     # returns the raw complex inner products, so take the
                     # real parts here.
-                    ll_diff[rows] = (
+                    terms = (
                         (d_h_a.real - d_h_r.real)
                         - 0.5 * (aa.real - rr.real)
-                        - (ar.real - rr.real)
+                        - (ar.real - rr.real),
+                        d_h_a.real, d_h_r.real, aa.real, rr.real, ar.real,
+                        xp.sqrt(xp.maximum(aa.real, 0.0)),
                     )
-                    d_h_add[rows] = d_h_a.real
-                    d_h_remove[rows] = d_h_r.real
-                    hh_add[rows] = aa.real
-                    hh_remove[rows] = rr.real
-                    hh_cross[rows] = ar.real
-                    opt_snr[rows] = xp.sqrt(xp.maximum(aa.real, 0.0))
+                    launched.append((rows, terms, self._stream_event(device)))
+            for rows, terms, ready in launched:
+                self._wait_events(ready)
+                (ll_diff[rows], d_h_add[rows], d_h_remove[rows], hh_add[rows],
+                 hh_remove[rows], hh_cross[rows], opt_snr[rows]) = terms
 
         return SwapLLResult(
             ll_diff=ll_diff,
@@ -1347,17 +1421,24 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         grad = xp.zeros(
             (num_bin, self.gb_stft_comp.num_params), dtype=xp.float64
         )
-        for s, mask, intra_d, intra_n, device in self._split_plan(
-            buffer_aca, data_index, noise_index
-        ):
+        plan = self._split_plan(buffer_aca, data_index, noise_index)
+        caller_ready = self._stream_event(plan[0][4]) if plan else None
+        launched = []
+        for s, rows, intra_d, intra_n, device in plan:
             with buffer_aca.device_context(device):
+                self._wait_events(caller_ready)
                 comp = self._comp_for_split(buffer_aca, s, device)
-                grad[mask] = comp.get_ll_grad_stft(
-                    params_phys[mask],
+                grad_split = comp.get_ll_grad_stft(
+                    params_phys[rows],
                     param_eps=param_eps,
                     data_index=intra_d,
                     noise_index=intra_n,
+                    start_freq_inds=self._split_start_inds(buffer_aca, s),
                 )
+                launched.append((rows, grad_split, self._stream_event(device)))
+        for rows, grad_split, ready in launched:
+            self._wait_events(ready)
+            grad[rows] = grad_split
         return grad
 
     def hessian(self, *_args, **_kwargs):
