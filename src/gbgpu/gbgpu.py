@@ -67,7 +67,13 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
 
     """
 
-    def __init__(self, orbits: Optional[Orbits | L1Orbits] = None, force_backend = None, t0 = None, flip_ref_phase=False):
+    def __init__(
+        self, 
+        orbits: Optional[Orbits | L1Orbits] = None, 
+        force_backend: Optional[str] = None, 
+        t0: Optional[float] = None, 
+        flip_ref_phase: bool = False
+    ):
         self.force_backend = force_backend
         GBGPUParallelModule.__init__(self, force_backend=self.force_backend)
         
@@ -80,7 +86,7 @@ class GBGPUBase(GBGPUParallelModule, abc.ABC):
         self.orbits = orbits # type: ignore
         
         # `gpus` controls multi-GPU dispatch. `None` -> CPU mode (or single-GPU on a single-device system).
-        self.gpus = None
+        self.gpus: Optional[list[int]] = None
 
         # absolute start time for spacecraft-position evaluation. ``t0`` arg
         # overrides; otherwise read the orbit's ``sc_t0`` (0.0 if absent).
