@@ -439,6 +439,20 @@ class GBComputationGroup{
         int n_side_bins, double window_factor, bool freq_from_tdi_phase,
         int *start_freq_inds = nullptr);
 
+    // Per-source STFT Fisher matrix, (num_bin, num_derivs, num_derivs). Instantiates LAT's
+    // stft_information_matrix_impl<GBTDIonTheFly>. param_eps has length nparams and is indexed by
+    // inds[d]; eps <= 0 freezes a parameter. start_freq_inds is indexed by noise_index.
+    void gb_stft_information_matrix_wrap(
+        double *info_out,
+        Orbits *orbits, TDIConfig *tdi_config,
+        STFTFresnel *fresnel, STFTDomain *stft,
+        double *params_all, int *noise_index_all,
+        int *inds, double *param_eps,
+        int num_bin, int nparams, int num_derivs, double T, double t_ref,
+        int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+        bool easy_central_difference,
+        int *start_freq_inds = nullptr);
+
     // Spline-path mirrors. `coarse_dt` (seconds) sets the coarse-grid spacing
     // for the cubic-spline window builder (smaller -> more accurate / more
     // get_tdi work). Python computes coarse_dt from a user knob

@@ -201,7 +201,7 @@ def get_chirp_mass_from_f_fdot(f, fdot):
     return Mc
 
 
-def get_N(amp, f0, Tobs, oversample=1, armlength=None):
+def get_N(amp, f0, Tobs, oversample=1, use_mem_cap=True, use_mem_cap=True):
     """Determine sampling rate for slow part of FastGB waveform.
 
     Args:
@@ -279,9 +279,10 @@ def get_N(amp, f0, Tobs, oversample=1, armlength=None):
     # adjust with oversample
     N_out = (N * oversample).astype(np.int32)
 
-    # cuda implementation relies on Nmax=2048
-    Nmax = 2048
-    N_out = np.minimum(N_out, Nmax)
+    if use_mem_cap:
+        # cuda implementation relies on Nmax=2048
+        Nmax = 2048
+        N_out = np.minimum(N_out, Nmax)
 
     # np.any(N_out) == 0 tested whether every entry was zero, not whether any was.
     if np.any(N_out == 0):

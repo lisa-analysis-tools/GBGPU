@@ -1724,6 +1724,25 @@ void GBComputationGroup::gb_stft_swap_ll_grad_wrap(
         start_freq_inds);
 }
 
+void GBComputationGroup::gb_stft_information_matrix_wrap(
+    double *info_out,
+    Orbits *orbits, TDIConfig *tdi_config,
+    STFTFresnel *fresnel, STFTDomain *stft,
+    double *params_all, int *noise_index_all,
+    int *inds, double *param_eps,
+    int num_bin, int nparams, int num_derivs, double T, double t_ref,
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    bool easy_central_difference,
+    int *start_freq_inds)
+{
+    stft_information_matrix_impl<GBTDIonTheFly>(
+        info_out, orbits, tdi_config, fresnel, stft,
+        params_all, noise_index_all, inds, param_eps,
+        num_bin, nparams, num_derivs, T, t_ref, n_side_bins, window_factor,
+        freq_from_tdi_phase, easy_central_difference,
+        start_freq_inds);
+}
+
 void GBComputationGroup::gb_wdm_het_swap_ll_wrap(
     double *d_h_add_out, double *d_h_remove_out,
     double *add_add_out, double *remove_remove_out, double *add_remove_out,

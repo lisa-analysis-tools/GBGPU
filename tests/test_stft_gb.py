@@ -26,6 +26,8 @@ import numpy as np
 from lisatools.domains import get_stft_settings
 from lisatools.utils.parallelbase import LISAToolsParallelModule
 
+from gbgpu.testing import stft_information_matrix_reference
+
 try:
     from gbgpu.gbcomps import STFTGBComputations
 
@@ -421,6 +423,296 @@ class STFTGBStage4Test(_STFTGBFixture):
         self.assertEqual(two_F.shape, (1,))
         self.assertTrue(np.isfinite(two_F[0]))
         self.assertGreaterEqual(two_F[0], 0.0)
+
+
+class _FisherGroupShim(_StftCompsShim):
+    """The shim plus what the reference Fisher reads from a computation group."""
+
+    def __init__(self, shim, invC, settings, num_noise, nch):
+        super().__init__(shim.cpp_fresnel, shim.cpp_domain)
+        self._keepalive = shim._keepalive
+        self.invC_arr = invC
+        self.settings = settings
+        self.num_noise = num_noise
+        self.num_channels = nch
+
+    def _owned_cpp_array(self, name, arr, dtype):
+        return np.ascontiguousarray(arr, dtype=dtype)
+
+
+class STFTGBFisherKernelTest(_STFTGBFixture):
+    """The Fisher kernel against the retained reference Fisher (F1 to F6).
+
+    Tapered window, midpoint anchor and a random Hermitian positive-definite inverse CSD, so the
+    cross-channel contraction and the shared Fresnel kernel are both exercised. The metric is
+    |G_kernel - G_ref| / sqrt(G_ii G_jj): off-diagonal entries pass through zero.
+    """
+
+    TEST_INDS = [0, 1, 2, 4, 5, 6, 7, 8]
+    # ? Measured 2.9e-15 (four-point) and 4.6e-15 (two-point) on this fixture, 2026-09-15.
+    BOUND = 1e-13
+
+    def _fisher_case(self, start_bin=0, trim_bins=0, cross_channel=True):
+        s, nch, num_noise = self.settings, self.nch, 2
+        NT, NF_full = s.NT, s.NF_active
+        rng = np.random.default_rng(7)
+        if cross_channel:
+            raw = (rng.standard_normal((num_noise, NT, NF_full, nch, nch))
+                   + 1j * rng.standard_normal((num_noise, NT, NF_full, nch, nch)))
+            hpd = raw @ np.conj(np.swapaxes(raw, -1, -2)) + nch * np.eye(nch)
+            invC_full = np.transpose(hpd, (0, 3, 4, 1, 2))
+        else:
+            invC_full = rng.uniform(0.5, 2.0, (num_noise, nch, NT, NF_full)).astype(np.complex128)
+        # A window is the full-grid inverse CSD sliced in frequency.
+        NF = NF_full - start_bin - trim_bins
+        invC = np.ascontiguousarray(invC_full[..., start_bin:start_bin + NF])
+        data = np.zeros((num_noise, nch, NT, NF), dtype=np.complex128)
+        tdi_type = self.backend.TDITypeDict["XYZ" if cross_channel else "AET"]
+        domain = self.backend.STFTDomainWrap(
+            NT, NF, nch, s.t0, s.min_freq, s.max_freq, s.dt, s.df,
+            data.reshape(-1), invC.reshape(-1), num_noise, num_noise, tdi_type,
+        )
+        fres = self.backend.STFTFresnelWrap(
+            NT, NF, nch, s.t0, s.min_freq, s.max_freq, s.dt, s.df,
+            window_alpha=0.5, use_midpoint=True,
+        )
+        shim = _StftCompsShim(fres, domain)
+        shim._keepalive = (data, invC)
+        grid = type("Grid", (), {"NT": NT, "NF_active": NF, "df": s.df})()
+        group = _FisherGroupShim(shim, invC, grid, num_noise, nch)
+        return self._gb(group, n_side_bins=3), group
+
+    def _params(self, gb):
+        return np.stack([GB_PARAMS, GB_PARAMS_B]), np.array([0, 1], dtype=np.int32)
+
+    def _boundary_pair(self):
+        """A source whose astro carrier sits on a half-bin boundary at one anchor, and the same
+        source a quarter bin away.
+
+        On the boundary the f0 and fdot steps move a stencil carrier across the bin. The kernel gives
+        all four templates of a derivative the union of their supports, so the two sources must give
+        almost the same Fisher; with each template on its own support the boundary one was 1e3 to 2e4
+        times larger. The reference keeps the own-support rule, so it is not comparable here.
+        """
+        s = self.settings
+        boundary = GB_PARAMS.copy()
+        t_anchor = s.t0 + 12.5 * s.dt
+        boundary[1] = s.min_freq + 5.5 * s.df - boundary[2] * t_anchor
+        away = boundary.copy()
+        away[1] += 0.25 * s.df
+        return np.stack([boundary, away]), np.array([0, 0], dtype=np.int32)
+
+    def _assert_parity(self, kernel, reference):
+        diagonal = np.abs(np.diagonal(reference, axis1=1, axis2=2))
+        self.assertTrue(np.all(diagonal > 0.0))
+        norm = np.sqrt(diagonal[:, :, None] * diagonal[:, None, :])
+        worst = float(np.max(np.abs(kernel - reference) / norm))
+        self.assertLess(worst, self.BOUND, msg=f"kernel left the reference by {worst:.3e}")
+
+    def test_f1_f4_parity_and_symmetry(self):
+        gb, group = self._fisher_case()
+        params, noise_index = self._params(gb)
+        for kwargs in ({}, {"inds": self.TEST_INDS}, {"inds": self.TEST_INDS, "astro_track": False}):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                kernel = gb.information_matrix(params, group, noise_index=noise_index, **kwargs)
+                reference = stft_information_matrix_reference(
+                    gb, params, group, noise_index=noise_index, **kwargs)
+                self._assert_parity(kernel, reference)
+                np.testing.assert_array_equal(kernel, np.swapaxes(kernel, 1, 2))
+
+    def test_f2_easy_central_difference(self):
+        gb, group = self._fisher_case()
+        params, noise_index = self._params(gb)
+        kwargs = dict(inds=self.TEST_INDS, noise_index=noise_index, easy_central_difference=True)
+        self._assert_parity(gb.information_matrix(params, group, **kwargs),
+                            stft_information_matrix_reference(gb, params, group, **kwargs))
+
+    def test_diagonal_inverse_csd(self):
+        gb, group = self._fisher_case(cross_channel=False)
+        params, noise_index = self._params(gb)
+        kwargs = dict(inds=self.TEST_INDS, noise_index=noise_index)
+        self._assert_parity(gb.information_matrix(params, group, **kwargs),
+                            stft_information_matrix_reference(gb, params, group, **kwargs))
+
+    def test_f3_subset_is_submatrix(self):
+        gb, group = self._fisher_case()
+        params, noise_index = self._params(gb)
+        subset = [1, 4, 7]
+        full = gb.information_matrix(params, group, noise_index=noise_index)
+        sub = gb.information_matrix(params, group, inds=subset, noise_index=noise_index)
+        np.testing.assert_array_equal(sub, full[:, subset][:, :, subset])
+
+    def test_f5_window_reproduces_full_grid(self):
+        gb, group = self._fisher_case()
+        gb_w, group_w = self._fisher_case(start_bin=1, trim_bins=1)
+        params, noise_index = self._params(gb)
+        # Only the first two sources: their supports lie inside [1, NF - 1).
+        full = gb.information_matrix(params[:2], group, inds=self.TEST_INDS,
+                                     noise_index=noise_index[:2])
+        windowed = gb_w.information_matrix(params[:2], group_w, inds=self.TEST_INDS,
+                                           noise_index=noise_index[:2],
+                                           start_freq_inds=np.array([1, 1], dtype=np.int32))
+        np.testing.assert_array_equal(windowed, full)
+
+    def test_f6_nonpositive_step_freezes(self):
+        gb, group = self._fisher_case()
+        params, noise_index = self._params(gb)
+        eps = gb._information_matrix_steps(9, None, None, 1e-6)[0].copy()
+        eps[5] = 0.0
+        info = gb.information_matrix(params, group, inds=self.TEST_INDS,
+                                     noise_index=noise_index, param_eps=eps)
+        row = self.TEST_INDS.index(5)
+        self.assertEqual(float(np.abs(info[:, row, :]).max()), 0.0)
+        self.assertEqual(float(np.abs(info[:, :, row]).max()), 0.0)
+        self.assertGreater(float(np.abs(info[:, 0, 0]).min()), 0.0)
+
+    def test_rejects_out_of_range_inds(self):
+        gb, group = self._fisher_case()
+        params, noise_index = self._params(gb)
+        with self.assertRaises(ValueError):
+            gb.information_matrix(params, group, inds=[0, 9], noise_index=noise_index)
+
+    def test_carrier_crossing_does_not_inflate(self):
+        gb, group = self._fisher_case()
+        params, noise_index = self._boundary_pair()
+        info = np.asarray(gb.information_matrix(params, group, inds=self.TEST_INDS,
+                                                noise_index=noise_index))
+        diagonal = np.abs(np.diagonal(info, axis1=1, axis2=2))
+        ratio = diagonal[0] / diagonal[1]
+        # ? A boundary source keeps slightly less of itself inside the +-n_side_bins cut, so the ratio
+        # ? sits just below 1 and rises toward it with n_side_bins; the defect this guards against was
+        # ? a factor 1e3 or more on the f0 and fdot entries.
+        for k, name in enumerate(("amp", "f0", "fdot", "phi0", "iota", "psi", "lam", "beta")):
+            with self.subTest(parameter=name):
+                self.assertGreater(ratio[k], 0.5, msg=f"{name} diagonal collapsed at a crossing")
+                self.assertLess(ratio[k], 2.0, msg=f"{name} diagonal inflated at a crossing: {ratio[k]:.3e}")
+
+
+def _time_domain_pixel(f0, fdot0, f, t0, dt, window_alpha, use_midpoint=True, sample=0.5):
+    """The integral the Fresnel evaluator represents, summed in longdouble on a fine time grid.
+
+    V(f) = e^{-2 pi i f (t_ref - t0)} int w(t - t0) exp(i[pi fdot0 tau^2 + 2 pi (f0 - f) tau]) dt,
+    tau = t - t_ref. Independent of the Fresnel machinery, so it catches an error in the evaluator
+    itself rather than only a change in it.
+    """
+    ld = np.longdouble
+    n = int(round(dt / sample)) + 1
+    x = np.arange(n, dtype=ld) * ld(sample)
+    taper = ld(window_alpha) * ld(dt) / 2
+    w = np.ones(n, dtype=ld)
+    if taper > 0:
+        rise, fall = x < taper, x > ld(dt) - taper
+        w[rise] = (1 - np.cos(np.pi * x[rise] / taper)) / 2
+        w[fall] = (1 - np.cos(np.pi * (ld(dt) - x[fall]) / taper)) / 2
+    tau = x - (ld(dt) / 2 if use_midpoint else ld(0.0))
+    phase = np.pi * ld(fdot0) * tau * tau + 2 * np.pi * (ld(f0) - ld(f)) * tau
+    integrand = w * (np.cos(phase) + 1j * np.sin(phase))
+    integral = (np.sum(integrand) - 0.5 * (integrand[0] + integrand[-1])) * ld(sample)
+    front = np.exp(-2j * np.pi * ld(f) * (ld(dt) / 2 if use_midpoint else ld(0.0)))
+    return complex(front * integral)
+
+
+@unittest.skipUnless(HAVE_STFT_GB, "requires the GBGPU STFT-GB build")
+class STFTFresnelAccuracyTest(unittest.TestCase):
+    """The evaluator against the integral it represents, over the fdot range the population spans.
+
+    Replaces an earlier bit-identity check. The evaluator writes a pixel as
+    exp(-i pi fdot0 zeta^2) [C + i s S](v); both factors carry ~pi (f0 - f)^2 / fdot0, up to 1e12 rad,
+    and cancel analytically. Forming them apart cost up to 1e-4 of the value at small |fdot0| and far
+    more of its f0 derivative, which is what this test pins down.
+    """
+
+    DT = 86400.0
+    T0 = 30.0 * 86400.0
+    ALPHA = 1.0 / (10e-3 * 86400.0)   # production taper: band start 10 mHz
+    BOUND = 1e-11
+
+    @classmethod
+    def setUpClass(cls):
+        cls.backend = _BackendHolder(force_backend="cpu").backend
+
+    def test_pixel_values_match_the_time_domain_integral(self):
+        df = 1.0 / self.DT
+        fresnel = self.backend.STFTFresnelWrap(
+            1, 1, 3, self.T0, 0.0, 1.0, self.DT, df,
+            window_alpha=self.ALPHA, use_midpoint=True,
+        )
+        k0 = int(round(3.0e-3 / df))
+        f0 = k0 * df
+        for magnitude in (1e-19, 1e-17, 1e-15):
+            for sign in (1.0, -1.0):
+                for offset in (0.25, 10.25):
+                    fdot0 = sign * magnitude
+                    f = (k0 - offset) * df
+                    with self.subTest(fdot0=fdot0, offset=offset):
+                        out = np.zeros(1, dtype=np.complex128)
+                        fresnel.compute_fourier_values(
+                            out, np.ones(1), np.zeros(1), np.array([f0]), np.array([fdot0]),
+                            np.array([self.T0]), np.array([f]), 1.0, 1, 1)
+                        truth = _time_domain_pixel(f0, fdot0, f, self.T0, self.DT, self.ALPHA)
+                        error = abs(out[0] - truth) / abs(truth)
+                        self.assertLess(error, self.BOUND,
+                                        msg=f"pixel value off the integral by {error:.3e}")
+
+    def test_phase_kernel_and_moment_match_their_integrals(self):
+        """The single-interval pair the evaluator is built on, against a direct quadrature.
+
+        kernel = sqrt(2|fdot0|) int e^{i psi} dtau and moment = the same with a tau weight, both over
+        one interval with tau from t_ref. The cases cover the three regimes the evaluator branches on:
+        endpoints far from the stationary point, the stationary point inside the interval, and an
+        endpoint within 1.6 Fresnel units of it. The moment is what the linear envelope multiplies;
+        its own conditioning fails differently from the kernel's, so both are checked.
+        """
+        df = 1.0 / self.DT
+        fresnel = self.backend.STFTFresnelWrap(
+            1, 1, 3, self.T0, 0.0, 1.0, self.DT, df,
+            window_alpha=self.ALPHA, use_midpoint=True,
+        )
+        k0 = int(round(3.0e-3 / df))
+        f0, t_ref = k0 * df, self.T0 + 0.5 * self.DT
+        cases = []
+        for magnitude in (1e-19, 1e-17, 1e-15):
+            for sign in (1.0, -1.0):
+                fdot0 = sign * magnitude
+                cases.append(("far", fdot0, (k0 - 10.25) * df))
+                cases.append(("stationary inside", fdot0, f0 + fdot0 * 0.5 * self.DT))
+                cases.append(("series endpoint", fdot0,
+                              f0 + fdot0 * (t_ref - self.T0) + 0.4 * np.sqrt(abs(fdot0) / 2.0)))
+        n = len(cases)
+        kernel = np.zeros(n, dtype=np.complex128)
+        moment = np.zeros(n, dtype=np.complex128)
+        fresnel.compute_phase_kernel_moments(
+            kernel, moment, np.array([c[2] for c in cases]), np.full(n, t_ref), np.full(n, f0),
+            np.array([c[1] for c in cases]), np.full(n, self.T0), np.full(n, self.T0 + self.DT),
+            np.full(n, self.T0), n)
+        for i, (label, fdot0, f_eff) in enumerate(cases):
+            k_ref, m_ref = _quadrature_pair(f_eff, t_ref, f0, fdot0, self.T0, self.T0 + self.DT, self.T0)
+            with self.subTest(case=label, fdot0=fdot0):
+                self.assertLess(abs(kernel[i] - k_ref) / abs(k_ref), self.BOUND)
+                # ? The moment vanishes by symmetry at delta_f = 0, so it is judged against the scale
+                # ? it enters the envelope correction with, |kernel| * DT.
+                scale = max(abs(m_ref), abs(k_ref) * self.DT)
+                self.assertLess(abs(moment[i] - m_ref) / scale, 1e-6)
+
+
+def _quadrature_pair(f_eff, t_ref, f0, fdot0, t_start, t_end, t_origin, pieces=16384):
+    """kernel and moment of one interval by Simpson quadrature in longdouble.
+
+    ! The piece count sets the floor of this test: Simpson error falls as h^4, and 4096 pieces leave
+    ! 2e-11 on a pixel ten bins off the tone, which is above the evaluator's own error.
+    """
+    ld = np.longdouble
+    tau = np.linspace(ld(t_start) - ld(t_ref), ld(t_end) - ld(t_ref), 2 * pieces + 1, dtype=ld)
+    phase = np.pi * ld(fdot0) * tau * tau + 2 * np.pi * (ld(f0) - ld(f_eff)) * tau
+    values = np.cos(phase) + 1j * np.sin(phase)
+    weights = np.ones(2 * pieces + 1, dtype=ld)
+    weights[1:-1:2], weights[2:-1:2] = 4.0, 2.0
+    step = (tau[-1] - tau[0]) / (2 * pieces)
+    root = np.sqrt(2.0 * abs(ld(fdot0)))
+    front = np.exp(-2j * np.pi * ld(f_eff) * (ld(t_ref) - ld(t_origin)))
+    integral = np.sum(weights * values) * step / 3
+    moment = np.sum(weights * tau * values) * step / 3
+    return complex(front * root * integral), complex(front * root * moment)
 
 
 if __name__ == "__main__":

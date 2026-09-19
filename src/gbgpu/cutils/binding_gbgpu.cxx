@@ -486,6 +486,30 @@ void GBComputationGroupWrap::gb_stft_swap_ll_grad(
         stft_start_freq_pointer(start_freq_inds));
 }
 
+void GBComputationGroupWrap::gb_stft_information_matrix(
+    array_type<double> info_out,
+    OrbitsWrap *orbits_wrap, TDIConfigWrap *tdi_config_wrap,
+    STFTFresnelWrap *fresnel_wrap, STFTDomainWrap *stft_wrap,
+    array_type<double> params_all, array_type<int> noise_index_all,
+    array_type<int> inds, array_type<double> param_eps,
+    int num_bin, int nparams, int num_derivs, double T, double t_ref,
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    bool easy_central_difference,
+    array_type<int> start_freq_inds)
+{
+    gb_stft_information_matrix_wrap(
+        return_pointer_and_check_length(info_out, "info_out", num_derivs * num_derivs, num_bin),
+        orbits_wrap->orbits, tdi_config_wrap->tdi_config,
+        fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
+        return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
+        return_pointer_and_check_length(inds, "inds", num_derivs, 1),
+        return_pointer_and_check_length(param_eps, "param_eps", nparams, 1),
+        num_bin, nparams, num_derivs, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        easy_central_difference,
+        stft_start_freq_pointer(start_freq_inds));
+}
+
 void GBComputationGroupWrap::gb_wdm_het_swap_ll(
     array_type<double> d_h_add_out, array_type<double> d_h_remove_out,
     array_type<double> add_add_out, array_type<double> remove_remove_out,
@@ -1211,6 +1235,11 @@ void gbgpu_part(nb::module_ &m) {
          "theta_remove (the other track held fixed). Matches the FD swap-grad "
          "convention; separate param_eps_add / param_eps_remove (eps_k <= 0 "
          "freezes).")
+    .def("gb_stft_information_matrix", &GBComputationGroupWrap::gb_stft_information_matrix,
+         "STFT/Fresnel GB Fisher matrix per source, 4 df Re sum conj(dh_i) invC dh_j, from "
+         "four-point (or two-point) central differences of the fill_global template over "
+         "the parameters in inds. info_out layout [num_bin, num_derivs, num_derivs]; "
+         "param_eps[inds[d]] <= 0 gives a zero row and column.")
     .def("gb_stft_get_fstat_ll", &GBComputationGroupWrap::gb_stft_get_fstat_ll,
          "STFT/Fresnel GB F-statistic: builds the 4 Cornish & Crowder '05 basis "
          "filters (GB waveform at fixed extrinsic (A,iota,psi,phi0) = "
