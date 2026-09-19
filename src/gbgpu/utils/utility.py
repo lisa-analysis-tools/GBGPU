@@ -201,7 +201,7 @@ def get_chirp_mass_from_f_fdot(f, fdot):
     return Mc
 
 
-def get_N(amp, f0, Tobs, oversample=1, use_mem_cap=True, use_mem_cap=True):
+def get_N(amp, f0, Tobs, oversample=1, armlength=None, use_mem_cap=True):
     """Determine sampling rate for slow part of FastGB waveform.
 
     Args:
