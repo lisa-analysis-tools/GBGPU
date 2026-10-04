@@ -165,6 +165,10 @@ _V5_COLLAPSED = 4
 #: v5_mode bit: the carrier SYM layout (per channel-pair moments, B0/B0nc the
 #: diagonal pairs, B1/B1nc the off-diagonal ones, each (n, 3 [q], 3, W, Ns)).
 _V5_SYM = 8
+#: sig-het F-stat fstat_mode bits: carrier reference (Re/Im filter ratio) and the
+#: SYM Gram fold (GB_SIGHET_FSTAT_CARRIER / GB_SIGHET_FSTAT_SYM in the kernel).
+_FSTAT_CARRIER = 4
+_FSTAT_SYM = 8
 
 
 def _invc_channel_symmetric(invC, xp, rtol=1e-12):
@@ -1891,6 +1895,25 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         invC_w = invC_full[ch[None, :, None, None], ch[None, None, :, None],
                            layers[:, None, None, :], :]
 
+        # ---- CARRIER reference + SYM fold (SIGHET_FSTAT_CARRIER, default on) --
+        # The log-polar per-channel filter ratio against a circular reference
+        # breaks the low-f X+Y+Z null exactly like the pre-carrier v5 ratio
+        # did: measured on the unequal-arm production noise (180 d, SNR 30), F
+        # was low by 70 % / 38 % at 0.6 mHz, 14-34 % at 1.25 mHz, 1.5-4.5 % at
+        # 2.3 mHz (the M Gram up to 200 % off). The carrier path builds the
+        # reference as the common carrier only (one channel + the c1 packet
+        # moment, gb_signal_het_make_reference_carrier), the kernel's filter
+        # ratio is the filter's own demodulated envelope (Re / Im), and the
+        # Gram folds with the SYM moments (second moment + c1). Needs a
+        # channel-symmetric invC (any noise model); otherwise the legacy path.
+        fs_carrier = (os.environ.get("SIGHET_FSTAT_CARRIER", "1") != "0"
+                      and _invc_pair_symmetric(invC_w, xp))
+        if fs_carrier and getattr(self, "_window_dj_arr", None) is None:
+            self._window_dj_arr = _window_dj(self.window_full, xp)
+        nch_ref = 1 if fs_carrier else nch
+        cp_code = (-(int(g["n_cp_build"]) + _SIGHET_CARRIER)
+                   if (fs_carrier and int(g["n_cp_build"]) > 1) else _n_cp_kernel_arg(g))
+
         # ---- compact reference c0 + bin-fold, CHUNKED TOGETHER -------------
         # Same dense-transient chunking as setup_in_model (user ruling
         # 2026-09-09): the dense c0 is needed only between make_reference and
@@ -1906,10 +1929,10 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         c0_sparse_w = xp.zeros((n, nch, W, g["N_sparse_t"]),
                                dtype=xp.complex128)
         per_src_bytes = (2 * nch * nch * W * g["Nt_active"] * 16    # Ec + En
-                         + nch * W * g["Nt_active"] * 16)            # dense c0
+                         + 2 * nch * W * g["Nt_active"] * 16)        # dense c0 (+ c1)
         chunk = max(1, min(n, _SIGHET_FOLD_MAX_BYTES
                            // max(per_src_bytes, 1)))
-        c0_dense_buf = xp.zeros((chunk, nch, W, g["Nt_active"]),
+        c0_dense_buf = xp.zeros((chunk, nch_ref, W, g["Nt_active"]),
                                 dtype=xp.complex128)
         c0_dense_w = None   # bound even if n == 0, so the del below is safe
         folds = []
@@ -1919,25 +1942,37 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 c0_dense_w = c0_dense_buf
                 c0_dense_w[...] = 0.0
             else:
-                c0_dense_w = xp.zeros((k, nch, W, g["Nt_active"]),
+                c0_dense_w = xp.zeros((k, nch_ref, W, g["Nt_active"]),
                                       dtype=xp.complex128)
-            c0_sparse_chunk = xp.zeros((k, nch, W, g["N_sparse_t"]),
+            c0_sparse_chunk = xp.zeros((k, nch_ref, W, g["N_sparse_t"]),
                                        dtype=xp.complex128)
-            self.cpp.gb_signal_het_make_reference(
-                self.tdi_wrap, c0_sparse_chunk, c0_dense_w,
-                self.window_full, self.n_sparse_local,
-                xp.ascontiguousarray(w_lo[s:s + k]),
-                xp.ascontiguousarray(refs[s:s + k]), k, 9, 1, 2,
-                g["Nf"], g["Nt"], W, g["Nt_active"],
-                g["nt_layer"], g["N_sparse_t"], g["stride"],
-                g["ind_min_t"], g["ind_min_f"],
-                g["layer_df"], g["dt"], g["Tobs"], g["t0"],
-                3, g["n_sparse_fd"], g["tukey_alpha"], _n_cp_kernel_arg(g))
-            c0_sparse_w[s:s + k] = c0_sparse_chunk
-            folds.append(bin_fold_real(
-                res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
-                self.n_sparse_local, g["stride"], g["Nt_active"],
-                tdi_type="XYZ"))
+            args = (self.n_sparse_local,
+                    xp.ascontiguousarray(w_lo[s:s + k]),
+                    xp.ascontiguousarray(refs[s:s + k]), k, 9, 1, 2,
+                    g["Nf"], g["Nt"], W, g["Nt_active"],
+                    g["nt_layer"], g["N_sparse_t"], g["stride"],
+                    g["ind_min_t"], g["ind_min_f"],
+                    g["layer_df"], g["dt"], g["Tobs"], g["t0"],
+                    3, g["n_sparse_fd"], g["tukey_alpha"], cp_code)
+            if fs_carrier:
+                c1_dense_w = xp.zeros_like(c0_dense_w)
+                self.cpp.gb_signal_het_make_reference_carrier(
+                    self.tdi_wrap, c0_sparse_chunk, c0_dense_w, c1_dense_w,
+                    self.window_full, self._window_dj_arr, *args)
+                c1_dense_w *= _c1_scale(g["Nt"])
+                folds.append(_collapsed_carrier_fold(
+                    res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
+                    self.n_sparse_local, g["stride"], g["Nt_active"],
+                    c1_dense=c1_dense_w, layout="sym"))
+            else:
+                self.cpp.gb_signal_het_make_reference(
+                    self.tdi_wrap, c0_sparse_chunk, c0_dense_w,
+                    self.window_full, *args)
+                folds.append(bin_fold_real(
+                    res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
+                    self.n_sparse_local, g["stride"], g["Nt_active"],
+                    tdi_type="XYZ"))
+            c0_sparse_w[s:s + k] = c0_sparse_chunk     # broadcasts a 1-channel build
         del c0_dense_buf, c0_dense_w
         if len(folds) == 1:
             A0s, A1s, B0s, B1s, B0ncs, B1ncs = folds[0]
@@ -1965,6 +2000,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             order=xp.asarray(order),
             max_df0=(None if assert_max_df0 is None
                      else float(assert_max_df0)),
+            carrier=bool(fs_carrier),
         )
         return n
 
@@ -2039,6 +2075,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         # a caller-passed mode can differ from the env default checked at
         # setup). Pure integer arithmetic -- negligible per-batch cost.
         self._check_fstat_shared_for_device(mode)
+        # carrier reference + SYM fold (setup_fstat_references): kernel bits
+        kmode = mode | ((_FSTAT_CARRIER | _FSTAT_SYM) if fs.get("carrier") else 0)
         N_out = xp.zeros((num_bin, 4), dtype=xp.float64)
         M_out = xp.zeros((num_bin, 10), dtype=xp.float64)
         self.cpp.gb_signal_het_fstat_get_ll(
@@ -2057,7 +2095,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             g["ind_min_t"], g["ind_min_f"], g["m_half"],
             g["layer_df"], g["dt"], g["Tobs"], g["t0"],
             3, 0, 1,                      # XYZ, project_real=1
-            mode)
+            kmode)
         self.N_arr = N_out
         self.M_mat = M_out
         return N_out, M_out

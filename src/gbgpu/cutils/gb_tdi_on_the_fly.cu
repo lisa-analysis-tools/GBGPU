@@ -6622,6 +6622,9 @@ void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
 // ============================================================================
 
 #define GB_FSTAT_N_FILTERS 4
+// fstat_mode bits on top of the stage mode (0 / 1)
+#define GB_SIGHET_FSTAT_CARRIER 4
+#define GB_SIGHET_FSTAT_SYM 8
 #define GB_FSTAT_N_M_UPPER 10
 #define GB_FSTAT_MAX_STAGES 4
 #define GB_FSTAT_BASIS_AMP 2.0
@@ -6671,6 +6674,13 @@ void gb_signal_het_fstat_score_one_source(
 {
     const int M      = 2 * m_active_half_width + 1;
     const int nwords = (N_sparse_t + 63) / 64;
+    // fstat_mode bits (the wrap validated them): GB_SIGHET_FSTAT_CARRIER --
+    // carrier-only reference, Re/Im node ratio (the candidate filter's own
+    // demodulated envelope); GB_SIGHET_FSTAT_SYM -- the carrier SYM stash fold
+    // (per channel-pair moments with the second moment and c1).
+    const int fs_carrier = (fstat_mode & GB_SIGHET_FSTAT_CARRIER) ? 1 : 0;
+    const int fs_sym     = (fstat_mode & GB_SIGHET_FSTAT_SYM) ? 1 : 0;
+    fstat_mode &= 3;
     const int n_stages = (fstat_mode == 1) ? 4 : 2;
 
     // ---- basis-filter tables (chunked-kernel constants, verbatim) ---------
@@ -6845,7 +6855,41 @@ void gb_signal_het_fstat_score_one_source(
         const double df0   = params_c[f0_idx]  - params_r[f0_idx];
         const double dfdot = params_c[fdot_idx] - params_r[fdot_idx];
         (void) count; (void) fix_c; (void) pjump;
-        for (int c = 0; c < nchannels; ++c)
+        // CARRIER reference: the ratio is the candidate filter's complex TDI
+        // demodulated by the reference's COMMON carrier phase,
+        // r_c = conj(M_c) e^{-i (phi_ref,r + derot)} -- linear in the
+        // channels (no division, no per-channel amplitude / phase fit), so
+        // the low-f X+Y+Z null is interpolated as itself. (conj(M_c) =
+        // A_c e^{i (tph_c + phi_ref,c)}: the extraction's own convention.)
+        // dlnA / dphi hold Re / Im of r at the nodes; the knot stage adds the
+        // derotation back.
+        for (int c = 0; fs_carrier && c < nchannels; ++c)
+        {
+            for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X) {
+                const cmplx Mv = tdi_c[(size_t) c * n_nodes + k];
+                const double tau = t_nodes[k] - t_start;
+                const double th = phiun_r[k]
+                                  + TWO_PI * (df0 * tau + 0.5 * dfdot * tau * tau);
+                const double ct = cos(th), stt = sin(th);
+                // conj(Mv) * e^{-i th}
+                dlnA[(size_t) c * n_nodes + k] =  Mv.real() * ct - Mv.imag() * stt;
+                dphi[(size_t) c * n_nodes + k] = -Mv.imag() * ct - Mv.real() * stt;
+            }
+            CUDA_SYNC_THREADS;
+            wdm_fit_cubic_spline(t_nodes, dlnA + (size_t) c * n_nodes,
+                                 cA1 + (size_t) c * n_nodes,
+                                 cA2 + (size_t) c * n_nodes,
+                                 cA3 + (size_t) c * n_nodes,
+                                 B_b, pcr, n_nodes, CUBIC_SPLINE_LINEAR_SPACING);
+            CUDA_SYNC_THREADS;
+            wdm_fit_cubic_spline(t_nodes, dphi + (size_t) c * n_nodes,
+                                 cP1 + (size_t) c * n_nodes,
+                                 cP2 + (size_t) c * n_nodes,
+                                 cP3 + (size_t) c * n_nodes,
+                                 B_b, pcr, n_nodes, CUBIC_SPLINE_LINEAR_SPACING);
+            CUDA_SYNC_THREADS;
+        }
+        for (int c = 0; !fs_carrier && c < nchannels; ++c)
         {
             for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X) {
                 const cmplx Mv = tdi_c[(size_t) c * n_nodes + k];
@@ -6949,9 +6993,17 @@ void gb_signal_het_fstat_score_one_source(
             const size_t o   = (size_t) c * n_nodes + seg;
             const double lA  = dlnA[o] + cA1[o] * dx + cA2[o] * dx2
                              + cA3[o] * dx2 * dx;
+            const double dr_ = TWO_PI * (df0 * tau + 0.5 * dfdot * tau * tau);
             const double ph  = dphi[o] + cP1[o] * dx + cP2[o] * dx2
                              + cP3[o] * dx2 * dx
-                             + TWO_PI * (df0 * tau + 0.5 * dfdot * tau * tau);
+                             + (fs_carrier ? 0.0 : dr_);
+            if (fs_carrier) {
+                // lA / ph are Re / Im of the derotated ratio: rotate back
+                const double cr = cos(dr_), sr = sin(dr_);
+                rk_re[(size_t) c * n_knots + k] = lA * cr - ph * sr;
+                rk_im[(size_t) c * n_knots + k] = lA * sr + ph * cr;
+                continue;
+            }
             // NOTE: direct cos/sin, never gcmplx::polar (signed-rho NaN trap).
             const double amp = exp(lA);
             rk_re[(size_t) c * n_knots + k] = amp * cos(ph);
@@ -7093,7 +7145,119 @@ void gb_signal_het_fstat_score_one_source(
         }
     }
 
-    if (tdi_type == 0)
+    if (tdi_type == 0 && fs_sym)
+    {
+        // CARRIER SYM stash (setup: _collapsed_carrier_fold, layout "sym"):
+        // per unique channel pair p the q = 0, 1, 2 moments, B0 / B0nc the
+        // diagonal pairs and B1 / B1nc the off-diagonal ones, each
+        // (num_data, 3 [q], 3 [pair], W_slab, N_sparse_t). The cores are the
+        // EXACT complex Grams over the ordered channel pairs:
+        //   K = sum P0 conj(r_i) r_j + P1 conj(r_i) dr_j + conj(P1) conj(dr_i) r_j
+        //       + P2 conj(dr_i) dr_j
+        // (P1 carries the complex c1 cross moment, so its two orderings take
+        // P1 and conj(P1); P0 / P2 are real), and the anomalous
+        //   Kn = sum Q0 r_i r_j + Q1 (r_i dr_j + dr_i r_j) + Q2 dr_i dr_j.
+        const size_t blk = (size_t) W_slab * N_sparse_t;
+        const int pc[6] = {0, 1, 2, 0, 0, 1};
+        const int pd[6] = {0, 1, 2, 1, 2, 2};
+        const int n_hh = M * N_sparse_t;
+        for (int idx = THREAD_START_X; idx < n_hh; idx += BLOCK_INCR_X)
+        {
+            const int im = idx / N_sparse_t;
+            const int b  = idx % N_sparse_t;
+            const int m_local = m_active[im] - w0;
+            cmplx rr[GB_FSTAT_MAX_STAGES][3], dd[GB_FSTAT_MAX_STAGES][3];
+            for (int st = 0; st < n_stages; ++st) {
+                const double *rp = rpix_all + (size_t) st * stage_stride;
+                for (int c = 0; c < 3; ++c)
+                    gb_sighet_v5_r_dr(mask_sh + (size_t) (c * M + im) * nwords,
+                                      rp + (size_t) c * N_sparse_t,
+                                      rp + (size_t) nchannels * N_sparse_t
+                                         + (size_t) c * N_sparse_t,
+                                      b, N_sparse_t, Dn, &rr[st][c], &dd[st][c]);
+            }
+            const size_t base = (size_t) data_idx * 9 * blk
+                                + (size_t) m_local * N_sparse_t + b;
+            cmplx K[GB_FSTAT_MAX_STAGES][GB_FSTAT_MAX_STAGES];
+            cmplx Kn[GB_FSTAT_MAX_STAGES][GB_FSTAT_MAX_STAGES];
+            for (int si = 0; si < n_stages; ++si)
+                for (int sj = 0; sj < n_stages; ++sj) {
+                    K[si][sj] = cmplx(0.0, 0.0);
+                    Kn[si][sj] = cmplx(0.0, 0.0);
+                }
+            for (int p = 0; p < 6; ++p)
+            {
+                const cmplx *Bc = (p < 3) ? B0_all : B1_all;
+                const cmplx *Bn = (p < 3) ? B0nc_all : B1nc_all;
+                const int pp = (p < 3) ? p : p - 3;
+                const cmplx P0 = Bc[base + (size_t) pp * blk];
+                const cmplx P1 = Bc[base + (size_t) (3 + pp) * blk];
+                const cmplx P2 = Bc[base + (size_t) (6 + pp) * blk];
+                cmplx Q0(0.0, 0.0), Q1(0.0, 0.0), Q2(0.0, 0.0);
+                if (project_real) {
+                    Q0 = Bn[base + (size_t) pp * blk];
+                    Q1 = Bn[base + (size_t) (3 + pp) * blk];
+                    Q2 = Bn[base + (size_t) (6 + pp) * blk];
+                }
+                const cmplx P1c = gcmplx::conj(P1);
+                // ordered pairs: (c, d) and, off the diagonal, (d, c)
+                for (int o = 0; o < ((p < 3) ? 1 : 2); ++o)
+                {
+                    const int c = (o == 0) ? pc[p] : pd[p];
+                    const int d = (o == 0) ? pd[p] : pc[p];
+                    for (int si = 0; si < n_stages; ++si)
+                        for (int sj = 0; sj < n_stages; ++sj) {
+                            const cmplx ri = rr[si][c], dri = dd[si][c];
+                            const cmplx rj = rr[sj][d], drj = dd[sj][d];
+                            K[si][sj] += P0 * (gcmplx::conj(ri) * rj)
+                                       + P1 * (gcmplx::conj(ri) * drj)
+                                       + P1c * (gcmplx::conj(dri) * rj)
+                                       + P2 * (gcmplx::conj(dri) * drj);
+                            if (project_real)
+                                Kn[si][sj] += Q0 * (ri * rj)
+                                            + Q1 * (ri * drj + dri * rj)
+                                            + Q2 * (dri * drj);
+                        }
+                }
+            }
+            if (n_stages == 2) {
+                double v10[GB_FSTAT_N_M_UPPER];
+                v10[0] =  K[0][0].real();
+                v10[1] = -K[0][1].real();
+                v10[2] = -K[0][0].imag();
+                v10[3] =  K[0][1].imag();
+                v10[4] =  K[1][1].real();
+                v10[5] =  K[1][0].imag();
+                v10[6] = -K[1][1].imag();
+                v10[7] =  K[0][0].real();
+                v10[8] = -K[0][1].real();
+                v10[9] =  K[1][1].real();
+                if (project_real) {
+                    v10[0] += Kn[0][0].real();
+                    v10[1] -= Kn[0][1].real();
+                    v10[2] -= Kn[0][0].imag();
+                    v10[3] += Kn[0][1].imag();
+                    v10[4] += Kn[1][1].real();
+                    v10[5] += Kn[1][0].imag();
+                    v10[6] -= Kn[1][1].imag();
+                    v10[7] -= Kn[0][0].real();
+                    v10[8] += Kn[0][1].real();
+                    v10[9] -= Kn[1][1].real();
+                }
+                for (int k = 0; k < GB_FSTAT_N_M_UPPER; ++k)
+                    M_partial[k] += v10[k];
+                continue;
+            }
+            for (int fi = 0; fi < GB_FSTAT_N_FILTERS; ++fi)
+                for (int fj = fi; fj < GB_FSTAT_N_FILTERS; ++fj) {
+                    const int si = s_of[fi], sj = s_of[fj];
+                    cmplx v = gcmplx::conj(alpha[fi]) * alpha[fj] * K[si][sj];
+                    if (project_real) v += alpha[fi] * alpha[fj] * Kn[si][sj];
+                    M_partial[fi * GB_FSTAT_N_FILTERS - (fi * (fi + 1)) / 2 + fj] += v.real();
+                }
+        }
+    }
+    else if (tdi_type == 0)
     {
         const int n_hh = nchannels * nchannels * M * N_sparse_t;
         for (int idx = THREAD_START_X; idx < n_hh; idx += BLOCK_INCR_X)
@@ -7403,11 +7567,20 @@ void GBComputationGroup::gb_signal_het_fstat_get_ll_wrap(
         throw std::invalid_argument(
             "[gb_signal_het_fstat_get_ll_wrap] Nt_layer * stride != Nt.");
     }
-    if (fstat_mode != 0 && fstat_mode != 1) {
+    const int fs_base  = fstat_mode & 3;
+    const int fs_flags = fstat_mode & ~3;
+    if (fs_base != 0 && fs_base != 1) {
         throw std::invalid_argument(
             "[gb_signal_het_fstat_get_ll_wrap] fstat_mode must be 0 "
             "(2 node stages + exact phi0 rotation, production) or 1 "
             "(4 independent stages, the recombination self-check).");
+    }
+    if ((fs_flags & ~(GB_SIGHET_FSTAT_CARRIER | GB_SIGHET_FSTAT_SYM)) != 0
+        || ((fs_flags & GB_SIGHET_FSTAT_SYM) && !(fs_flags & GB_SIGHET_FSTAT_CARRIER))
+        || ((fs_flags & GB_SIGHET_FSTAT_SYM) && (tdi_type != 0 || nchannels != 3))) {
+        throw std::invalid_argument(
+            "[gb_signal_het_fstat_get_ll_wrap] fstat_mode flags: CARRIER (4) "
+            "and SYM (8, needs CARRIER, XYZ with 3 channels) only.");
     }
     if (W_slab <= 0 || W_slab > Nf_active) {
         throw std::invalid_argument(
@@ -7417,7 +7590,7 @@ void GBComputationGroup::gb_signal_het_fstat_get_ll_wrap(
     }
     (void) num_data; (void) Nt_active;
 
-    const int n_stages = (fstat_mode == 1) ? 4 : 2;
+    const int n_stages = (fs_base == 1) ? 4 : 2;
     const size_t shared_bytes = gb_sighet_fstat_shared_bytes(
         n_nodes, n_knots, nchannels, m_active_half_width, N_sparse_t,
         band_len, n_stages);

@@ -92,7 +92,11 @@ class GBLookupKernelTest(unittest.TestCase):
         C = np.empty((Nfa, 3, 3))
         for c in range(3):
             for d in range(3):
-                C[:, c, d] = sxx * (1.0 + 0.01 * (c - 1)) if c == d else sxy
+                C[:, c, d] = sxx if c == d else sxy
+        # unequal channel gains: a congruence D C D keeps C positive definite
+        # (a raw diagonal offset makes the near-singular low-f C indefinite)
+        D = np.diag([0.99, 1.0, 1.01])
+        C = D[None] @ C @ D[None]
         iC_l = np.linalg.inv(C).transpose(1, 2, 0)                  # (3, 3, Nfa)
         iC_full = np.broadcast_to(iC_l[None, :, :, :, None], (R, 3, 3, Nfa, T)).copy()
         idx = np.arange(R, dtype=np.int32)
