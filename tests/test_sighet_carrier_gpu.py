@@ -162,6 +162,27 @@ class CarrierGpuCpuParityTest(unittest.TestCase):
         self.assertEqual(self._check(SIGHET_CARRIER_LAYOUT="full", SIGHET_ANCHOR_CORRECT="0"),
                          "full")
 
+    def test_carrier_fstat(self):
+        """The carrier sig-het F-stat (carrier reference + SYM Gram fold), GPU == CPU."""
+        import cupy as cp
+        out = {}
+        for be in ("cpu", GPU):
+            xp = np if be == "cpu" else cp
+            comp = GBSignalHetComputations.for_band_engine(self.comps[be], cp_repr="carrier",
+                                                           **V5_KNOBS)
+            holder = _Holder(self.slabs, self.invCs, xp)
+            with _Env(SIGHET_FSTAT_CARRIER="1"):
+                comp.setup_fstat_references(self.params_ref, holder, data_index=0,
+                                            noise_index=0)
+            self.assertTrue(comp._fstat["carrier"])
+            N, M = comp.get_fstat_ll_wdm(xp.asarray(self.params),
+                                         data_index=xp.zeros(len(self.params), dtype=xp.int32))
+            out[be] = (np.asarray(cp.asnumpy(xp.asarray(N))), np.asarray(cp.asnumpy(xp.asarray(M))))
+            comp.clear_fstat_references()
+        for a, b, name in zip(out[GPU], out["cpu"], ("N", "M")):
+            np.testing.assert_allclose(a, b, rtol=1e-10, atol=1e-10 * np.abs(b).max(),
+                                       err_msg=f"F-stat {name} GPU vs CPU")
+
     def test_carrier_reference_producer(self):
         import cupy as cp
         out = {}
