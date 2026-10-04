@@ -105,6 +105,45 @@ def _resolve_n_cp(n_cp_build, Tobs):
     return int(np.clip(int(math.ceil(float(Tobs) / spacing)) + 1, 32, 256))
 
 
+#: Control-point representation of the spline waveform build
+#: (``gbfd_build_one_source``: the make_reference stash and the v2 candidate
+#: build). ``"ampph"``: cubic splines of each XYZ channel's signed amplitude
+#: and phase. ``"reim"``: cubic splines of the Re and Im parts of each
+#: channel's envelope demodulated by the common reference phase -- identical
+#: at the nodes, LINEAR in the channel values between them, so the low-f
+#: X+Y+Z null is interpolated as itself. Per-channel amp/phase splines break
+#: that null where an envelope passes near zero (edge-on / pattern-null
+#: sources: the phase swings steeply and differently per channel) and the
+#: near-singular low-f XYZ invC amplifies the leak. Measured on the 6-month
+#: production grid (compiled v5, 256 nodes, SNR 100): edge-on anchor offsets
+#: up to 0.1 lnL from the amp/phase build vs <= 7e-5 for the exact direct
+#: build. The same knob switches the v5 scorer's candidate NODE-RATIO fit
+#: from log-polar (dlnA, dphi) cubics to Re/Im cubics of the derotated
+#: complex ratio: the log-polar fit exp()-amplifies spline overshoot near
+#: envelope minima and flip spans (compiled 6-month check: eps up to 1e7 x
+#: the true dlnL on edge-on / pattern-null sources at posterior-scale steps).
+#: v2/v3/v4 keep their log-polar fits. Env SIGHET_CP_REPR (default "reim";
+#: "ampph" restores the previous behaviour exactly).
+_CP_REPRS = ("ampph", "reim")
+
+
+def _resolve_cp_repr(cp_repr):
+    if cp_repr is None:
+        cp_repr = os.environ.get("SIGHET_CP_REPR", "reim")
+    cp_repr = str(cp_repr).lower()
+    if cp_repr not in _CP_REPRS:
+        raise ValueError(f"cp_repr must be one of {_CP_REPRS}, got {cp_repr!r}")
+    return cp_repr
+
+
+def _n_cp_kernel_arg(g):
+    """The ``n_cp_sig`` the kernels take: the node count, NEGATED for the
+    Re/Im representation (``gbfd_build_one_source`` decodes the sign; the
+    direct path, ``0``, has no representation)."""
+    n = int(g["n_cp_build"])
+    return -n if (n > 1 and g.get("cp_repr", "ampph") == "reim") else n
+
+
 def _c0_row_mask_bits(c0, xp):
     """Bit-packed |c0| row-floor mask -- the v5 scorer's only view of c0.
 
@@ -294,7 +333,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     def __init__(self, data_td, ref_params, *, Nf, Nt, dt, t0, t_ref,
                  orbits, tdi_config, min_freq, max_freq, sens_model="scirdv1",
                  edge_cut=None, nt_layer=64, n_sparse_fd=1024, m_active_half_width=2,
-                 max_r=0.0, tukey_alpha=0.05, n_cp_build=-1,
+                 max_r=0.0, tukey_alpha=0.05, n_cp_build=-1, cp_repr=None,
                  force_backend="cpu"):
         if isinstance(force_backend, str) and force_backend not in ("cpu", "gbgpu_cpu"):
             raise NotImplementedError(
@@ -313,6 +352,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         Nobs = Nf * Nt
         Tobs = Nt * Nf * dt
         self.n_cp_build = _resolve_n_cp(n_cp_build, Tobs)
+        self.cp_repr = _resolve_cp_repr(cp_repr)
         t_arr = np.arange(Nobs) * dt + t0
         # plain backend flavor for the lisatools frontends (TDIConfig / TDSettings /
         # WDMSettings / GBTDIonTheFly). self.backend is the GBGPU COMPOSITE backend
@@ -367,7 +407,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             np.ascontiguousarray(ref_params[None]), 1, 9, 1, 2,
             Nf, Nt, Nf_active, Nt_active, nt_layer, N_sparse_t, stride,
             ind_min_t, ind_min_f, layer_df, dt, Tobs, t0,
-            3, n_sparse_fd, tukey_alpha, self.n_cp_build)
+            3, n_sparse_fd, tukey_alpha,
+            _n_cp_kernel_arg(dict(n_cp_build=self.n_cp_build, cp_repr=self.cp_repr)))
 
         # --- bin-fold coefficients from lisatools (dense c0 x data x invC) -------
         A0, A1, B0, B1, B0nc, B1nc = bin_fold_real(
@@ -392,7 +433,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                        ind_min_t=ind_min_t, ind_min_f=ind_min_f, layer_df=layer_df,
                        dt=dt, Tobs=Tobs, t0=t0, n_sparse_fd=n_sparse_fd,
                        tukey_alpha=tukey_alpha, max_r=max_r, m_half=self.m_half,
-                       n_cp_build=self.n_cp_build)
+                       n_cp_build=self.n_cp_build, cp_repr=self.cp_repr)
 
     @property
     def xp(self):
@@ -551,7 +592,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     def for_band_engine(cls, chunked_comp, *, nt_layer=64, n_sparse_fd=1024,
                         m_active_half_width=2, max_r=0.0, n_cp_build=-1,
                         v3_n_nodes=0, v4_knots=0, v4_band=0, v5=0,
-                        tukey_alpha=None):
+                        tukey_alpha=None, cp_repr=None):
         """Build a data-less engine-mode instance around ``chunked_comp``.
 
         ``max_r=0`` disables the kernel's heterodyne-ratio magnitude clip.
@@ -564,6 +605,11 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         e^8 (~3e-6). The FLOOR_EPS reference floor in the kernel already
         guards the divide-by-small on its own. Set ``max_r > 0`` only as
         a diagnostic.
+
+        ``cp_repr`` picks the control-point representation of the spline
+        waveform build and of the v5 node-ratio fit (``"ampph"`` /
+        ``"reim"``; ``None`` -> env ``SIGHET_CP_REPR``, default ``"reim"``;
+        ``"ampph"`` is the rollback); see ``_CP_REPRS``.
 
         ``v5`` selects the V5 occupancy experiment (opt-in, default OFF --
         with ``v5=0`` nothing about the v2/v3/v4 paths changes). It only
@@ -735,6 +781,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                        tukey_alpha=tukey_alpha, max_r=float(max_r),
                        m_half=self.m_half,
                        n_cp_build=_resolve_n_cp(n_cp_build, Tobs),
+                       cp_repr=_resolve_cp_repr(cp_repr),
                        v3_n_nodes=int(v3_n_nodes), v4_knots=int(v4_knots),
                        v4_band=int(v4_band), v5=int(v5))
         # RESOLVED-CONFIG ECHO. Nothing else in the stack prints what the
@@ -753,11 +800,12 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         logger.info(
             "sig-het engine resolved: v3_n_nodes=%d v4_knots=%d v4_band=%d "
             "v5=%d | nt_layer=%d (stride %d) N_sparse_t=%d n_sparse_fd=%d "
-            "n_cp_build=%d m_half=%d max_r=%g | Nf=%d Nt=%d Nt_active=%d "
-            "Tobs=%.6gs -> sparse spacing %.1f h",
+            "n_cp_build=%d cp_repr=%s m_half=%d max_r=%g | Nf=%d Nt=%d "
+            "Nt_active=%d Tobs=%.6gs -> sparse spacing %.1f h",
             int(v3_n_nodes), int(v4_knots), int(v4_band), int(v5),
             int(nt_layer), int(stride), int(N_sparse_t), int(n_sparse_fd),
-            _resolve_n_cp(n_cp_build, Tobs), self.m_half, float(max_r),
+            _resolve_n_cp(n_cp_build, Tobs), self._g["cp_repr"], self.m_half,
+            float(max_r),
             Nf, Nt, Nt_active, Tobs, stride * Nf * dt / 3600.0,
         )
         # Deltas are what the in-model repeats consume; keep the chunked
@@ -1069,7 +1117,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 g["nt_layer"], g["N_sparse_t"], g["stride"],
                 g["ind_min_t"], g["ind_min_f"],
                 g["layer_df"], g["dt"], g["Tobs"], g["t0"],
-                3, g["n_sparse_fd"], g["tukey_alpha"], g["n_cp_build"])
+                3, g["n_sparse_fd"], g["tukey_alpha"], _n_cp_kernel_arg(g))
             c0_sparse_w[s:s + k] = c0_sparse_chunk
             folds.append(bin_fold_real(
                 res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
@@ -1557,7 +1605,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 g["nt_layer"], g["N_sparse_t"], g["stride"],
                 g["ind_min_t"], g["ind_min_f"],
                 g["layer_df"], g["dt"], g["Tobs"], g["t0"],
-                3, g["n_sparse_fd"], g["tukey_alpha"], g["n_cp_build"])
+                3, g["n_sparse_fd"], g["tukey_alpha"], _n_cp_kernel_arg(g))
             c0_sparse_w[s:s + k] = c0_sparse_chunk
             folds.append(bin_fold_real(
                 res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
@@ -1998,7 +2046,10 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 self._v4_band_arrays[2],
                 x, self.params_ref_all, di, _w_lo,
                 N, num_data,
-                self._resolve_v3_nodes(x, di), int(g["v4_knots"]),
+                # NEGATED node count = the Re/Im node-ratio fit (the wrap
+                # decodes it); cp_repr selects the Re/Im family as a whole.
+                (-1 if g.get("cp_repr", "ampph") == "reim" else 1)
+                * self._resolve_v3_nodes(x, di), int(g["v4_knots"]),
                 9, 1, 2,
                 g["Nf"], g["Nt"], g["Nf_active"], _W_slab, g["Nt_active"],
                 g["nt_layer"], g["N_sparse_t"], g["stride"],
@@ -2084,7 +2135,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             g["layer_df"], g["dt"], g["Tobs"], g["t0"],
             3, 0, g["n_sparse_fd"],
             g["tukey_alpha"], g["max_r"], 1,     # project_real=1
-            g["n_cp_build"], d_h_im)
+            _n_cp_kernel_arg(g), d_h_im)
         self.last_d_h = d_h.copy()
         self.last_h_h = h_h.copy()
         self.last_d_h_im = _QUAD_SIGN_SIGHET * d_h_im

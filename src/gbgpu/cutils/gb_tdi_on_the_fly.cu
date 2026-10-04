@@ -363,6 +363,9 @@ int GBTDIonTheFly::get_gb_fd_buffer_size(int N, int nchannels, int n_cp_sig)
     // amp/phase/dphi_ref coefficient stacks + B + PCR scratch + un-het
     // phi_ref) + the raw cp TDI (cmplx) + extract/unwrap scratch.
     // The MAX of the two is reserved so a runtime path switch is safe.
+    // n_cp_sig < -1 selects the same arena with the Re/Im representation
+    // (see gbfd_build_one_source), so only its magnitude sizes it.
+    if (n_cp_sig < -1) n_cp_sig = -n_cp_sig;
     const size_t common =
           N_PARAMS_MAX * sizeof(double)
         + (size_t) N * sizeof(double)
@@ -485,6 +488,10 @@ void gbfd_radix2_fft_inplace(cmplx *a, int N, int log2N)
 // dense rfft(Tukey*td) convention. The same taper formula is used as in
 // the chunked-het sparse FD path (TDIonTheFly.cu:2074-2098) so cross-path
 // inner products line up at FP precision.
+// n_cp_sig: <= 1 direct per-point evaluation; > 1 control-point splines of
+// each channel's (signed) amplitude and phase; < -1 control-point splines
+// of the Re and Im parts of each channel's envelope demodulated by the
+// common reference phase, with |n_cp_sig| nodes (see the spline branch).
 CUDA_DEVICE
 void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
                            double *params_in, double t_start, double Tobs,
@@ -494,6 +501,8 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
                            int *kf0_out, double *f0g_out, double *dts_out,
                            double tukey_alpha, double edge_frac, int n_cp_sig)
 {
+    const bool cp_reim = (n_cp_sig < -1);
+    if (cp_reim) n_cp_sig = -n_cp_sig;
     // ---- carve up shared memory ------------------------------------------
     char *cur = (char*) shared_mem;
 
@@ -600,6 +609,28 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
             CUDA_SYNC_THREADS;
             tof->new_unwrap_phase(flip, n_cp_sig, ph_y);
             CUDA_SYNC_THREADS;
+            if (cp_reim)
+            {
+                // Re/Im REPRESENTATION: overwrite (amp, phase) at the nodes
+                // with the Re and Im parts of w_c = amp * e^{i tdi_phase}
+                // (the envelope demodulated by the COMMON reference phase,
+                // which keeps its own dphi_ref spline). Identical at the
+                // nodes; between them the interpolation is LINEAR in the
+                // channel values, so X+Y+Z is interpolated as itself and the
+                // low-f XYZ null survives (per-channel amp/phase splines
+                // break it: the steep phase swing through a near-null
+                // envelope is incoherent across channels and the
+                // near-singular low-f XYZ invC amplifies it). The signed
+                // amplitude passes straight through.
+                for (int k = THREAD_START_X; k < n_cp_sig; k += BLOCK_INCR_X)
+                {
+                    const double a = amp_y[k];
+                    const double p = ph_y[k];
+                    amp_y[k] = a * cos(p);
+                    ph_y[k]  = a * sin(p);
+                }
+                CUDA_SYNC_THREADS;
+            }
             wdm_fit_cubic_spline(t_cp, amp_y, amp_c1, amp_c2, amp_c3,
                                   B_b, pcr, n_cp_sig,
                                   CUBIC_SPLINE_LINEAR_SPACING);
@@ -645,9 +676,21 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
                 // (NaN, NaN) (cuda_complex.hpp signbit guard) that the
                 // NaN scrub below then silently zeroes.
                 const double th_cp = tph + dph + phi0_start;
-                const double aw_cp = amp * w;
-                tdi_chan[c * N + n] =
-                    cmplx(aw_cp * cos(th_cp), aw_cp * sin(th_cp));
+                if (cp_reim)
+                {
+                    // amp / tph hold Re(w_c) / Im(w_c) here:
+                    // tdi_chan = w * w_c * e^{i (dphi_ref + 2 pi f0g t_start)}
+                    const double th_r = dph + phi0_start;
+                    const double cr = cos(th_r), sr = sin(th_r);
+                    tdi_chan[c * N + n] =
+                        cmplx(w * (amp * cr - tph * sr), w * (amp * sr + tph * cr));
+                }
+                else
+                {
+                    const double aw_cp = amp * w;
+                    tdi_chan[c * N + n] =
+                        cmplx(aw_cp * cos(th_cp), aw_cp * sin(th_cp));
+                }
             }
             // Barrier before the single-channel coefficient buffers are
             // reused for the next channel.
@@ -5524,6 +5567,7 @@ void gb_signal_het_v5_score_one_source(
     int     ind_min_t, int ind_min_f, int m_active_half_width,
     double  layer_df, double dt, double T_obs, double t_start,
     int     nchannels, int tdi_type, int project_real,
+    int     ratio_reim,
     double *dh_im_partial = nullptr)
 {
     const int M      = 2 * m_active_half_width + 1;
@@ -5648,15 +5692,26 @@ void gb_signal_het_v5_score_one_source(
         // |c0|^2 fold weight there, so flooring is exact where it matters.
         if (THREAD_ZERO) {
             double amax = 0.0;
-            for (int k = 0; k < n_nodes; ++k)
-                if (amp_y[k] > amax) amax = amp_y[k];
+            for (int k = 0; k < n_nodes; ++k) {
+                const double ak = ratio_reim ? fabs(amp_y[k]) : amp_y[k];
+                if (ak > amax) amax = ak;
+            }
             pcr[0] = (amax > 1e-300) ? 1e-2 * amax : 1e-300;
         }
         CUDA_SYNC_THREADS;
         for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X) {
             double a = amp_y[k];
-            if (a < pcr[0]) a = pcr[0];
-            dlnA[(size_t) c * n_nodes + k] = log(a);
+            if (ratio_reim) {
+                // Re/Im mode keeps the SIGNED amplitude (a1/a0 with the
+                // extraction's flip pi in both phases is the exact complex
+                // ratio), floored in MAGNITUDE exactly like the reference
+                // below so the ratio is identically 1 at the reference.
+                dlnA[(size_t) c * n_nodes + k] =
+                    (fabs(a) < pcr[0]) ? copysign(pcr[0], a) : a;
+            } else {
+                if (a < pcr[0]) a = pcr[0];
+                dlnA[(size_t) c * n_nodes + k] = log(a);
+            }
             dphi[(size_t) c * n_nodes + k] = ph_y[k] + phiun_c[k];
         }
         CUDA_SYNC_THREADS;
@@ -5670,12 +5725,38 @@ void gb_signal_het_v5_score_one_source(
         CUDA_SYNC_THREADS;
         if (THREAD_ZERO) {
             double amax = 0.0;
-            for (int k = 0; k < n_nodes; ++k)
-                if (amp_y[k] > amax) amax = amp_y[k];
+            for (int k = 0; k < n_nodes; ++k) {
+                const double ak = ratio_reim ? fabs(amp_y[k]) : amp_y[k];
+                if (ak > amax) amax = ak;
+            }
             pcr[0] = (amax > 1e-300) ? 1e-2 * amax : 1e-300;
         }
         CUDA_SYNC_THREADS;
-        for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X) {
+        if (ratio_reim)
+        {
+            // Re/Im NODE RATIO: r_k = (a1/a0) e^{i (theta1 - theta0 - derot)}
+            // stored as (Re, Im) in the (dlnA, dphi) rows. Both amplitudes
+            // keep the log-polar path's relative floor (|a| >= 1e-2 max, in
+            // magnitude, sign kept), so r == 1 exactly at the reference, but
+            // there is no exp() of a spline anywhere: the log-polar fit's
+            // overshoot near an envelope minimum (or a flip span that the
+            // candidate and the reference cross at different nodes) became
+            // exp()-amplified garbage -- measured eps up to 1e7 x the true
+            // dlnL on edge-on and pattern-null sources.
+            for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X) {
+                const double a0  = (fabs(amp_y[k]) < pcr[0])
+                                 ? copysign(pcr[0], amp_y[k]) : amp_y[k];
+                const double rat = dlnA[(size_t) c * n_nodes + k] / a0;
+                const double tau = t_nodes[k] - t_start;
+                const double dph = dphi[(size_t) c * n_nodes + k]
+                    - (ph_y[k] + phiun_r[k])
+                    - TWO_PI * (df0 * tau + 0.5 * dfdot * tau * tau);
+                dlnA[(size_t) c * n_nodes + k] = rat * cos(dph);
+                dphi[(size_t) c * n_nodes + k] = rat * sin(dph);
+            }
+            CUDA_SYNC_THREADS;
+        }
+        for (int k = THREAD_START_X; (!ratio_reim) && k < n_nodes; k += BLOCK_INCR_X) {
             double a = amp_y[k];
             if (a < pcr[0]) a = pcr[0];
             const double tau = t_nodes[k] - t_start;
@@ -5692,7 +5773,7 @@ void gb_signal_het_v5_score_one_source(
         CUDA_SYNC_THREADS;
         // node-sequence unwrap of the RESIDUAL phase (post-derot the
         // adjacent-node difference is << pi inside the trust region).
-        if (THREAD_ZERO) {
+        if (THREAD_ZERO && !ratio_reim) {
             double *dp = dphi + (size_t) c * n_nodes;
             for (int k = 1; k < n_nodes; ++k) {
                 double d = dp[k] - dp[k - 1];
@@ -5745,13 +5826,25 @@ void gb_signal_het_v5_score_one_source(
         const size_t o   = (size_t) c * n_nodes + seg;
         const double lA  = dlnA[o] + cA1[o] * dx + cA2[o] * dx2
                          + cA3[o] * dx2 * dx;
-        const double ph  = dphi[o] + cP1[o] * dx + cP2[o] * dx2
-                         + cP3[o] * dx2 * dx
-                         + TWO_PI * (df0 * tau + 0.5 * dfdot * tau * tau);
-        // NOTE: direct cos/sin, never gcmplx::polar (signed-rho NaN trap).
-        const double amp = exp(lA);
-        rk_re[(size_t) c * n_knots + k] = amp * cos(ph);
-        rk_im[(size_t) c * n_knots + k] = amp * sin(ph);
+        if (ratio_reim) {
+            // lA / im are Re / Im of the derotated ratio; restore derot.
+            const double im  = dphi[o] + cP1[o] * dx + cP2[o] * dx2
+                             + cP3[o] * dx2 * dx;
+            const double drt = TWO_PI * (df0 * tau + 0.5 * dfdot * tau * tau);
+            const double cd = cos(drt), sd = sin(drt);
+            rk_re[(size_t) c * n_knots + k] = lA * cd - im * sd;
+            rk_im[(size_t) c * n_knots + k] = lA * sd + im * cd;
+        } else {
+            // (expression kept verbatim: the log-polar path stays
+            // bit-identical to v4)
+            const double ph  = dphi[o] + cP1[o] * dx + cP2[o] * dx2
+                             + cP3[o] * dx2 * dx
+                             + TWO_PI * (df0 * tau + 0.5 * dfdot * tau * tau);
+            // NOTE: direct cos/sin, never gcmplx::polar (signed-rho NaN trap).
+            const double amp = exp(lA);
+            rk_re[(size_t) c * n_knots + k] = amp * cos(ph);
+            rk_im[(size_t) c * n_knots + k] = amp * sin(ph);
+        }
     }
     CUDA_SYNC_THREADS;
 
@@ -6000,7 +6093,7 @@ void gb_signal_het_v5_get_ll_kernel(
     int Nf, int Nf_active, int W_slab, int N_sparse_t, int stride,
     int ind_min_t, int ind_min_f, int m_active_half_width,
     double layer_df, double dt, double T_obs, double t_start,
-    int nchannels, int tdi_type, int project_real,
+    int nchannels, int tdi_type, int project_real, int ratio_reim,
     double *d_h_im_out)
 {
     extern CUDA_SHARED char shared_mem[];
@@ -6027,7 +6120,7 @@ void gb_signal_het_v5_get_ll_kernel(
             Nf, Nf_active, W_slab, N_sparse_t, stride,
             ind_min_t, ind_min_f, m_active_half_width,
             layer_df, dt, T_obs, t_start,
-            nchannels, tdi_type, project_real,
+            nchannels, tdi_type, project_real, ratio_reim,
             &dh_im_partial);
 
         const int tid = threadIdx.x;
@@ -6079,6 +6172,10 @@ void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
     int     v5_mode, double *d_h_im_out)
 {
     gb_sighet_check_m_half(m_active_half_width);
+    // n_nodes < 0 selects the Re/Im node-ratio fit (see the node stage of
+    // gb_signal_het_v5_score_one_source) with |n_nodes| nodes.
+    const bool ratio_reim = (n_nodes < 0);
+    if (ratio_reim) n_nodes = -n_nodes;
     if (n_nodes < 4) {
         throw std::invalid_argument(
             "[gb_signal_het_v5_get_ll_wrap] n_nodes must be >= 4 "
@@ -6148,7 +6245,7 @@ void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
         Nf, Nf_active, W_slab, N_sparse_t, stride,
         ind_min_t, ind_min_f, m_active_half_width,
         layer_df, dt, T_obs, t_start,
-        nchannels, tdi_type, project_real, d_h_im_out);
+        nchannels, tdi_type, project_real, (int) ratio_reim, d_h_im_out);
 
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
@@ -6202,7 +6299,7 @@ void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
             Nf, Nf_active, W_slab, N_sparse_t, stride,
             ind_min_t, ind_min_f, m_active_half_width,
             layer_df, dt, T_obs, t_start,
-            nchannels, tdi_type, project_real,
+            nchannels, tdi_type, project_real, ratio_reim,
             &dh_im_partial);
         d_h_out[bin] = 0.5 * dh_partial;
         h_h_out[bin] = 0.5 * hh_partial;
