@@ -7945,9 +7945,13 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
                             : ((a.slab_lo != nullptr) ? a.slab_lo[n_slot] : a.ind_min_f);
     const size_t plane_d = (size_t) a.W_slab * a.Nt_active;
     const size_t plane_c = (size_t) a.W_invC * a.Nt_active;
-    const double *Dbase = a.data + (size_t) d_slot * nch * plane_d;
-    const double *Cbase = a.invC + (size_t) (mirror ? a.invC_row[n_slot] : n_slot)
-                                   * nch * nch * plane_c;
+    const bool fill = (a.fill_out != nullptr);
+    const double *Dbase = fill ? nullptr : a.data + (size_t) d_slot * nch * plane_d;
+    const double *Cbase = fill ? nullptr
+                               : a.invC + (size_t) (mirror ? a.invC_row[n_slot] : n_slot)
+                                          * nch * nch * plane_c;
+    double *Fbase = fill ? a.fill_out + (size_t) d_slot * nch * plane_d : nullptr;
+    const double fac = fill ? a.factors[bin_i] : 0.0;
     const bool coarse = a.k_coarse && kmeta[1] > 0;
     double dh = 0.0, hh = 0.0, dhim = 0.0;
 
@@ -8005,7 +8009,8 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
             const int m = m0 + l;
             if (m < a.ind_min_f || m > a.ind_max_f) continue;
             const int ml_d = m - d_lo, ml_c = m - n_lo;
-            if (ml_d < 0 || ml_d >= a.W_slab || ml_c < 0 || ml_c >= a.W_invC) continue;
+            if (ml_d < 0 || ml_d >= a.W_slab) continue;
+            if (!fill && (ml_c < 0 || ml_c >= a.W_invC)) continue;
             const double f_norm = f_ref - (double) m * a.layer_df;
             double tc, ts, tdc, tds;
             const int jl = coarse ? m - kmeta[0] : -1;
@@ -8043,8 +8048,22 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
                     h[c]  += (dcc * Vr[c] - dss * Vi[c]) * inv2pi;
                     hq[c] += (dcc * Vi[c] + dss * Vr[c]) * inv2pi;
                 }
-                D[c] = Dbase[(size_t) c * plane_d + (size_t) ml_d * a.Nt_active + nl];
             }
+            if (fill)
+            {
+                for (int c = 0; c < nch; ++c)
+                {
+                    double *dst = Fbase + (size_t) c * plane_d + (size_t) ml_d * a.Nt_active + nl;
+#ifdef __CUDA_ARCH__
+                    atomicAdd(dst, fac * h[c]);     // rows may share a slot
+#else
+                    *dst += fac * h[c];
+#endif
+                }
+                continue;
+            }
+            for (int c = 0; c < nch; ++c)
+                D[c] = Dbase[(size_t) c * plane_d + (size_t) ml_d * a.Nt_active + nl];
             // the XYZ inverse covariance is symmetric in its channel pair: read
             // the 6 unique planes (00, 11, 22, 01, 02, 12) -- a quarter less
             // traffic on the memory-bound contraction
@@ -8096,7 +8115,7 @@ void gb_lookup_get_ll_kernel(GBTDIonTheFly *tdi_on_fly, GBLookupArgs a)
             d_h_tmp[tid] = dhim;
             dhim_sum = block_reduce(d_h_tmp);
         }
-        if (THREAD_ZERO)
+        if (THREAD_ZERO && a.d_h_out != nullptr)
         {
             a.d_h_out[bin_i] = dh_sum;
             a.h_h_out[bin_i] = hh_sum;
@@ -8152,6 +8171,7 @@ void GBComputationGroup::gb_lookup_get_ll_wrap(GBTDIonTheFly *tdi_on_fly, GBLook
         double dh = 0.0, hh = 0.0, dhim = 0.0;
         gb_lookup_score_one_source(a, tdi_on_fly, (void *) scratch.data(), bin,
                                    &dh, &hh, &dhim);
+        if (a.d_h_out == nullptr) continue;     // fill mode
         a.d_h_out[bin] = dh;
         a.h_h_out[bin] = hh;
         if (a.d_h_im_out != nullptr) a.d_h_im_out[bin] = dhim;

@@ -77,6 +77,11 @@ struct GBLookupArgs {
                                 // where a layer straddles the table support); 0: per pixel
     WDMLookupTableView tab;
     double fdot_lo, fdot_hi;    // exact fdot support of the table
+    // FILL mode (fill_out != nullptr): instead of the inner products, add
+    // factors[row] * h into fill_out (the data-slab layout, slot data_index[row]);
+    // data / invC / noise_index and the d_h / h_h outputs are then unused.
+    double *fill_out;
+    const double *factors;
 };
 
 // CPU/GPU class-name aliasing -- one rule, both layers.

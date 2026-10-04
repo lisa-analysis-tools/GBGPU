@@ -1078,6 +1078,21 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         int FD, int FF, double fdot0, double dfdot, double f0, double df,
         double f_lo, double f_hi, int ref_odd, double fdot_lo, double fdot_hi);
 
+    // GB lookup FILL (gb_lookup_get_ll_wrap in fill mode).
+    void gb_lookup_fill(
+        GBTDIonTheFlyWrap *tdi_wrap,
+        array_type<double> fill_out, array_type<double> factors,
+        array_type<double> params, array_type<int> data_index,
+        array_type<int> slab_lo, int W_slab, int n_slots_d,
+        int num_bin, int nparams, int nchannels,
+        int n_nodes, double t_node0, double dt_node,
+        double t0, double layer_dt, double layer_df,
+        int ind_min_t, int Nt_active, int ind_min_f, int ind_max_f,
+        int num_m_layers, int k1, int k_coarse,
+        array_type<double> coeff_c, array_type<double> coeff_s,
+        int FD, int FF, double fdot0, double dfdot, double f0, double df,
+        double f_lo, double f_hi, int ref_odd, double fdot_lo, double fdot_hi);
+
     // Carrier-mode reference producer: the FD build runs all ``nchannels`` but
     // only channel 0 is emitted (the carrier is channel-independent), plus the
     // packet first moment's dense transform (window -> wdm_window_dj) into

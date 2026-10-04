@@ -38,6 +38,8 @@ class GBLookupComputations(GBGPUParallelModule):
         n_nodes: response control points per row over the active span.
         num_m_layers: layers each side of the carrier layer (2 -> 5 layers).
         k1: include the amplitude-slope term.
+        fill: ``fill_global_wdm`` writes the lookup template (``fill_lookup``) instead of
+            delegating to the chunked fill.
         k_coarse: read the table only at the control points and interpolate each layer's
             (smooth) table value in time at the pixels (Mike, 10-04: "lookup computed over
             large steps in pixels ... spline the rotated representation"); a layer whose
@@ -45,7 +47,7 @@ class GBLookupComputations(GBGPUParallelModule):
     """
 
     def __init__(self, chunked_comp, table, *, n_nodes=64, num_m_layers=2, k1=True,
-                 k_coarse=True):
+                 k_coarse=True, fill=False):
         flavor = chunked_comp.backend.name.split("_", 1)[1]
         GBGPUParallelModule.__init__(self, force_backend=flavor)
         from lisatools.domains import WDMLookupTable
@@ -65,6 +67,7 @@ class GBLookupComputations(GBGPUParallelModule):
         self.num_m_layers = int(num_m_layers)
         self.k1 = bool(k1)
         self.k_coarse = bool(k_coarse)
+        self.fill = bool(fill)
         self.d_d = float(getattr(chunked_comp, "d_d", 0.0))
 
         dt = float(wdm.data_dt)
@@ -110,7 +113,38 @@ class GBLookupComputations(GBGPUParallelModule):
         return None
 
     def fill_global_wdm(self, *args, **kwargs):
+        """Chunked fill (the default), or the lookup fill when built with ``fill=True``."""
+        if self.fill:
+            return self.fill_lookup(*args, **kwargs)
         return self.chunked.fill_global_wdm(*args, **kwargs)
+
+    def fill_lookup(self, params, templates, convert_to_ra_dec=None, data_index=None,
+                    factors=None, band_slab_Nf=None, slab_min_f=None, **kwargs):
+        """Add ``factors[row] * h_row`` (the lookup template) into ``templates`` -- the flat
+        buffer of slabs ``(n_slots, 3, W, Nt_active)`` (``band_slab_Nf`` + ``slab_min_f``)
+        or the full active band. The chunked ``fill_global_wdm`` signature; its
+        ``grid_dim`` / ``m_band_half_width`` do not apply (the band is ``num_m_layers``)."""
+        if convert_to_ra_dec:
+            raise NotImplementedError("the lookup fill takes ICRS params")
+        xp = self.xp
+        x = xp.ascontiguousarray(xp.atleast_2d(xp.asarray(params, dtype=float)))
+        num_bin, nparams = x.shape
+        W = self.Nf_active if (band_slab_Nf is None or slab_min_f is None) else int(band_slab_Nf)
+        buf = templates
+        n_slots = int(buf.size // (3 * W * self.Nt_active))
+        di = xp.zeros(num_bin, dtype=xp.int32) if data_index is None else \
+            xp.ascontiguousarray(xp.asarray(data_index, dtype=xp.int32))
+        fac = xp.ones(num_bin) if factors is None else \
+            xp.ascontiguousarray(xp.asarray(factors, dtype=float))
+        self.cpp.gb_lookup_fill(
+            self.tdi_wrap, buf, fac, x.reshape(-1), di,
+            (xp.zeros(0, dtype=xp.int32) if (band_slab_Nf is None or slab_min_f is None)
+             else xp.ascontiguousarray(xp.asarray(slab_min_f, dtype=xp.int32))),
+            W, n_slots, num_bin, nparams, 3,
+            self.n_nodes, self.t_node0, self.dt_node,
+            self.t0, self.layer_dt, self.layer_df,
+            self.ind_min_t, self.Nt_active, self.ind_min_f, self.ind_max_f,
+            self.num_m_layers, int(self.k1), int(self.k_coarse), *self._tab)
 
     def __getattr__(self, name):
         # delegate the rest of the computation-object surface to the chunked comp;
@@ -185,16 +219,35 @@ class GBLookupWDMComputations(_gbwdm_base()):
     changes; only the per-row likelihood switches to the lookup.
 
     Args: those of ``GBWDMComputations`` plus ``lookup_table`` (a ``WDMLookupTable`` or
-    a path, built at the grid's layer duration) and ``lookup_n_nodes`` /
-    ``lookup_num_m_layers`` / ``lookup_k_coarse`` (see :class:`GBLookupComputations`).
+    a path, built at the grid's layer duration), ``lookup_n_nodes`` /
+    ``lookup_num_m_layers`` / ``lookup_k_coarse`` (see :class:`GBLookupComputations`) and
+    ``lookup_fill`` (default off: fills stay chunked-het).
     """
 
     def __init__(self, *args, lookup_table, lookup_n_nodes=64, lookup_num_m_layers=2,
-                 lookup_k_coarse=True, **kwargs):
+                 lookup_k_coarse=True, lookup_fill=False, **kwargs):
         super().__init__(*args, **kwargs)
         self._lookup = GBLookupComputations(self, lookup_table, n_nodes=lookup_n_nodes,
                                             num_m_layers=lookup_num_m_layers,
                                             k_coarse=lookup_k_coarse)
+        self.lookup_fill = bool(lookup_fill)
+
+    def fill_global_wdm(self, params, templates, *args, **kwargs):
+        """The chunked fill, or (``lookup_fill``) the lookup template -- then every GB
+        template the fit writes is the same model its likelihood scores."""
+        if not self.lookup_fill:
+            return super().fill_global_wdm(params, templates, *args, **kwargs)
+        if kwargs.get("convert_to_ra_dec") is None:
+            kwargs["convert_to_ra_dec"] = bool(getattr(self, "convert_to_ra_dec", False))
+        if kwargs.get("convert_to_ra_dec"):
+            from lisatools.response.directresponse import ecliptic_to_icrs
+
+            x = self.xp.asarray(self.xp.atleast_2d(params), dtype=float).copy()
+            lam, beta = ecliptic_to_icrs(x[:, -2].copy(), x[:, -1].copy())
+            x[:, -2], x[:, -1] = lam, beta
+            params = x
+        kwargs.pop("convert_to_ra_dec", None)
+        return self._lookup.fill_lookup(params, templates, *args, **kwargs)
 
     def get_ll_wdm(self, params, wdm_holder, data_index=None, noise_index=None,
                    convert_to_ra_dec=None, **kwargs):

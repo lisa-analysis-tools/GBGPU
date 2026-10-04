@@ -1229,6 +1229,48 @@ void GBComputationGroupWrap::gb_lookup_get_ll(
     a.tab.f0 = f0; a.tab.df = df; a.tab.f_lo = f_lo; a.tab.f_hi = f_hi;
     a.tab.ref_odd = ref_odd;
     a.fdot_lo = fdot_lo; a.fdot_hi = fdot_hi;
+    a.fill_out = nullptr; a.factors = nullptr;
+    gb_lookup_get_ll_wrap(tdi_wrap->waveform, a);
+}
+
+void GBComputationGroupWrap::gb_lookup_fill(
+    GBTDIonTheFlyWrap *tdi_wrap,
+    array_type<double> fill_out, array_type<double> factors,
+    array_type<double> params, array_type<int> data_index,
+    array_type<int> slab_lo, int W_slab, int n_slots_d,
+    int num_bin, int nparams, int nchannels,
+    int n_nodes, double t_node0, double dt_node,
+    double t0, double layer_dt, double layer_df,
+    int ind_min_t, int Nt_active, int ind_min_f, int ind_max_f,
+    int num_m_layers, int k1, int k_coarse,
+    array_type<double> coeff_c, array_type<double> coeff_s,
+    int FD, int FF, double fdot0, double dfdot, double f0, double df,
+    double f_lo, double f_hi, int ref_odd, double fdot_lo, double fdot_hi)
+{
+    GBLookupArgs a;
+    a.d_h_out = nullptr; a.h_h_out = nullptr; a.d_h_im_out = nullptr;
+    a.fill_out = return_pointer_and_check_length(
+        fill_out, "fill_out", nchannels * W_slab * Nt_active, n_slots_d);
+    a.factors = return_pointer_and_check_length(factors, "factors", num_bin, 1);
+    a.params = return_pointer_and_check_length(params, "params", nparams, num_bin);
+    a.data_index = return_pointer_and_check_length(data_index, "data_index", num_bin, 1);
+    a.noise_index = a.data_index;
+    a.data = nullptr; a.invC = nullptr; a.invC_row = nullptr;
+    a.slab_lo = (slab_lo.size() > 0)
+        ? return_pointer_and_check_length(slab_lo, "slab_lo", n_slots_d, 1) : nullptr;
+    a.W_slab = W_slab; a.W_invC = W_slab;
+    a.num_bin = num_bin; a.nparams = nparams; a.nchannels = nchannels;
+    a.n_nodes = n_nodes; a.t_node0 = t_node0; a.dt_node = dt_node;
+    a.t0 = t0; a.layer_dt = layer_dt; a.layer_df = layer_df;
+    a.ind_min_t = ind_min_t; a.Nt_active = Nt_active;
+    a.ind_min_f = ind_min_f; a.ind_max_f = ind_max_f;
+    a.num_m_layers = num_m_layers; a.k1 = k1; a.k_coarse = k_coarse;
+    a.tab.coeff_c = return_pointer_and_check_length(coeff_c, "coeff_c", FF, FD);
+    a.tab.coeff_s = return_pointer_and_check_length(coeff_s, "coeff_s", FF, FD);
+    a.tab.FD = FD; a.tab.FF = FF; a.tab.fdot0 = fdot0; a.tab.dfdot = dfdot;
+    a.tab.f0 = f0; a.tab.df = df; a.tab.f_lo = f_lo; a.tab.f_hi = f_hi;
+    a.tab.ref_odd = ref_odd;
+    a.fdot_lo = fdot_lo; a.fdot_hi = fdot_hi;
     gb_lookup_get_ll_wrap(tdi_wrap->waveform, a);
 }
 
@@ -1629,6 +1671,12 @@ void gbgpu_part(nb::module_ &m) {
          "common carrier (f_ref, fdot_ref) plus the amplitude-slope K1 term, "
          "contracted with the row's data / invC slabs into d_h, h_h (and the phase "
          "quadrature d_h_im when non-empty). Plain sums (no 4 df factor).")
+    .def("gb_lookup_fill",
+         &GBComputationGroupWrap::gb_lookup_fill,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "GB lookup FILL: add factors[row] * (the lookup template of row) into fill_out "
+         "(slab layout (n_slots, nch, W_slab, Nt_active), slot data_index[row]; slab_lo "
+         "empty = full band). Atomic on the GPU (rows may share a slot).")
     .def("gb_signal_het_make_reference_carrier",
          &GBComputationGroupWrap::gb_signal_het_make_reference_carrier,
          nb::call_guard<nb::gil_scoped_release>(),

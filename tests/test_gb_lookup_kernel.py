@@ -171,6 +171,30 @@ class GBLookupKernelTest(unittest.TestCase):
                                                       v4_knots=64, v4_band=16, v5=1)
         self.assertIs(sig.chunked, sub)
 
+    def test_fill_is_the_scored_template(self):
+        """The lookup fill writes exactly the template the scorer scores: with the data =
+        the lookup fill of the rows, d_h == h_h (self-consistency to rounding); and it
+        agrees with the chunked fill at the template-accuracy level."""
+        lk = GBLookupComputations(self.chunked, self.table, fill=True)
+        buf = np.zeros(self.narrow.linear_data_arr[0].size)
+        lk.fill_global_wdm(self.p, buf, data_index=self.idx, factors=np.ones(len(self.p)),
+                           band_slab_Nf=W, slab_min_f=self.slab_lo)
+        h = _Holder(buf.reshape(len(self.p), 3, W, -1),
+                    self.narrow.linear_psd_arr[0].reshape(len(self.p), 3, 3, W, -1), W,
+                    self.slab_lo)
+        lk.get_ll_wdm(self.p, h, data_index=self.idx, noise_index=self.idx)
+        np.testing.assert_allclose(np.asarray(lk.d_h_out), np.asarray(lk.h_h_out), rtol=1e-12)
+        ref = np.zeros_like(buf)
+        self.chunked.fill_global_wdm(self.p, ref, data_index=self.idx,
+                                     factors=np.ones(len(self.p)), band_slab_Nf=W,
+                                     slab_min_f=self.slab_lo, m_band_half_width=2)
+        rel = np.linalg.norm(buf - ref) / np.linalg.norm(ref)
+        self.assertLess(rel, 1e-3, f"lookup vs chunked fill {rel:.2e}")
+        # factors scale linearly (a removal is factor -1)
+        lk.fill_global_wdm(self.p, buf, data_index=self.idx, factors=-np.ones(len(self.p)),
+                           band_slab_Nf=W, slab_min_f=self.slab_lo)
+        self.assertLess(np.abs(buf).max(), 1e-12 * np.abs(ref).max())
+
     def test_k1_term_is_load_bearing(self):
         with_k1 = self._rel(self._lk())["h_h"]
         without = self._rel(self._lk(k1=False))["h_h"]
@@ -232,6 +256,19 @@ class GBLookupGpuParityTest(GBLookupKernelTest):
                 np.testing.assert_allclose(cp.asnumpy(v), cpu[k], rtol=1e-10,
                                            atol=1e-10 * np.abs(cpu["h_h"]).max(),
                                            err_msg=f"{k} GPU vs CPU (k_coarse={kc})")
+        # the fill (atomic adds on the GPU: two rows share each slot here)
+        P2 = np.concatenate([self.p, self.p])
+        I2 = np.concatenate([self.idx, self.idx])
+        cpu_buf = np.zeros(h.linear_data_arr[0].size)
+        GBLookupComputations(self.chunked, self.table, fill=True).fill_global_wdm(
+            P2, cpu_buf, data_index=I2, factors=np.ones(len(P2)), band_slab_Nf=W,
+            slab_min_f=self.slab_lo)
+        gpu_buf = cp.zeros(cpu_buf.size)
+        GBLookupComputations(g_ch, self.table, fill=True).fill_global_wdm(
+            cp.asarray(P2), gpu_buf, data_index=cp.asarray(I2), factors=cp.ones(len(P2)),
+            band_slab_Nf=W, slab_min_f=cp.asarray(self.slab_lo))
+        np.testing.assert_allclose(cp.asnumpy(gpu_buf), cpu_buf, rtol=0,
+                                   atol=1e-10 * np.abs(cpu_buf).max(), err_msg="fill GPU vs CPU")
 
 
 if __name__ == "__main__":
