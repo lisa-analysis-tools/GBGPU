@@ -1571,15 +1571,17 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         chunked delegate and removed in ``get_ll_wdm`` (applied to h_h, which
         is phase-independent, so the phase-max quadrature path inherits it).
 
-        ``SIGHET_ANCHOR_CORRECT``: ``auto`` (default) corrects only when the
-        stash lacks the exact-fold terms -- the collapsed stash with the second
-        moment and the packet first moment (c1) leaves ~3e-4 / 3e-2 lnL max at
-        SNR 100 / 1000 (6 months, stride 36), so it is skipped there; the
-        full-layout fallback (asymmetric noise, ``SIGHET_CARRIER_COLLAPSE=0``)
-        or ``SIGHET_CARRIER_C1=0`` keep it. ``1`` always, ``0`` never.
+        ``SIGHET_ANCHOR_CORRECT``: ``1`` (default) always; ``0`` never; ``auto``
+        skips it on the carrier-fold layouts (sym / collapsed with c1). The
+        exact-fold layouts leave a residual template error of ~2e-4 at low-f
+        edge-on sources (first cluster GPU probe, 3 months: zero-data h_h ratio
+        up to 1.0005 with the correction off); a data = source gate hides it
+        (the anchor error is then second order, ~3e-4 lnL at SNR 100), real
+        residuals do not. On the GPU the correction is one batched chunked
+        scoring per reference block (0.1 s for 2048 references), so it stays on.
         """
         g = self._g
-        knob = os.environ.get("SIGHET_ANCHOR_CORRECT", "auto")
+        knob = os.environ.get("SIGHET_ANCHOR_CORRECT", "1").lower()
         exact_fold = self._stash_layout in ("collapsed", "sym") and bool(self._stash_c1)
         if (g.get("cp_repr") != "carrier" or knob == "0"
                 or (knob != "1" and exact_fold)):
