@@ -1056,6 +1056,28 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         int nchannels,
         int N_sparse_fd, double tukey_alpha, int n_cp_sig);
 
+    // GB direct-to-WDM LOOKUP scorer (gb_lookup_get_ll_wrap): d_h / h_h (and the
+    // phase quadrature d_h_im when non-empty) of num_bin rows against their
+    // data / invC slabs. slab_lo empty = full band; invC_row empty = per-slot
+    // invC (non-empty: shared-psd mirror rows, W_invC = Nf_active).
+    void gb_lookup_get_ll(
+        GBTDIonTheFlyWrap *tdi_wrap,
+        array_type<double> d_h_out, array_type<double> h_h_out,
+        array_type<double> d_h_im_out,
+        array_type<double> params,
+        array_type<int> data_index, array_type<int> noise_index,
+        array_type<double> data, array_type<double> invC,
+        array_type<int> slab_lo, array_type<int> invC_row,
+        int W_slab, int W_invC, int n_slots_d, int n_slots_c,
+        int num_bin, int nparams, int nchannels,
+        int n_nodes, double t_node0, double dt_node,
+        double t0, double layer_dt, double layer_df,
+        int ind_min_t, int Nt_active, int ind_min_f, int ind_max_f,
+        int num_m_layers, int k1, int k_coarse,
+        array_type<double> coeff_c, array_type<double> coeff_s,
+        int FD, int FF, double fdot0, double dfdot, double f0, double df,
+        double f_lo, double f_hi, int ref_odd, double fdot_lo, double fdot_hi);
+
     // Carrier-mode reference producer: the FD build runs all ``nchannels`` but
     // only channel 0 is emitted (the carrier is channel-independent), plus the
     // packet first moment's dense transform (window -> wdm_window_dj) into

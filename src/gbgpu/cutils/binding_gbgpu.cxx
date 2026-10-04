@@ -1182,6 +1182,56 @@ void GBComputationGroupWrap::gb_signal_het_make_reference(
         N_sparse_fd, tukey_alpha, n_cp_sig);
 }
 
+void GBComputationGroupWrap::gb_lookup_get_ll(
+    GBTDIonTheFlyWrap *tdi_wrap,
+    array_type<double> d_h_out, array_type<double> h_h_out,
+    array_type<double> d_h_im_out,
+    array_type<double> params,
+    array_type<int> data_index, array_type<int> noise_index,
+    array_type<double> data, array_type<double> invC,
+    array_type<int> slab_lo, array_type<int> invC_row,
+    int W_slab, int W_invC, int n_slots_d, int n_slots_c,
+    int num_bin, int nparams, int nchannels,
+    int n_nodes, double t_node0, double dt_node,
+    double t0, double layer_dt, double layer_df,
+    int ind_min_t, int Nt_active, int ind_min_f, int ind_max_f,
+    int num_m_layers, int k1, int k_coarse,
+    array_type<double> coeff_c, array_type<double> coeff_s,
+    int FD, int FF, double fdot0, double dfdot, double f0, double df,
+    double f_lo, double f_hi, int ref_odd, double fdot_lo, double fdot_hi)
+{
+    GBLookupArgs a;
+    a.d_h_out = return_pointer_and_check_length(d_h_out, "d_h_out", num_bin, 1);
+    a.h_h_out = return_pointer_and_check_length(h_h_out, "h_h_out", num_bin, 1);
+    a.d_h_im_out = (d_h_im_out.size() > 0)
+        ? return_pointer_and_check_length(d_h_im_out, "d_h_im_out", num_bin, 1) : nullptr;
+    a.params = return_pointer_and_check_length(params, "params", nparams, num_bin);
+    a.data_index = return_pointer_and_check_length(data_index, "data_index", num_bin, 1);
+    a.noise_index = return_pointer_and_check_length(noise_index, "noise_index", num_bin, 1);
+    a.data = return_pointer_and_check_length(
+        data, "data", nchannels * W_slab * Nt_active, n_slots_d);
+    a.invC = return_pointer_and_check_length(
+        invC, "invC", nchannels * nchannels * W_invC * Nt_active, n_slots_c);
+    a.slab_lo = (slab_lo.size() > 0)
+        ? return_pointer_and_check_length(slab_lo, "slab_lo", n_slots_d, 1) : nullptr;
+    a.invC_row = (invC_row.size() > 0)
+        ? return_pointer_and_check_length(invC_row, "invC_row", n_slots_d, 1) : nullptr;
+    a.W_slab = W_slab; a.W_invC = W_invC;
+    a.num_bin = num_bin; a.nparams = nparams; a.nchannels = nchannels;
+    a.n_nodes = n_nodes; a.t_node0 = t_node0; a.dt_node = dt_node;
+    a.t0 = t0; a.layer_dt = layer_dt; a.layer_df = layer_df;
+    a.ind_min_t = ind_min_t; a.Nt_active = Nt_active;
+    a.ind_min_f = ind_min_f; a.ind_max_f = ind_max_f;
+    a.num_m_layers = num_m_layers; a.k1 = k1; a.k_coarse = k_coarse;
+    a.tab.coeff_c = return_pointer_and_check_length(coeff_c, "coeff_c", FF, FD);
+    a.tab.coeff_s = return_pointer_and_check_length(coeff_s, "coeff_s", FF, FD);
+    a.tab.FD = FD; a.tab.FF = FF; a.tab.fdot0 = fdot0; a.tab.dfdot = dfdot;
+    a.tab.f0 = f0; a.tab.df = df; a.tab.f_lo = f_lo; a.tab.f_hi = f_hi;
+    a.tab.ref_odd = ref_odd;
+    a.fdot_lo = fdot_lo; a.fdot_hi = fdot_hi;
+    gb_lookup_get_ll_wrap(tdi_wrap->waveform, a);
+}
+
 void GBComputationGroupWrap::gb_signal_het_make_reference_carrier(
     GBTDIonTheFlyWrap *tdi_wrap,
     array_type<std::complex<double>> c0_sparse_out,
@@ -1570,6 +1620,15 @@ void gbgpu_part(nb::module_ &m) {
          "complex WDM c0 at the sparse grid (c0_sparse_out) and full Nt "
          "resolution (c0_dense_out). Replaces the Python polyphase so the sig-het "
          "reference comes from the backend. CPU-only (GPU TODO).")
+    .def("gb_lookup_get_ll",
+         &GBComputationGroupWrap::gb_lookup_get_ll,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "GB direct-to-WDM LOOKUP scorer: per row the GB response at n_nodes "
+         "control points (Re/Im splines of each channel's envelope demodulated by "
+         "the common reference phase), then ONE table read per (pixel, layer) at the "
+         "common carrier (f_ref, fdot_ref) plus the amplitude-slope K1 term, "
+         "contracted with the row's data / invC slabs into d_h, h_h (and the phase "
+         "quadrature d_h_im when non-empty). Plain sums (no 4 df factor).")
     .def("gb_signal_het_make_reference_carrier",
          &GBComputationGroupWrap::gb_signal_het_make_reference_carrier,
          nb::call_guard<nb::gil_scoped_release>(),

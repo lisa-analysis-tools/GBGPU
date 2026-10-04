@@ -47,7 +47,37 @@
 #include "lat_tdi_on_the_fly.hh"      // LISATDIonTheFly base + OrbitsSplineCache
 #include "lat_chunked_het_kernels.hh" // wdm_het_*_impl<SourceT> + helpers
 #include "gbt_global.h"               // cmplx + CUDA_DEVICE etc.
+#include "wdm_lookup_kernels.hh"      // WDMLookupTableView + B-spline table reads
 #include <vector>
+
+// Arguments of the GB direct-to-WDM lookup scorer (gb_lookup_get_ll_wrap). Plain
+// pointers (device pointers on the GPU build) + scalars; passed by value.
+struct GBLookupArgs {
+    double *d_h_out;            // (num_bin)
+    double *h_h_out;            // (num_bin)
+    double *d_h_im_out;         // (num_bin) or nullptr: the phase-quadrature <d|h>
+    const double *params;       // (num_bin, nparams)
+    const int *data_index;      // (num_bin) buffer slot of each row's data slab
+    const int *noise_index;     // (num_bin) slot of each row's invC slab
+    const double *data;         // (n_slots, nch, W_slab, Nt_active)
+    const double *invC;         // (n_noise, nch, nch, W_invC, Nt_active)
+    const int *slab_lo;         // (n_slots) absolute layer of slab row 0, or nullptr (full band)
+    const int *invC_row;        // (n_slots) shared-psd mirror row per slot, or nullptr
+    int W_slab;                 // data slab width (Nf_active for the full band)
+    int W_invC;                 // invC slab width (Nf_active for the mirror plane / full band)
+    int num_bin, nparams, nchannels;
+    int n_nodes;                // response control points per row
+    double t_node0, dt_node;    // control-point grid (absolute seconds)
+    double t0, layer_dt, layer_df;   // pixel n (absolute index) sits at t0 + n * layer_dt
+    int ind_min_t, Nt_active, ind_min_f, ind_max_f;
+    int num_m_layers;           // layers each side of the carrier layer
+    int k1;                     // include the amplitude-slope (K1) term
+    int k_coarse;               // 1: table read at the control points only, 4-point Lagrange
+                                // interpolation in time per layer (direct reads per pixel
+                                // where a layer straddles the table support); 0: per pixel
+    WDMLookupTableView tab;
+    double fdot_lo, fdot_hi;    // exact fdot support of the table
+};
 
 // CPU/GPU class-name aliasing -- one rule, both layers.
 //
@@ -722,6 +752,14 @@ class GBComputationGroup{
     // in-model window is the buffer's narrow band slab, whose edge rows
     // carry nonzero coefficients. Skipping reproduces the full-band stash
     // bit-for-bit (it was identically zero off the window).
+    // GB direct-to-WDM LOOKUP scorer: no heterodyne reference, no stash. Block per
+    // row: the GB response at n_nodes control points (Re/Im of each channel's
+    // envelope demodulated by the common reference phase + that phase, cubic
+    // splines), then per active pixel ONE table read per layer at the common
+    // carrier (f_ref, fdot_ref) plus the amplitude-slope K1 term, contracted with
+    // the row's data / invC slabs into <d|h>, <h|h> (and the phase quadrature).
+    void gb_lookup_get_ll_wrap(GBTDIonTheFly *tdi_on_fly, GBLookupArgs args);
+
     void gb_signal_het_v5_get_ll_wrap(
         GBTDIonTheFly *tdi_on_fly,
         double *d_h_out, double *h_h_out,

@@ -1,0 +1,170 @@
+"""GB direct-to-WDM LOOKUP scorer (the fused ``gb_lookup_get_ll`` kernel).
+
+Reference-free GB likelihood: each row's WDM coefficients are read straight from
+the n_ref lookup table, so there is no heterodyne reference, anchor offset,
+stash or refresh -- a drop-in for the chunked delegate's ``get_ll_wdm`` (and the
+band engine's ``gb_wdm_comp``). Fills and every other method delegate to the
+chunked computation the scorer is built around.
+
+Per row (one CUDA block): the GB response at ``n_nodes`` control points, each
+channel's envelope demodulated by the COMMON reference phase splined in Re / Im
+(linear in the channels, so the low-f X+Y+Z null survives) plus that phase;
+then per active pixel ONE table read per layer at the common carrier
+``(f_ref, fdot_ref)`` and the amplitude-slope (K1) term. Python prototype and
+design notes: LAT ``scripts/gb/gb_lookup_scorer.py``.
+
+The table must be built at the run's layer duration (the GB recipe:
+``scripts/gb/_gb_testbox.py::GB_TABLE_RECIPE``, a 128-layer build record and a
+narrow fdot axis -- the shared 32-layer EMRI table carries a ~2e-5 norm bias).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from lisatools.response.tdionfly import GBTDIonTheFly
+
+from .parallelbase import GBGPUParallelModule
+
+
+class GBLookupComputations(GBGPUParallelModule):
+    """Lookup scorer around a chunked ``GBWDMComputations`` (grid, orbits, TDI, t_ref).
+
+    Args:
+        chunked_comp: the chunked delegate (``gbgpu.gbcomps.GBWDMComputations``); its
+            backend, WDM grid, orbits, TDI configuration and ``t_ref`` are used.
+        table: a ``lisatools.domains.WDMLookupTable`` (or a path to one) built at the
+            grid's layer duration.
+        n_nodes: response control points per row over the active span.
+        num_m_layers: layers each side of the carrier layer (2 -> 5 layers).
+        k1: include the amplitude-slope term.
+        k_coarse: read the table only at the control points and interpolate each layer's
+            (smooth) table value in time at the pixels (Mike, 10-04: "lookup computed over
+            large steps in pixels ... spline the rotated representation"); a layer whose
+            table support starts or ends inside the span keeps per-pixel reads.
+    """
+
+    def __init__(self, chunked_comp, table, *, n_nodes=64, num_m_layers=2, k1=True,
+                 k_coarse=True):
+        flavor = chunked_comp.backend.name.split("_", 1)[1]
+        GBGPUParallelModule.__init__(self, force_backend=flavor)
+        from lisatools.domains import WDMLookupTable
+        from lisatools.wdm_lookup_eval import WDMLookupEvaluator
+
+        self.chunked = chunked_comp
+        wdm = chunked_comp.wdm_settings
+        self.wdm = wdm
+        if isinstance(table, str):
+            table = WDMLookupTable.from_file(table, force_backend=flavor)
+        if abs(float(table.layer_dt) - float(wdm.layer_dt)) > 1e-6 * float(wdm.layer_dt):
+            raise ValueError(f"lookup table layer_dt {table.layer_dt} != grid layer_dt "
+                             f"{wdm.layer_dt}")
+        self.ev = WDMLookupEvaluator(table, interp="spline", force_backend=flavor)
+        self.cpp = self.backend.GBComputationGroupWrap()
+        self.n_nodes = int(n_nodes)
+        self.num_m_layers = int(num_m_layers)
+        self.k1 = bool(k1)
+        self.k_coarse = bool(k_coarse)
+        self.d_d = float(getattr(chunked_comp, "d_d", 0.0))
+
+        dt = float(wdm.data_dt)
+        t0 = float(wdm.t0)
+        Tobs = float(wdm.Tobs)
+        Nobs = int(wdm.Nf) * int(wdm.Nt)
+        self.layer_dt = float(wdm.layer_dt)
+        self.layer_df = float(wdm.layer_df)
+        self.t0 = t0
+        self.ind_min_t = int(wdm.ind_min_t)
+        self.Nt_active = int(wdm.Nt_active)
+        self.ind_min_f = int(wdm.ind_min_f)
+        self.ind_max_f = int(wdm.ind_max_f)
+        self.Nf_active = self.ind_max_f - self.ind_min_f + 1
+        # control points span the analysed pixels plus one layer each side
+        t_first = t0 + self.ind_min_t * self.layer_dt
+        t_last = t0 + (self.ind_min_t + self.Nt_active - 1) * self.layer_dt
+        self.t_node0 = t_first - self.layer_dt
+        self.dt_node = (t_last + self.layer_dt - self.t_node0) / (self.n_nodes - 1)
+
+        t_tdi = np.linspace(t0, t0 + (Nobs - 1) * dt, 16384)
+        gb_gen = GBTDIonTheFly(t_tdi, Tobs, float(chunked_comp.t_ref), 1.0 / dt, 1,
+                               tdi_config=chunked_comp.tdi_config, orbits=chunked_comp.orbits,
+                               tdi_chan="XYZ", force_backend=flavor)
+        self.tdi_wrap = gb_gen.wave_gen
+        self._keep_alive = dict(gb_gen=gb_gen)
+
+        ev = self.ev
+        xp = self.xp
+        self._tab = (xp.ascontiguousarray(xp.asarray(ev.tab_cos, dtype=float).reshape(-1)),
+                     xp.ascontiguousarray(xp.asarray(ev.tab_sin, dtype=float).reshape(-1)),
+                     int(ev.nfdot), int(ev.nf), float(ev.fdot_min), float(ev.dfdot),
+                     float(ev.f_min), float(ev.df), float(ev.f_min), float(ev.f_max),
+                     int((ev.m_ref + ev.n_ref) % 2), float(ev.fdot_min), float(ev.fdot_max))
+        self.d_h_out = self.h_h_out = self.d_h_im_out = None
+
+    # ---- the band-engine contract --------------------------------------------------
+    def setup_in_model(self, *args, **kwargs):
+        """No reference to build: the lookup is exact at every point."""
+        return False
+
+    def clear_in_model(self):
+        return None
+
+    def fill_global_wdm(self, *args, **kwargs):
+        return self.chunked.fill_global_wdm(*args, **kwargs)
+
+    def __getattr__(self, name):
+        # delegate the rest of the computation-object surface to the chunked comp;
+        # never for dunders / before __init__ set ``chunked`` (deepcopy / pickle)
+        if name.startswith("__") or "chunked" not in self.__dict__:
+            raise AttributeError(name)
+        return getattr(self.__dict__["chunked"], name)
+
+    def get_ll_wdm(self, params, wdm_holder, data_index=None, noise_index=None,
+                   convert_to_ra_dec=False, **kwargs):
+        """``ll = -d_d / 2 + d_h - h_h / 2`` per row (kernel convention, plain sums);
+        stores ``d_h_out`` / ``h_h_out`` / ``d_h_im_out``. ``wdm_holder`` exposes
+        ``linear_data_arr[0]`` / ``linear_psd_arr[0]`` (XYZ 3x3 invC), with optional
+        ``band_slab_Nf`` + ``slab_min_f`` (narrow per-slot slabs) and
+        ``psd_row_index`` (shared-psd mirror)."""
+        if convert_to_ra_dec:
+            raise NotImplementedError("the lookup scorer takes ICRS params")
+        xp = self.xp
+        x = xp.ascontiguousarray(xp.atleast_2d(xp.asarray(params, dtype=float)))
+        num_bin, nparams = x.shape
+        nch = 3
+        W = getattr(wdm_holder, "band_slab_Nf", None)
+        slab_lo = getattr(wdm_holder, "slab_min_f", None)
+        if W is None or slab_lo is None:
+            W, slab_lo = self.Nf_active, None
+        W = int(W)
+        data = xp.asarray(wdm_holder.linear_data_arr[0])
+        invC = xp.asarray(wdm_holder.linear_psd_arr[0])
+        n_slots_d = int(data.size // (nch * W * self.Nt_active))
+        rows = getattr(wdm_holder, "psd_row_index", None)
+        if rows is not None:
+            W_c = self.Nf_active
+            invC_row = xp.ascontiguousarray(xp.asarray(rows, dtype=xp.int32))
+        else:
+            W_c = W
+            invC_row = xp.zeros(0, dtype=xp.int32)
+        n_slots_c = int(invC.size // (nch * nch * W_c * self.Nt_active))
+        di = xp.zeros(num_bin, dtype=xp.int32) if data_index is None else \
+            xp.ascontiguousarray(xp.asarray(data_index, dtype=xp.int32))
+        ni = di if noise_index is None else \
+            xp.ascontiguousarray(xp.asarray(noise_index, dtype=xp.int32))
+        d_h = xp.zeros(num_bin)
+        h_h = xp.zeros(num_bin)
+        d_h_im = xp.zeros(num_bin)
+        self.cpp.gb_lookup_get_ll(
+            self.tdi_wrap, d_h, h_h, d_h_im, x.reshape(-1), di, ni,
+            xp.ascontiguousarray(data.reshape(-1)), xp.ascontiguousarray(invC.reshape(-1)),
+            (xp.zeros(0, dtype=xp.int32) if slab_lo is None
+             else xp.ascontiguousarray(xp.asarray(slab_lo, dtype=xp.int32))),
+            invC_row, W, W_c, n_slots_d, n_slots_c, num_bin, nparams, nch,
+            self.n_nodes, self.t_node0, self.dt_node,
+            self.t0, self.layer_dt, self.layer_df,
+            self.ind_min_t, self.Nt_active, self.ind_min_f, self.ind_max_f,
+            self.num_m_layers, int(self.k1), int(self.k_coarse), *self._tab)
+        self.d_h_out, self.h_h_out, self.d_h_im_out = d_h, h_h, d_h_im
+        self.last_d_h, self.last_h_h, self.last_d_h_im = d_h, h_h, d_h_im
+        return -0.5 * self.d_d + d_h - 0.5 * h_h

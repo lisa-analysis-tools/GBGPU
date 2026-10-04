@@ -7509,3 +7509,447 @@ void GBComputationGroup::gb_signal_het_fstat_get_ll_wrap(
     }
 #endif
 }
+
+
+// ============================================================================
+// GB direct-to-WDM LOOKUP scorer (gb_lookup_get_ll_wrap).
+//
+// Reference-free: every row's WDM coefficients are read straight from the
+// n_ref lookup table (LAT wdm_lookup_kernels.hh), so there is no heterodyne
+// reference, anchor offset, stash or refresh. Design (lisa-sprint-2026-1e,
+// 10-03, against a dense TD->WDM truth; Python prototype
+// LAT scripts/gb/gb_lookup_scorer.py):
+//   * response at n_nodes control points per row (get_tdi_raw); each channel's
+//     envelope demodulated by the COMMON reference phase, w_c = A_c e^{i tph_c},
+//     splined in Re / Im (linear in the channels: the low-f X+Y+Z null
+//     survives), and the common phase dp = phi_ref - 2 pi f0 t splined once;
+//   * per pixel ONE table read per layer at the common carrier
+//     (f_ref, fdot_ref) = (dp' / 2 pi + f0, dp'' / 2 pi): channel c's
+//     coefficient is the quarter-turn value of W_c = w_c e^{i phi_ref};
+//   * the amplitude-slope term (1 / 2 pi) d/df [quarter-turn of V_c],
+//     V_c = -i wdot_c e^{i phi_ref}, d/df the same B-spline's derivative along
+//     the offset axis (no new table) -- the per-channel K1 term whose absence
+//     broke the null in the per-channel polar lookup.
+// ============================================================================
+
+// (c, s) and d(c, s)/d f_norm of the table at f_norm, given the fdot taps of
+// wdm_table_fdot_axis. Same taps / weights / mirror rule as LAT's
+// wdm_table_cs_at; the derivative uses the B-spline basis derivatives (sign
+// flipped where the coordinate itself was mirrored). false (zeros) outside.
+CUDA_DEVICE
+static inline bool gb_lookup_table_cs_dcs(const WDMLookupTableView &tab, const int *td,
+                                          const double *wd, double f_norm,
+                                          double *c, double *s, double *dc, double *ds)
+{
+    *c = 0.0; *s = 0.0; *dc = 0.0; *ds = 0.0;
+    double x = (f_norm - tab.f0) / tab.df;
+    if (!(x >= -1e-9) || !(x <= (double) (tab.FF - 1) + 1e-9)) return false;
+    double sgn = 1.0;
+    if (x < 0.0) { x = -x; sgn = -1.0; }
+    if (x > (double) (tab.FF - 1)) { x = 2.0 * (double) (tab.FF - 1) - x; sgn = -1.0; }
+    const double fl = floor(x);
+    const double t = x - fl, u = 1.0 - t, t2 = t * t, t3 = t2 * t;
+    const double wf[4] = {u * u * u / 6.0, (3.0 * t3 - 6.0 * t2 + 4.0) / 6.0,
+                          (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) / 6.0, t3 / 6.0};
+    const double sc = sgn / tab.df;
+    const double dw[4] = {-0.5 * u * u * sc, (1.5 * t2 - 2.0 * t) * sc,
+                          (-1.5 * t2 + t + 0.5) * sc, 0.5 * t2 * sc};
+    int tf[4];
+    const int start = (int) fl - 1;
+    for (int k = 0; k < 4; ++k) tf[k] = wdm_mirror_index(start + k, tab.FF);
+    const int na = (tab.FD <= 1) ? 1 : 4;
+    for (int a = 0; a < na; ++a)
+    {
+        const double wa = (tab.FD <= 1) ? 1.0 : wd[a];
+        const size_t row = (tab.FD <= 1) ? 0 : (size_t) td[a] * tab.FF;
+        double ac = 0.0, as = 0.0, adc = 0.0, ads = 0.0;
+        for (int b = 0; b < 4; ++b)
+        {
+            const double vc = tab.coeff_c[row + tf[b]];
+            const double vs = tab.coeff_s[row + tf[b]];
+            ac += wf[b] * vc; as += wf[b] * vs;
+            adc += dw[b] * vc; ads += dw[b] * vs;
+        }
+        *c += wa * ac; *s += wa * as; *dc += wa * adc; *ds += wa * ads;
+    }
+    return true;
+}
+
+
+// Most layers one row's coarse table cache holds (the row's carrier range +-
+// num_m_layers); a row needing more falls back to per-pixel reads.
+#define GB_LOOKUP_LMAX 8
+
+// Dynamic shared bytes of one lookup block (mirrors the carve below).
+CUDA_CALLABLE_MEMBER
+static inline size_t gb_lookup_shared_bytes(int n_nodes, int nchannels)
+{
+    const size_t n = (size_t) n_nodes;
+    return N_PARAMS_MAX * sizeof(double)
+         + (size_t) 4 * GB_LOOKUP_LMAX * n * sizeof(double)     /* coarse (c, s, dc, ds) */
+         + (size_t) (2 + GB_LOOKUP_LMAX) * sizeof(int)          /* m_lo, n_lay, flags */
+         + n * sizeof(double) * (1        /* t_cp */
+                                 + 1      /* phi_un */
+                                 + 4      /* dp spline */
+                                 + 8 * (size_t) nchannels   /* Re / Im splines */
+                                 + 1      /* B */
+                                 + 8      /* pcr */
+                                 + 2)     /* flip, pjump */
+         + n * (size_t) nchannels * sizeof(cmplx)   /* tdi_cp */
+         + n * sizeof(int) + n * sizeof(bool) + 16;
+}
+
+
+CUDA_DEVICE
+static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof,
+                                       void *shared_mem, int bin_i,
+                                       double *dh_p, double *hh_p, double *dhim_p)
+{
+    const int n   = a.n_nodes;
+    const int nch = a.nchannels;
+    char *cur = (char *) shared_mem;
+    double *params_here = (double *) cur; cur += N_PARAMS_MAX * sizeof(double);
+    double *Kv     = (double *) cur; cur += (size_t) 4 * GB_LOOKUP_LMAX * n * sizeof(double);
+    int    *kmeta  = (int *) cur;    cur += (size_t) (2 + GB_LOOKUP_LMAX) * sizeof(int);
+    double *t_cp   = (double *) cur; cur += (size_t) n * sizeof(double);
+    double *phi_un = (double *) cur; cur += (size_t) n * sizeof(double);
+    double *dp_y   = (double *) cur; cur += (size_t) n * sizeof(double);
+    double *dp_c1  = (double *) cur; cur += (size_t) n * sizeof(double);
+    double *dp_c2  = (double *) cur; cur += (size_t) n * sizeof(double);
+    double *dp_c3  = (double *) cur; cur += (size_t) n * sizeof(double);
+    double *wsp    = (double *) cur; cur += (size_t) 8 * nch * n * sizeof(double);
+    double *B_b    = (double *) cur; cur += (size_t) n * sizeof(double);
+    double *pcr    = (double *) cur; cur += (size_t) 8 * n * sizeof(double);
+    double *flip   = (double *) cur; cur += (size_t) n * sizeof(double);
+    double *pjump  = (double *) cur; cur += (size_t) n * sizeof(double);
+    cmplx  *tdi_cp = (cmplx *) cur;  cur += (size_t) nch * n * sizeof(cmplx);
+    int    *count  = (int *) cur;    cur += (size_t) n * sizeof(int);
+    bool   *fix_c  = (bool *) cur;
+    // channel c's Re spline: wsp + (8c + 0..3) n, Im spline: wsp + (8c + 4..7) n
+#define GBLK_SPL(c, k) (wsp + ((size_t) 8 * (c) + (k)) * n)
+
+    for (int i = THREAD_START_X; i < a.nparams; i += BLOCK_INCR_X)
+        params_here[i] = a.params[(size_t) bin_i * a.nparams + i];
+    for (int i = THREAD_START_X; i < n; i += BLOCK_INCR_X)
+        t_cp[i] = a.t_node0 + (double) i * a.dt_node;
+    CUDA_SYNC_THREADS;
+
+    // ---- node stage: response at the control points -> splines --------------
+    tof->get_tdi_raw(tdi_cp, phi_un, params_here, t_cp, n, bin_i, nch);
+    CUDA_SYNC_THREADS;
+    const double f0 = params_here[tof->f0_index];
+    const double two_pi_f0 = 2.0 * M_PI * f0;
+    for (int i = THREAD_START_X; i < n; i += BLOCK_INCR_X)
+        dp_y[i] = phi_un[i] - two_pi_f0 * t_cp[i];
+    CUDA_SYNC_THREADS;
+    wdm_fit_cubic_spline(t_cp, dp_y, dp_c1, dp_c2, dp_c3, B_b, pcr, n,
+                         CUBIC_SPLINE_LINEAR_SPACING);
+    CUDA_SYNC_THREADS;
+    for (int c = 0; c < nch; ++c)
+    {
+        double *re_y = GBLK_SPL(c, 0), *im_y = GBLK_SPL(c, 4);
+        // signed amplitude + phase relative to the UN-heterodyned phi_ref (the
+        // extract's remainder(., 2 pi) unwrap needs it), then Re / Im
+        tof->new_extract_amplitude_and_phase(count, fix_c, flip, pjump, n,
+                                             re_y, im_y, &tdi_cp[c * n], phi_un);
+        CUDA_SYNC_THREADS;
+        tof->new_unwrap_phase(flip, n, im_y);
+        CUDA_SYNC_THREADS;
+        for (int k = THREAD_START_X; k < n; k += BLOCK_INCR_X)
+        {
+            const double amp = re_y[k], ph = im_y[k];
+            re_y[k] = amp * cos(ph);
+            im_y[k] = amp * sin(ph);
+        }
+        CUDA_SYNC_THREADS;
+        wdm_fit_cubic_spline(t_cp, re_y, GBLK_SPL(c, 1), GBLK_SPL(c, 2), GBLK_SPL(c, 3),
+                             B_b, pcr, n, CUBIC_SPLINE_LINEAR_SPACING);
+        CUDA_SYNC_THREADS;
+        wdm_fit_cubic_spline(t_cp, im_y, GBLK_SPL(c, 5), GBLK_SPL(c, 6), GBLK_SPL(c, 7),
+                             B_b, pcr, n, CUBIC_SPLINE_LINEAR_SPACING);
+        CUDA_SYNC_THREADS;
+    }
+
+    const int L = a.num_m_layers;
+    const double inv2pi = 0.5 / M_PI;
+
+    // ---- coarse table stage (k_coarse): read the table at the control points ----
+    // The carrier (f_ref, fdot_ref) of a GB moves slowly, so each layer's table
+    // value (c, s, dc/df, ds/df) is a smooth function of time: read it once per
+    // control point and interpolate at the pixels (4-point Lagrange). A layer
+    // whose table support starts / ends inside the span keeps per-pixel reads.
+    // kmeta = {m_lo, n_lay (0 = coarse off for this row), flag[j]: 0 out, 1 in, 2 mixed}
+#define GBLK_KV(q, j, k) Kv[(((size_t) (q) * GB_LOOKUP_LMAX + (j)) * n) + (k)]
+    if (a.k_coarse)
+    {
+        if (THREAD_ZERO)
+        {
+            double fmin = 1e300, fmax = -1e300;
+            for (int k = 0; k < n; ++k)
+            {
+                const int sk = (k < n - 1) ? k : n - 2;
+                double v, d1, d2;
+                wdm_spline_derivs(dp_y, dp_c1, dp_c2, dp_c3, sk, t_cp[k] - t_cp[sk],
+                                  &v, &d1, &d2);
+                const double f = d1 * inv2pi + f0;
+                fmin = (f < fmin) ? f : fmin;
+                fmax = (f > fmax) ? f : fmax;
+            }
+            int m_lo = (int) floor(fmin / a.layer_df) - L;
+            int m_hi = (int) floor(fmax / a.layer_df) + L;
+            if (m_lo < a.ind_min_f) m_lo = a.ind_min_f;
+            if (m_hi > a.ind_max_f) m_hi = a.ind_max_f;
+            const int n_lay = m_hi - m_lo + 1;
+            kmeta[0] = m_lo;
+            kmeta[1] = (n_lay >= 1 && n_lay <= GB_LOOKUP_LMAX) ? n_lay : 0;
+        }
+        CUDA_SYNC_THREADS;
+        const int m_lo = kmeta[0], n_lay = kmeta[1];
+        for (int j = THREAD_START_X; j < n_lay; j += BLOCK_INCR_X)
+        {
+            const int m = m_lo + j;
+            int n_in = 0;
+            for (int k = 0; k < n; ++k)
+            {
+                const int sk = (k < n - 1) ? k : n - 2;
+                double v, d1, d2;
+                wdm_spline_derivs(dp_y, dp_c1, dp_c2, dp_c3, sk, t_cp[k] - t_cp[sk],
+                                  &v, &d1, &d2);
+                const double f = d1 * inv2pi + f0, fdot = d2 * inv2pi;
+                const double f_norm = f - (double) m * a.layer_df;
+                double tc = 0.0, ts = 0.0, tdc = 0.0, tds = 0.0;
+                int td[4];
+                double wd[4];
+                if (fdot >= a.fdot_lo && fdot <= a.fdot_hi
+                    && f_norm >= a.tab.f_lo && f_norm <= a.tab.f_hi
+                    && wdm_table_fdot_axis(a.tab, fdot, td, wd)
+                    && gb_lookup_table_cs_dcs(a.tab, td, wd, f_norm, &tc, &ts, &tdc, &tds))
+                    ++n_in;
+                GBLK_KV(0, j, k) = tc;  GBLK_KV(1, j, k) = ts;
+                GBLK_KV(2, j, k) = tdc; GBLK_KV(3, j, k) = tds;
+            }
+            kmeta[2 + j] = (n_in == 0) ? 0 : ((n_in == n) ? 1 : 2);
+        }
+        CUDA_SYNC_THREADS;
+    }
+
+    // ---- pixel stage -----------------------------------------------------------
+    const int d_slot = a.data_index[bin_i];
+    const int n_slot = a.noise_index[bin_i];
+    const int d_lo = (a.slab_lo != nullptr) ? a.slab_lo[d_slot] : a.ind_min_f;
+    const bool mirror = (a.invC_row != nullptr);
+    const int n_lo = mirror ? a.ind_min_f
+                            : ((a.slab_lo != nullptr) ? a.slab_lo[n_slot] : a.ind_min_f);
+    const size_t plane_d = (size_t) a.W_slab * a.Nt_active;
+    const size_t plane_c = (size_t) a.W_invC * a.Nt_active;
+    const double *Dbase = a.data + (size_t) d_slot * nch * plane_d;
+    const double *Cbase = a.invC + (size_t) (mirror ? a.invC_row[n_slot] : n_slot)
+                                   * nch * nch * plane_c;
+    const bool coarse = a.k_coarse && kmeta[1] > 0;
+    double dh = 0.0, hh = 0.0, dhim = 0.0;
+
+    for (int nl = THREAD_START_X; nl < a.Nt_active; nl += BLOCK_INCR_X)
+    {
+        const int n_abs = a.ind_min_t + nl;
+        const double t = a.t0 + (double) n_abs * a.layer_dt;
+        int seg = (int) ((t - a.t_node0) / a.dt_node);
+        if (seg < 0) seg = 0;
+        if (seg > n - 2) seg = n - 2;
+        const double dx = t - t_cp[seg];
+        double dpv, dp1, dp2;
+        wdm_spline_derivs(dp_y, dp_c1, dp_c2, dp_c3, seg, dx, &dpv, &dp1, &dp2);
+        const double f_ref = dp1 * inv2pi + f0;
+        const double fdot_ref = dp2 * inv2pi;
+        int td[4];
+        double wd[4];
+        const bool fdot_ok = fdot_ref >= a.fdot_lo && fdot_ref <= a.fdot_hi
+                             && wdm_table_fdot_axis(a.tab, fdot_ref, td, wd);
+        if (!coarse && !fdot_ok) continue;
+        // 4-point Lagrange weights at t on the control-point grid (coarse path)
+        int j0 = seg - 1;
+        if (j0 < 0) j0 = 0;
+        if (j0 > n - 4) j0 = n - 4;
+        double lw[4] = {0.0, 0.0, 0.0, 0.0};
+        if (coarse)
+        {
+            const double xx = (t - t_cp[j0]) / a.dt_node;
+            lw[0] = -(xx - 1.0) * (xx - 2.0) * (xx - 3.0) / 6.0;
+            lw[1] = xx * (xx - 2.0) * (xx - 3.0) / 2.0;
+            lw[2] = -xx * (xx - 1.0) * (xx - 3.0) / 2.0;
+            lw[3] = xx * (xx - 1.0) * (xx - 2.0) / 6.0;
+        }
+        // carrier phase: 2 pi frac(f0 t) keeps the big argument exact
+        const double ft = f0 * t;
+        const double phi = dpv + 2.0 * M_PI * (ft - floor(ft));
+        const double cphi = cos(phi), sphi = sin(phi);
+        double Wr[3], Wi[3], Vr[3], Vi[3];
+        for (int c = 0; c < nch; ++c)
+        {
+            double rv, r1, r2, iv, i1, i2;
+            wdm_spline_derivs(GBLK_SPL(c, 0), GBLK_SPL(c, 1), GBLK_SPL(c, 2), GBLK_SPL(c, 3),
+                              seg, dx, &rv, &r1, &r2);
+            wdm_spline_derivs(GBLK_SPL(c, 4), GBLK_SPL(c, 5), GBLK_SPL(c, 6), GBLK_SPL(c, 7),
+                              seg, dx, &iv, &i1, &i2);
+            Wr[c] = rv * cphi - iv * sphi;
+            Wi[c] = rv * sphi + iv * cphi;
+            // V = -i wdot e^{i phi}
+            Vr[c] = i1 * cphi + r1 * sphi;
+            Vi[c] = i1 * sphi - r1 * cphi;
+        }
+        const int m0 = (int) floor(f_ref / a.layer_df);
+        for (int l = -L; l <= L; ++l)
+        {
+            const int m = m0 + l;
+            if (m < a.ind_min_f || m > a.ind_max_f) continue;
+            const int ml_d = m - d_lo, ml_c = m - n_lo;
+            if (ml_d < 0 || ml_d >= a.W_slab || ml_c < 0 || ml_c >= a.W_invC) continue;
+            const double f_norm = f_ref - (double) m * a.layer_df;
+            double tc, ts, tdc, tds;
+            const int jl = coarse ? m - kmeta[0] : -1;
+            const int flag = (coarse && jl >= 0 && jl < kmeta[1]) ? kmeta[2 + jl] : 2;
+            if (flag == 0) continue;
+            if (flag == 1)
+            {
+                tc = ts = tdc = tds = 0.0;
+                for (int q = 0; q < 4; ++q)
+                {
+                    tc  += lw[q] * GBLK_KV(0, jl, j0 + q);
+                    ts  += lw[q] * GBLK_KV(1, jl, j0 + q);
+                    tdc += lw[q] * GBLK_KV(2, jl, j0 + q);
+                    tds += lw[q] * GBLK_KV(3, jl, j0 + q);
+                }
+            }
+            else
+            {
+                if (!fdot_ok) continue;
+                if (f_norm < a.tab.f_lo || f_norm > a.tab.f_hi) continue;
+                if (!gb_lookup_table_cs_dcs(a.tab, td, wd, f_norm, &tc, &ts, &tdc, &tds))
+                    continue;
+            }
+            // quarter-turn rule (WDMLookupTable.get_wdm_coeffs), on the derivative too
+            if (a.tab.ref_odd) { tc = -tc; tdc = -tdc; }
+            const bool odd = ((m + n_abs) & 1) != 0;
+            const double cc = odd ? ts : tc, ss = odd ? -tc : ts;
+            const double dcc = odd ? tds : tdc, dss = odd ? -tdc : tds;
+            double h[3], hq[3], D[3];
+            for (int c = 0; c < nch; ++c)
+            {
+                h[c]  = cc * Wr[c] - ss * Wi[c];
+                hq[c] = cc * Wi[c] + ss * Wr[c];
+                if (a.k1) {
+                    h[c]  += (dcc * Vr[c] - dss * Vi[c]) * inv2pi;
+                    hq[c] += (dcc * Vi[c] + dss * Vr[c]) * inv2pi;
+                }
+                D[c] = Dbase[(size_t) c * plane_d + (size_t) ml_d * a.Nt_active + nl];
+            }
+            for (int c = 0; c < nch; ++c)
+            {
+                double Ch = 0.0, Chq = 0.0;
+                for (int d = 0; d < nch; ++d)
+                {
+                    const double iC = Cbase[((size_t) c * nch + d) * plane_c
+                                            + (size_t) ml_c * a.Nt_active + nl];
+                    Ch += iC * h[d];
+                    Chq += iC * hq[d];
+                }
+                dh += D[c] * Ch;
+                hh += h[c] * Ch;
+                dhim += D[c] * Chq;
+            }
+        }
+    }
+#undef GBLK_SPL
+#undef GBLK_KV
+    *dh_p = dh;
+    *hh_p = hh;
+    *dhim_p = dhim;
+}
+
+
+#ifdef __CUDACC__
+CUDA_KERNEL
+void gb_lookup_get_ll_kernel(GBTDIonTheFly *tdi_on_fly, GBLookupArgs a)
+{
+    extern CUDA_SHARED char shared_mem[];
+    CUDA_SHARED double d_h_tmp[NUM_THREADS_HERE];
+    CUDA_SHARED double h_h_tmp[NUM_THREADS_HERE];
+    GBTDIonTheFly tof(tdi_on_fly->orbits, tdi_on_fly->tdi_config,
+                      tdi_on_fly->T, tdi_on_fly->t_ref);
+    for (int bin_i = BLOCK_START_X; bin_i < a.num_bin; bin_i += GRID_INCR_X)
+    {
+        double dh = 0.0, hh = 0.0, dhim = 0.0;
+        gb_lookup_score_one_source(a, &tof, (void *) shared_mem, bin_i, &dh, &hh, &dhim);
+        const int tid = threadIdx.x;
+        d_h_tmp[tid] = dh;
+        h_h_tmp[tid] = hh;
+        CUDA_SYNC_THREADS;
+        const double dh_sum = block_reduce(d_h_tmp);
+        const double hh_sum = block_reduce(h_h_tmp);
+        double dhim_sum = 0.0;
+        if (a.d_h_im_out != nullptr)
+        {
+            d_h_tmp[tid] = dhim;
+            dhim_sum = block_reduce(d_h_tmp);
+        }
+        if (THREAD_ZERO)
+        {
+            a.d_h_out[bin_i] = dh_sum;
+            a.h_h_out[bin_i] = hh_sum;
+            if (a.d_h_im_out != nullptr) a.d_h_im_out[bin_i] = dhim_sum;
+        }
+        CUDA_SYNC_THREADS;
+    }
+}
+#endif
+
+
+void GBComputationGroup::gb_lookup_get_ll_wrap(GBTDIonTheFly *tdi_on_fly, GBLookupArgs a)
+{
+    if (a.n_nodes < 4)
+        throw std::invalid_argument("[gb_lookup_get_ll_wrap] n_nodes must be >= 4.");
+    if (a.nchannels != 3)
+        throw std::invalid_argument("[gb_lookup_get_ll_wrap] XYZ with 3 channels only.");
+    if (a.nparams > N_PARAMS_MAX)
+        throw std::invalid_argument("[gb_lookup_get_ll_wrap] nparams > N_PARAMS_MAX.");
+    if (a.num_bin <= 0) return;
+    const size_t shared_bytes = gb_lookup_shared_bytes(a.n_nodes, a.nchannels);
+
+#ifdef __CUDACC__
+    GBTDIonTheFly *gb_host = new GBTDIonTheFly(
+        tdi_on_fly->orbits, tdi_on_fly->tdi_config, tdi_on_fly->T, tdi_on_fly->t_ref);
+    Orbits *d_orbits;
+    gpuErrchk(cudaMalloc(&d_orbits, sizeof(Orbits)));
+    gpuErrchk(cudaMemcpy(d_orbits, tdi_on_fly->orbits, sizeof(Orbits), cudaMemcpyHostToDevice));
+    TDIConfig *d_tdi_config;
+    gpuErrchk(cudaMalloc(&d_tdi_config, sizeof(TDIConfig)));
+    gpuErrchk(cudaMemcpy(d_tdi_config, tdi_on_fly->tdi_config, sizeof(TDIConfig),
+                         cudaMemcpyHostToDevice));
+    gb_host->orbits = d_orbits;
+    gb_host->tdi_config = d_tdi_config;
+    GBTDIonTheFly *d_gb;
+    gpuErrchk(cudaMalloc(&d_gb, sizeof(GBTDIonTheFly)));
+    gpuErrchk(cudaMemcpy(d_gb, gb_host, sizeof(GBTDIonTheFly), cudaMemcpyHostToDevice));
+    if (shared_bytes > 48 * 1024)
+        cudaFuncSetAttribute(gb_lookup_get_ll_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shared_bytes);
+    const int grid_x = (a.num_bin < 65535) ? a.num_bin : 65535;
+    gb_lookup_get_ll_kernel<<<grid_x, NUM_THREADS_HERE, shared_bytes>>>(d_gb, a);
+    cudaDeviceSynchronize();
+    gpuErrchk(cudaGetLastError());
+    gpuErrchk(cudaFree(d_orbits));
+    gpuErrchk(cudaFree(d_tdi_config));
+    gpuErrchk(cudaFree(d_gb));
+    delete gb_host;
+#else
+    std::vector<char> scratch(shared_bytes);
+    for (int bin = 0; bin < a.num_bin; ++bin)
+    {
+        double dh = 0.0, hh = 0.0, dhim = 0.0;
+        gb_lookup_score_one_source(a, tdi_on_fly, (void *) scratch.data(), bin,
+                                   &dh, &hh, &dhim);
+        a.d_h_out[bin] = dh;
+        a.h_h_out[bin] = hh;
+        if (a.d_h_im_out != nullptr) a.d_h_im_out[bin] = dhim;
+    }
+#endif
+}
