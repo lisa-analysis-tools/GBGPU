@@ -42,8 +42,10 @@ from lisatools.utils.constants import YRSID_SI
 from gbgpu.gbcomps import GBWDMComputations
 from gbgpu.gbsignalhetcomputations import (
     GBSignalHetComputations,
+    _SYM_PAIRS,
     _collapsed_carrier_fold,
     _invc_channel_symmetric,
+    _invc_pair_symmetric,
     _window_dj,
 )
 
@@ -58,6 +60,17 @@ def _sym_invc(rng, k, W, Nt):
     for c in range(3):
         for d in range(3):
             iC[:, c, d] = b + (a if c == d else 0.0)
+    return iC
+
+
+def _unequal_invc(rng, k, W, Nt):
+    """(k, 3, 3, W, Nt) channel-symmetric but NOT a*I + b*J (unequal arms): distinct
+    diagonals and distinct off-diagonal pairs, diagonally dominant (positive definite)."""
+    iC = np.empty((k, 3, 3, W, Nt))
+    for c in range(3):
+        iC[:, c, c] = rng.uniform(1.0, 2.0, (k, W, Nt))
+    for c, d in ((0, 1), (0, 2), (1, 2)):
+        iC[:, c, d] = iC[:, d, c] = rng.uniform(-0.3, 0.3, (k, W, Nt))
     return iC
 
 
@@ -210,6 +223,85 @@ class FirstMomentTest(unittest.TestCase):
         self.assertLess(np.abs(got - want).max() / np.abs(want).max(), 1e-6)
 
 
+def _fold_hh_sym(P, r, dr):
+    """Python mirror of the kernel's SYM fold. ``P = (B0, B1, B0nc, B1nc)`` each
+    (k, 3 q, 3 pair, W, Ns); ``r, dr`` (k, 3, W, Ns)."""
+    B0, B1, B0nc, B1nc = P
+    cj = np.conj
+    tot = 0.0
+    for p in range(3):
+        rp, dp = r[:, p], dr[:, p]
+        tot = tot + B0[:, 0, p] * (cj(rp) * rp) + B0[:, 1, p] * 2 * cj(rp) * dp \
+            + B0[:, 2, p] * (cj(dp) * dp)
+        tot = tot + B0nc[:, 0, p] * rp * rp + B0nc[:, 1, p] * 2 * rp * dp + B0nc[:, 2, p] * dp * dp
+        c, d = _SYM_PAIRS[3 + p]
+        rc, rd, dc, dd = r[:, c], r[:, d], dr[:, c], dr[:, d]
+        tot = tot + B1[:, 0, p] * (cj(rc) * rd + cj(rd) * rc) \
+            + B1[:, 1, p] * 2 * (cj(rc) * dd + cj(rd) * dc) + B1[:, 2, p] * (cj(dc) * dd + cj(dd) * dc)
+        tot = tot + B1nc[:, 0, p] * 2 * rc * rd + B1nc[:, 1, p] * 2 * (rc * dd + dc * rd) \
+            + B1nc[:, 2, p] * 2 * dc * dd
+    return 0.5 * np.real(tot.sum(axis=(-2, -1)))
+
+
+class SymLayoutTest(unittest.TestCase):
+    """The carrier SYM layout: any channel-symmetric invC (the unequal-arm production noise)."""
+
+    def _toy(self, seed=9):
+        t = _Toy(seed=seed)
+        t.iC = _unequal_invc(t.rng, t.k, t.W, t.Nt)
+        return t
+
+    def test_detection(self):
+        t = self._toy()
+        self.assertFalse(_invc_channel_symmetric(t.iC, np))
+        self.assertTrue(_invc_pair_symmetric(t.iC, np))
+        bad = t.iC.copy()
+        bad[:, 0, 1] *= 1.0 + 1e-6
+        self.assertFalse(_invc_pair_symmetric(bad, np))
+
+    def test_full_layout_identity(self):
+        """q = 0, 1 SYM moments (c1 off) == bin_fold_real's nch x nch blocks."""
+        t = self._toy()
+        A0, A1, B0, B1, B0nc, B1nc = _collapsed_carrier_fold(
+            t.res, t.c0, t.iC, t.nb, t.stride, t.Nt, layout="sym")
+        fA0, fA1, F0, F1, F0nc, F1nc = bin_fold_real(t.res, t.c0, t.iC, t.nb, t.stride, t.Nt,
+                                                      tdi_type="XYZ")
+        np.testing.assert_allclose(A0, fA0, rtol=1e-13, atol=1e-13 * np.abs(fA0).max())
+        for full, dia, off, q in ((F0, B0, B1, 0), (F1, B0, B1, 1), (F0nc, B0nc, B1nc, 0),
+                                  (F1nc, B0nc, B1nc, 1)):
+            for p, (c, d) in enumerate(_SYM_PAIRS):
+                got = dia[:, q, p] if p < 3 else off[:, q, p - 3]
+                for cc, dd in ((c, d), (d, c)):
+                    np.testing.assert_allclose(got, full[:, cc, dd], rtol=1e-12,
+                                               atol=1e-12 * np.abs(full).max())
+
+    def test_hh_exact_with_c1(self):
+        t = self._toy(seed=10)
+        c1 = t.random_c1()
+        P = _collapsed_carrier_fold(t.res, t.c0, t.iC, t.nb, t.stride, t.Nt, c1_dense=c1,
+                                    layout="sym")[2:]
+        rng = t.rng
+        r = rng.standard_normal((t.k, 3, t.W, t.Ns)) + 1j * rng.standard_normal((t.k, 3, t.W, t.Ns))
+        dr = 0.3 * (rng.standard_normal(r.shape) + 1j * rng.standard_normal(r.shape))
+        h = t.c0 * (r[..., t.bin_idx] + dr[..., t.bin_idx] * t.n_off) + c1 * dr[..., t.bin_idx]
+        dense = np.einsum("kcwn,kcdwn,kdwn->k", h.real, t.iC, h.real)
+        np.testing.assert_allclose(_fold_hh_sym(P, r, dr), dense, rtol=1e-12)
+
+    def test_sym_equals_collapsed_on_equal_arm(self):
+        """On a*I + b*J noise the SYM moments are the collapsed ones: diag = a + b, off = b."""
+        t = _Toy(seed=11)
+        c1 = t.random_c1()
+        _, _, Pa, Pb, Pna, Pnb = t.fold(c1)
+        _, _, B0, B1, B0nc, B1nc = _collapsed_carrier_fold(
+            t.res, t.c0, t.iC, t.nb, t.stride, t.Nt, c1_dense=c1, layout="sym")
+        for p in range(3):
+            np.testing.assert_allclose(B0[:, :, p], Pa + Pb, rtol=1e-12, atol=1e-12 * np.abs(Pa).max())
+            np.testing.assert_allclose(B1[:, :, p], Pb, rtol=1e-12, atol=1e-12 * np.abs(Pa).max())
+            np.testing.assert_allclose(B0nc[:, :, p], Pna + Pnb, rtol=1e-12,
+                                       atol=1e-12 * np.abs(Pna).max())
+            np.testing.assert_allclose(B1nc[:, :, p], Pnb, rtol=1e-12, atol=1e-12 * np.abs(Pna).max())
+
+
 class NegativeControlTest(unittest.TestCase):
     def test_asymmetric_invc_detected(self):
         t = _Toy()
@@ -296,6 +388,8 @@ class CompiledCollapseTest(unittest.TestCase):
             invCs.append(_sym_invc(rng, 1, h_act.shape[1], h_act.shape[2])[0])
         cls.slabs, cls.invCs = np.stack(slabs), np.stack(invCs)
         cls.holder = _SlotHolder(cls.slabs, cls.invCs)
+        cls.invCs_un = np.stack([_unequal_invc(rng, 1, s.shape[1], s.shape[2])[0] for s in slabs])
+        cls.holder_un = _SlotHolder(cls.slabs, cls.invCs_un)
         cls.slots = np.array([0, 1], dtype=np.int32)
         rows = [A, C]
         for _ in range(2):
@@ -312,8 +406,8 @@ class CompiledCollapseTest(unittest.TestCase):
         return GBSignalHetComputations.for_band_engine(self.chunked, cp_repr="carrier",
                                                        **V5_KNOBS)
 
-    def _scores(self, comp, holder=None, collapse="1", zero_q2=False, c1="0"):
-        with _Env(SIGHET_CARRIER_COLLAPSE=collapse, SIGHET_ANCHOR_CORRECT="0",
+    def _scores(self, comp, holder=None, layout="collapsed", zero_q2=False, c1="0"):
+        with _Env(SIGHET_CARRIER_LAYOUT=layout, SIGHET_ANCHOR_CORRECT="0",
                   SIGHET_CARRIER_C1=c1):
             comp.setup_in_model(self.holder if holder is None else holder, self.params_ref,
                                 self.slots)
@@ -322,24 +416,23 @@ class CompiledCollapseTest(unittest.TestCase):
                 for arr in (comp.B0_all, comp.B1_all, comp.B0nc_all, comp.B1nc_all):
                     arr[:, 2] = 0.0
             comp.get_ll(self.params, data_index=self.di)
-            return (bool(comp._stash_collapsed), np.asarray(comp.last_d_h).copy(),
+            return (comp._stash_layout, np.asarray(comp.last_d_h).copy(),
                     np.asarray(comp.last_h_h).copy())
         finally:
             comp.clear_in_model()
 
     def test_collapsed_without_q2_equals_full_layout(self):
         comp = self._comp()
-        c_full, dh_f, hh_f = self._scores(comp, collapse="0")
-        c_col, dh_c, hh_c = self._scores(comp, collapse="1", zero_q2=True)
-        self.assertFalse(c_full)
-        self.assertTrue(c_col)
+        c_full, dh_f, hh_f = self._scores(comp, layout="full")
+        c_col, dh_c, hh_c = self._scores(comp, layout="collapsed", zero_q2=True)
+        self.assertEqual((c_full, c_col), ("full", "collapsed"))
         np.testing.assert_allclose(dh_c, dh_f, rtol=1e-11, atol=1e-11 * np.abs(dh_f).max())
         np.testing.assert_allclose(hh_c, hh_f, rtol=1e-11, atol=1e-11 * np.abs(hh_f).max())
 
     def test_q2_moments_reach_the_score(self):
         comp = self._comp()
-        _, dh0, hh0 = self._scores(comp, collapse="1", zero_q2=True)
-        _, dh2, hh2 = self._scores(comp, collapse="1")
+        _, dh0, hh0 = self._scores(comp, layout="collapsed", zero_q2=True)
+        _, dh2, hh2 = self._scores(comp, layout="collapsed")
         np.testing.assert_array_equal(dh2, dh0)          # <d|h> has no q = 2 term
         self.assertGreater(np.min(hh2 - hh0), 0.0,
                            "conj(dr) dr n_off^2 is a positive-definite addition to <h|h>")
@@ -397,22 +490,86 @@ class CompiledCollapseTest(unittest.TestCase):
             np.testing.assert_allclose(full["c1"][1][:, c], c11[:, 0], rtol=0,
                                        atol=1e-14 * np.abs(c11).max(), err_msg=f"c1 ch {c}")
 
+    def _scores_layout(self, comp, holder, zero_q2=False, **env):
+        e = dict(SIGHET_ANCHOR_CORRECT="0")
+        e.update(env)
+        with _Env(**e):
+            comp.setup_in_model(holder, self.params_ref, self.slots)
+        try:
+            if zero_q2:
+                for arr in (comp.B0_all, comp.B1_all, comp.B0nc_all, comp.B1nc_all):
+                    arr[:, 2] = 0.0
+            comp.get_ll(self.params, data_index=self.di)
+            return (comp._stash_layout, np.asarray(comp.last_d_h).copy(),
+                    np.asarray(comp.last_h_h).copy())
+        finally:
+            comp.clear_in_model()
+
+    def test_unequal_arm_takes_the_sym_layout(self):
+        """Unequal-arm noise: SYM layout, and with q = 2 and c1 off it IS the full layout."""
+        comp = self._comp()
+        lay_f, dh_f, hh_f = self._scores_layout(comp, self.holder_un, SIGHET_CARRIER_COLLAPSE="0")
+        lay_s, dh_s, hh_s = self._scores_layout(comp, self.holder_un, zero_q2=True,
+                                                SIGHET_CARRIER_C1="0")
+        self.assertEqual((lay_f, lay_s), ("full", "sym"))
+        np.testing.assert_allclose(dh_s, dh_f, rtol=1e-11, atol=1e-11 * np.abs(dh_f).max())
+        np.testing.assert_allclose(hh_s, hh_f, rtol=1e-11, atol=1e-11 * np.abs(hh_f).max())
+
+    def test_sym_equals_collapsed_compiled(self):
+        """On equal-arm noise the SYM kernel path reproduces the collapsed one (same model)."""
+        comp = self._comp()
+        lay_c, dh_c, hh_c = self._scores_layout(comp, self.holder,
+                                                SIGHET_CARRIER_LAYOUT="collapsed")
+        lay_s, dh_s, hh_s = self._scores_layout(comp, self.holder)    # default: sym
+        self.assertEqual((lay_c, lay_s), ("collapsed", "sym"))
+        np.testing.assert_allclose(dh_s, dh_c, rtol=1e-12, atol=1e-12 * np.abs(dh_c).max())
+        np.testing.assert_allclose(hh_s, hh_c, rtol=1e-11, atol=1e-11 * np.abs(hh_c).max())
+
+    def test_sym_anchor_exact_with_c1(self):
+        """Unequal-arm noise: the SYM fold's reference ln L matches the exact chunked one
+        ~100x better than the full layout (no second moment, no c1)."""
+        comp = self._comp()
+        ex = np.asarray(self.chunked.get_ll_wdm(self.params, self.holder_un, data_index=self.di,
+                                                noise_index=self.di)).ravel()
+        err = {}
+        for name, env in (("full", dict(SIGHET_CARRIER_COLLAPSE="0")), ("sym", {})):
+            e = dict(SIGHET_ANCHOR_CORRECT="0")
+            e.update(env)
+            with _Env(**e):
+                comp.setup_in_model(self.holder_un, self.params_ref, self.slots)
+            try:
+                self.assertEqual(comp._stash_layout, name)
+                ll = np.asarray(comp.get_ll(self.params, data_index=self.di)).ravel()
+            finally:
+                comp.clear_in_model()
+            err[name] = np.abs(ll - ex)[:2] / np.abs(ex[:2])
+        self.assertLess(err["sym"].max(), err["full"].min() / 100.0,
+                        f"sym anchor {err['sym']} vs full {err['full']}")
+
+    def test_default_layout_is_sym(self):
+        """SYM is the default on any channel-symmetric noise, equal-arm included (the
+        collapsed layout is opt-in only)."""
+        comp = self._comp()
+        self.assertEqual(self._scores_layout(comp, self.holder)[0], "sym")
+        self.assertEqual(self._scores_layout(comp, self.holder_un)[0], "sym")
+        self.assertEqual(self._scores_layout(comp, self.holder_un,
+                                             SIGHET_CARRIER_LAYOUT="collapsed")[0], "sym")
+
     def test_asymmetric_buffer_falls_back_loudly(self):
         bad = self.invCs.copy()
-        bad[:, 1, 1] *= 1.2
+        bad[:, 0, 1] *= 1.2                       # iC_01 != iC_10: not even pair-symmetric
         holder = _SlotHolder(self.slabs, bad)
         comp = self._comp()
         with self.assertLogs("gbgpu.gbsignalhetcomputations", level="WARNING") as cm:
-            collapsed, dh, hh = self._scores(comp, holder=holder, collapse="1")
-        self.assertFalse(collapsed)
-        self.assertTrue(any("NOT channel-symmetric" in m for m in cm.output))
+            lay, dh, hh = self._scores_layout(comp, holder)
+        self.assertEqual(lay, "full")
+        self.assertTrue(any("not symmetric" in m for m in cm.output))
         self.assertTrue(np.all(np.isfinite(hh)) and np.all(hh > 0))
 
     def test_patch_cannot_switch_layout(self):
-        bad = self.invCs.copy()
-        bad[:, 1, 1] *= 1.2
+        bad = self.invCs_un                       # collapsed block -> a SYM patch
         comp = self._comp()
-        with _Env(SIGHET_CARRIER_COLLAPSE="1", SIGHET_ANCHOR_CORRECT="0"):
+        with _Env(SIGHET_CARRIER_LAYOUT="collapsed", SIGHET_ANCHOR_CORRECT="0"):
             comp.setup_in_model(self.holder, self.params_ref, self.slots)
             try:
                 self.assertTrue(comp._stash_collapsed)

@@ -47,7 +47,6 @@ from lisatools.utils.constants import YRSID_SI
 from gbgpu.gbcomps import GBWDMComputations
 from gbgpu.gbsignalhetcomputations import (
     GBSignalHetComputations,
-    _V5_COLLAPSED,
     _v5_nodes_arg,
 )
 
@@ -324,7 +323,7 @@ class DegenerateFullBandTest(_Grid):
             g["ind_min_t"], g["ind_min_f"], g["m_half"],
             g["layer_df"], g["dt"], g["Tobs"], g["t0"],
             3, 0, 1,
-            1 | (_V5_COLLAPSED if comp._stash_collapsed else 0), d_h_im)
+            1 | comp._v5_layout_bits(), d_h_im)
         return dict(d_h=np.asarray(d_h).copy(), h_h=np.asarray(h_h).copy(),
                     d_h_im=np.asarray(d_h_im).copy())
 
@@ -358,7 +357,8 @@ class WindowedVsFullBandTest(_Grid):
         self.assertLess(int(self.win._stash_W), Nf_active)
         self.assertEqual(self.full.A0_all.shape[2], Nf_active)
         self.assertEqual(self.win.A0_all.shape[2], int(self.win._stash_W))
-        # (n, nch, nch, W, Ns), or (n, 3 [q], W, Ns) when carrier-collapsed
+        # (n, nch, nch, W, Ns) / carrier sym (n, 3 [q], 3, W, Ns), or (n, 3 [q], W, Ns)
+        # when carrier-collapsed
         self.assertEqual(self.win.B0_all.shape[-2], int(self.win._stash_W))
         # the windowed origins are the real per-reference offsets
         self.assertTrue(bool(np.any(np.asarray(self.win._stash_w_lo) > 0)))

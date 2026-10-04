@@ -708,6 +708,10 @@ class GBComputationGroup{
     // B0/B1/B0nc/B1nc are the (a_q, b_q) moments of an a*I + b*J inverse
     // covariance, (num_data, 3 [q = 0, 1, 2], W_slab, N_sparse_t), q = 2 the
     // conj(dr) dr second moment. Needs the carrier n_nodes code.
+    // OR GB_SIGHET_V5_SYM (8) instead: the carrier SYM stash for any
+    // channel-symmetric inverse covariance (unequal arms) -- the same moments
+    // per unique channel pair, B0/B0nc the diagonal pairs (00, 11, 22) and
+    // B1/B1nc the off-diagonal ones (01, 02, 12), (num_data, 3 [q], 3, W, Ns).
     //
     // COMPACT-SLAB STASH (same contract as the F-stat scorer below): the
     // stash arrays are per-reference windows of width ``W_slab`` with

@@ -950,7 +950,8 @@ void GBComputationGroupWrap::gb_signal_het_v5_get_ll(
     const size_t b_xyz  = (size_t) num_data * nchannels * nchannels
                         * W_slab * N_sparse_t;
     const size_t b_diag = (size_t) num_data * nchannels * W_slab * N_sparse_t;
-    // v5_mode & 4: carrier-mode COLLAPSED moments, (num_data, 3 [q], W, Ns).
+    // v5_mode & 4: carrier-mode COLLAPSED moments, (num_data, 3 [q], W, Ns);
+    // v5_mode & 8 (carrier SYM: (num_data, 3 [q], 3 [pair], W, Ns)) keeps b_xyz.
     const size_t b_coll = (size_t) num_data * 3 * W_slab * N_sparse_t;
     const size_t b_len  = (v5_mode & 4) ? b_coll
                         : ((tdi_type == 0) ? b_xyz : b_diag);
@@ -1505,7 +1506,10 @@ void gbgpu_part(nb::module_ &m) {
          "traffic (~3 blocks/SM) -- the A/B that isolates occupancy. "
          "OR 4 into v5_mode for the carrier-mode COLLAPSED stash (B0/B1/"
          "B0nc/B1nc = (a_q, b_q) moments q = 0..2, shape (num_data, 3, W, Ns); "
-         "needs the carrier n_nodes code). "
+         "needs the carrier n_nodes code). OR 8 instead for the carrier SYM "
+         "stash (any channel-symmetric invC): the same moments per unique "
+         "channel pair, B0/B0nc the diagonal pairs and B1/B1nc the off-diagonal "
+         "ones, each (num_data, 3 [q], 3 [pair], W, Ns). "
          "GB_SIGHET_V5_VERBOSE=1 prints registers/thread and CUDA's own "
          "achieved blocks/SM for the launch.")
     .def("gb_signal_het_fstat_get_ll",
