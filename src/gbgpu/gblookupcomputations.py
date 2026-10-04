@@ -168,3 +168,51 @@ class GBLookupComputations(GBGPUParallelModule):
         self.d_h_out, self.h_h_out, self.d_h_im_out = d_h, h_h, d_h_im
         self.last_d_h, self.last_h_h, self.last_d_h_im = d_h, h_h, d_h_im
         return -0.5 * self.d_d + d_h - 0.5 * h_h
+
+
+def _gbwdm_base():
+    from .gbcomps import GBWDMComputations
+
+    return GBWDMComputations
+
+
+class GBLookupWDMComputations(_gbwdm_base()):
+    """A chunked ``GBWDMComputations`` whose ``get_ll_wdm`` runs the fused lookup scorer.
+
+    The integration form for the global fit: it IS the chunked computation for every
+    other purpose (fills, swaps, F-stat, attributes, sig-het's ``for_band_engine``
+    delegate), so nothing that type-dispatches on or writes attributes to the GB comp
+    changes; only the per-row likelihood switches to the lookup.
+
+    Args: those of ``GBWDMComputations`` plus ``lookup_table`` (a ``WDMLookupTable`` or
+    a path, built at the grid's layer duration) and ``lookup_n_nodes`` /
+    ``lookup_num_m_layers`` / ``lookup_k_coarse`` (see :class:`GBLookupComputations`).
+    """
+
+    def __init__(self, *args, lookup_table, lookup_n_nodes=64, lookup_num_m_layers=2,
+                 lookup_k_coarse=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lookup = GBLookupComputations(self, lookup_table, n_nodes=lookup_n_nodes,
+                                            num_m_layers=lookup_num_m_layers,
+                                            k_coarse=lookup_k_coarse)
+
+    def get_ll_wdm(self, params, wdm_holder, data_index=None, noise_index=None,
+                   convert_to_ra_dec=None, **kwargs):
+        """The chunked signature; ``grid_dim`` / layer-group / ``m_band_half_width`` knobs
+        of the chunked kernel do not apply (the lookup band is ``lookup_num_m_layers``)."""
+        if convert_to_ra_dec is None:
+            convert_to_ra_dec = bool(getattr(self, "convert_to_ra_dec", False))
+        x = self.xp.asarray(self.xp.atleast_2d(params), dtype=float).copy()
+        if convert_to_ra_dec:
+            from lisatools.response.directresponse import ecliptic_to_icrs
+
+            lam, beta = ecliptic_to_icrs(x[:, -2].copy(), x[:, -1].copy())
+            x[:, -2], x[:, -1] = lam, beta
+        wdm_holder = self._as_wdm_holder(wdm_holder)
+        self._lookup.d_d = float(getattr(self, "d_d", 0.0))
+        ll = self._lookup.get_ll_wdm(x, wdm_holder, data_index=data_index,
+                                     noise_index=noise_index)
+        self.d_h_out = self._lookup.d_h_out
+        self.h_h_out = self._lookup.h_h_out
+        self.d_h_im_out = self._lookup.d_h_im_out
+        return ll

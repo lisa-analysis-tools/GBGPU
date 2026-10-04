@@ -139,6 +139,34 @@ class GBLookupKernelTest(unittest.TestCase):
             np.testing.assert_allclose(a[k], b[k], rtol=1e-12,
                                        atol=1e-12 * np.abs(self.ref["h_h"]).max(), err_msg=k)
 
+    def test_chunked_subclass_integration(self):
+        """GBLookupWDMComputations: a chunked comp whose get_ll_wdm is the lookup (same
+        numbers as GBLookupComputations), fills inherited, and sig-het builds on it."""
+        from gbgpu.gblookupcomputations import GBLookupWDMComputations
+        from gbgpu.gbsignalhetcomputations import GBSignalHetComputations
+
+        ch = self.chunked
+        sub = GBLookupWDMComputations(
+            self.wdm, t_ref=ch.t_ref, Nt_sub=256, n_pad=32, N_sparse=256, N_cp_sig=48,
+            N_cp_orbit=32, orbits=ch.orbits, tdi_config="2nd generation", force_backend="cpu",
+            d_d=0.0, tdi_type="XYZ", lookup_table=self.table)
+        sub.convert_to_ra_dec = False
+        ll = np.asarray(sub.get_ll_wdm(self.p, self.narrow, data_index=self.idx,
+                                       noise_index=self.idx))
+        ref = self._lk()
+        np.testing.assert_allclose(np.asarray(sub.d_h_out), ref["d_h"], rtol=1e-13)
+        np.testing.assert_allclose(np.asarray(sub.h_h_out), ref["h_h"], rtol=1e-13)
+        np.testing.assert_allclose(ll, ref["d_h"] - 0.5 * ref["h_h"], rtol=1e-12)
+        a = np.zeros(self.narrow.linear_data_arr[0].size)
+        b = np.zeros_like(a)
+        for comp, buf in ((sub, a), (ch, b)):
+            comp.fill_global_wdm(self.p, buf, data_index=self.idx, factors=np.ones(len(self.p)),
+                                 band_slab_Nf=W, slab_min_f=self.slab_lo)
+        np.testing.assert_array_equal(a, b)
+        sig = GBSignalHetComputations.for_band_engine(sub, cp_repr="carrier", v3_n_nodes=32,
+                                                      v4_knots=64, v4_band=16, v5=1)
+        self.assertIs(sig.chunked, sub)
+
     def test_k1_term_is_load_bearing(self):
         with_k1 = self._rel(self._lk())["h_h"]
         without = self._rel(self._lk(k1=False))["h_h"]
