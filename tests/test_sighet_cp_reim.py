@@ -42,8 +42,10 @@ from lisatools.utils.constants import YRSID_SI
 from gbgpu.gbcomps import GBWDMComputations
 from gbgpu.gbsignalhetcomputations import (
     GBSignalHetComputations,
+    _SIGHET_CARRIER,
     _n_cp_kernel_arg,
     _resolve_cp_repr,
+    _v5_nodes_arg,
 )
 
 #: Six months on the production WDM layer (3600 s) with a cheap sampling:
@@ -127,7 +129,7 @@ class CpReprKnobTest(unittest.TestCase):
     def test_resolution_and_sign(self):
         saved = os.environ.pop("SIGHET_CP_REPR", None)
         try:
-            self.assertEqual(_resolve_cp_repr(None), "reim")       # default
+            self.assertEqual(_resolve_cp_repr(None), "carrier")    # default
             os.environ["SIGHET_CP_REPR"] = "AmpPh"
             self.assertEqual(_resolve_cp_repr(None), "ampph")      # rollback
             self.assertEqual(_resolve_cp_repr("reim"), "reim")     # explicit wins
@@ -141,6 +143,28 @@ class CpReprKnobTest(unittest.TestCase):
         self.assertEqual(_n_cp_kernel_arg(dict(n_cp_build=64, cp_repr="ampph")), 64)
         self.assertEqual(_n_cp_kernel_arg(dict(n_cp_build=0, cp_repr="reim")), 0)
         self.assertEqual(_n_cp_kernel_arg(dict(n_cp_build=64)), 64)
+        # carrier: the reference build takes the carrier code only where allowed
+        g = dict(n_cp_build=64, cp_repr="carrier")
+        self.assertEqual(_n_cp_kernel_arg(g), -64)
+        self.assertEqual(_n_cp_kernel_arg(g, allow_carrier=True), -(64 + _SIGHET_CARRIER))
+        self.assertEqual(_v5_nodes_arg(g, 32), -(32 + _SIGHET_CARRIER))
+        self.assertEqual(_v5_nodes_arg(dict(cp_repr="reim"), 32), -32)
+        self.assertEqual(_v5_nodes_arg(dict(cp_repr="ampph"), 32), 32)
+
+    def test_carrier_is_v5_only(self):
+        fx = _fixture()
+        with self.assertRaises(ValueError):
+            GBSignalHetComputations.for_band_engine(
+                fx["chunked"], nt_layer=120, n_cp_build=32, tukey_alpha=0.01,
+                cp_repr="carrier")                       # explicit, v2 engine
+        saved = os.environ.pop("SIGHET_CP_REPR", None)
+        try:   # the DEFAULT on a non-v5 engine falls back to reim
+            sig = GBSignalHetComputations.for_band_engine(
+                fx["chunked"], nt_layer=120, n_cp_build=32, tukey_alpha=0.01)
+            self.assertEqual(sig._g["cp_repr"], "reim")
+        finally:
+            if saved is not None:
+                os.environ["SIGHET_CP_REPR"] = saved
 
     def test_engine_records_repr(self):
         self.assertEqual(_engine(32, "reim")._g["cp_repr"], "reim")
@@ -274,7 +298,7 @@ class V5RatioDeltaTest(unittest.TestCase):
         NV = np.full(n_src, 1024)
         eng = {rep: make_band_likelihood_engine(
             wdm, gb_wdm_comp=_engine(256, rep), nchannels=3, tdi_channel_setup="XYZ")
-            for rep in ("ampph", "reim")}
+            for rep in ("ampph", "reim", "carrier")}
         e0 = eng["ampph"]
         zero = _Slabs(np.zeros((n_src, 3, W, T)), invc, slab_lo, W)
         e0.get_ll(zero, p0, data_index=idx, noise_index=idx, N_vals=NV, waveform_kwargs={})
@@ -302,14 +326,26 @@ class V5RatioDeltaTest(unittest.TestCase):
         le0 = ll(e0, p0)                       # exact (no reference active)
         D_ex = np.array([ll(e0, p1) - le0 for p1 in cands])
         cls.eps, cls.anchor = {}, {}
-        for rep, e in eng.items():
-            e.setup_in_model(data, p0, idx)
-            ls0 = ll(e, p0)
-            D = np.array([ll(e, p1) - ls0 for p1 in cands])
-            e.clear_in_model()
+        runs = list(eng.items()) + [("carrier_nocorr", eng["carrier"])]
+        for rep, e in runs:
+            saved = os.environ.get("SIGHET_ANCHOR_CORRECT")
+            if rep == "carrier_nocorr":
+                os.environ["SIGHET_ANCHOR_CORRECT"] = "0"
+            try:
+                e.setup_in_model(data, p0, idx)
+                ls0 = ll(e, p0)
+                D = np.array([ll(e, p1) - ls0 for p1 in cands])
+                e.clear_in_model()
+            finally:
+                if rep == "carrier_nocorr":
+                    if saved is None:
+                        os.environ.pop("SIGHET_ANCHOR_CORRECT", None)
+                    else:
+                        os.environ["SIGHET_ANCHOR_CORRECT"] = saved
             cls.eps[rep] = np.abs(D - D_ex)
             cls.anchor[rep] = np.abs(ls0 - le0)
         cls.T = np.abs(D_ex)
+        cls.edge = np.abs(np.cos(p0[:, 5])) < 0.05
 
     def test_reim_anchor_exact(self):
         worst = self.anchor["reim"].max()
@@ -323,6 +359,22 @@ class V5RatioDeltaTest(unittest.TestCase):
     def test_reim_not_worse_in_bulk(self):
         a, r = np.median(self.eps["ampph"]), np.median(self.eps["reim"])
         self.assertLessEqual(r, 1.5 * a + 1e-6, f"median eps Re/Im {r:.2e} vs {a:.2e}")
+
+    def test_carrier_fixes_edge_on(self):
+        """Carrier-only reference: every delta inside the tier bar, edge-on included,
+        where the per-channel Re/Im ratio still fails (its error sits in X+Y+Z)."""
+        e = self.eps["carrier"]
+        bar = np.maximum(0.1, self.T / 100.0)
+        self.assertTrue(np.all(e <= bar), f"carrier worst eps/bar {np.max(e / bar):.2f}")
+        r = self.eps["reim"][:, self.edge]
+        self.assertGreater(np.max(r / bar[:, self.edge]), 3.0,
+                           "the per-channel Re/Im ratio should still fail edge-on here")
+
+    def test_carrier_anchor_corrected(self):
+        self.assertLess(self.anchor["carrier"].max(), 1e-8,
+                        f"carrier anchor {self.anchor['carrier'].max():.2e} with the correction")
+        self.assertGreater(self.anchor["carrier_nocorr"].max(), 1e-2,
+                           "without the correction the carrier anchor offset should show")
 
 
 if __name__ == "__main__":

@@ -122,26 +122,51 @@ def _resolve_n_cp(n_cp_build, Tobs):
 #: complex ratio: the log-polar fit exp()-amplifies spline overshoot near
 #: envelope minima and flip spans (compiled 6-month check: eps up to 1e7 x
 #: the true dlnL on edge-on / pattern-null sources at posterior-scale steps).
-#: v2/v3/v4 keep their log-polar fits. Env SIGHET_CP_REPR (default "reim";
-#: "ampph" restores the previous behaviour exactly).
-_CP_REPRS = ("ampph", "reim")
+#: v2/v3/v4 keep their log-polar fits. Env SIGHET_CP_REPR (default "carrier" on v5
+#: engines, "reim" elsewhere; "reim" / "ampph" are the rollbacks).
+_CP_REPRS = ("ampph", "reim", "carrier")
+#: ``"carrier"`` = ``"reim"`` with a CARRIER-ONLY in-model reference (v5 only): the stash is
+#: built with a unit envelope in every channel (the reference's common phase only) and the v5
+#: node "ratio" is each channel's own demodulated envelope -- no division by a per-channel
+#: reference envelope, so the node fit is linear in the channels and the low-f X+Y+Z null
+#: survives. (The Re/Im node ratio still divides channel by channel: its error was measured to
+#: sit ~100 % in the T = X+Y+Z direction, which the near-singular low-f XYZ invC amplifies.)
+#: F-stat references and v2 candidate builds use the plain Re/Im code.
+_SIGHET_CARRIER = 1048576     # == GB_SIGHET_CARRIER in gb_tdi_on_the_fly.cu
 
 
 def _resolve_cp_repr(cp_repr):
     if cp_repr is None:
-        cp_repr = os.environ.get("SIGHET_CP_REPR", "reim")
+        cp_repr = os.environ.get("SIGHET_CP_REPR", "carrier")
     cp_repr = str(cp_repr).lower()
     if cp_repr not in _CP_REPRS:
         raise ValueError(f"cp_repr must be one of {_CP_REPRS}, got {cp_repr!r}")
     return cp_repr
 
 
-def _n_cp_kernel_arg(g):
+def _n_cp_kernel_arg(g, allow_carrier=False):
     """The ``n_cp_sig`` the kernels take: the node count, NEGATED for the
-    Re/Im representation (``gbfd_build_one_source`` decodes the sign; the
-    direct path, ``0``, has no representation)."""
+    Re/Im representation, ``-(n + _SIGHET_CARRIER)`` for a carrier-only
+    reference build (only where ``allow_carrier``: the v5 in-model stash)
+    -- ``gbfd_build_one_source`` decodes it; the direct path, ``0``, has no
+    representation."""
     n = int(g["n_cp_build"])
-    return -n if (n > 1 and g.get("cp_repr", "ampph") == "reim") else n
+    rep = g.get("cp_repr", "ampph")
+    if n <= 1 or rep == "ampph":
+        return n
+    if rep == "carrier" and allow_carrier:
+        return -(n + _SIGHET_CARRIER)
+    return -n
+
+
+def _v5_nodes_arg(g, nodes):
+    """The v5 node-count argument: log-polar (``ampph``), Re/Im (``reim``,
+    negated) or Re/Im against the carrier-only reference (``carrier``)."""
+    rep = g.get("cp_repr", "ampph")
+    nodes = int(nodes)
+    if rep == "carrier":
+        return -(nodes + _SIGHET_CARRIER)
+    return -nodes if rep == "reim" else nodes
 
 
 def _c0_row_mask_bits(c0, xp):
@@ -608,8 +633,9 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
 
         ``cp_repr`` picks the control-point representation of the spline
         waveform build and of the v5 node-ratio fit (``"ampph"`` /
-        ``"reim"``; ``None`` -> env ``SIGHET_CP_REPR``, default ``"reim"``;
-        ``"ampph"`` is the rollback); see ``_CP_REPRS``.
+        ``"reim"`` / ``"carrier"``; ``None`` -> env ``SIGHET_CP_REPR``,
+        default ``"carrier"`` for v5 engines and ``"reim"`` otherwise;
+        ``"ampph"`` is the full rollback); see ``_CP_REPRS``.
 
         ``v5`` selects the V5 occupancy experiment (opt-in, default OFF --
         with ``v5=0`` nothing about the v2/v3/v4 paths changes). It only
@@ -784,6 +810,14 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                        cp_repr=_resolve_cp_repr(cp_repr),
                        v3_n_nodes=int(v3_n_nodes), v4_knots=int(v4_knots),
                        v4_band=int(v4_band), v5=int(v5))
+        _is_v5 = bool(int(v4_knots)) and bool(int(v5))
+        if (self._g["cp_repr"] == "carrier" and not _is_v5 and cp_repr is None
+                and "SIGHET_CP_REPR" not in os.environ):
+            self._g["cp_repr"] = "reim"          # the default only applies to v5
+        if self._g["cp_repr"] == "carrier" and not _is_v5:
+            raise ValueError(
+                "cp_repr='carrier' (carrier-only in-model reference) is a v5 scorer mode: "
+                "build the engine with v4_knots > 0 and v5 = 1, or use cp_repr='reim'.")
         # RESOLVED-CONFIG ECHO. Nothing else in the stack prints what the
         # sig-het engine actually ended up with: the stock builder logs only
         # "GB in-model likelihood: SIGNAL-HET", run_settings.log does not
@@ -814,6 +848,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         self._in_model = None
         self._slot_to_ref = None
         self._slot_to_ref_xp = None
+        self._anchor_off = None
         self.c0_mask_all = None
         self._stash_W = None
         self._stash_w_lo = None
@@ -1117,7 +1152,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 g["nt_layer"], g["N_sparse_t"], g["stride"],
                 g["ind_min_t"], g["ind_min_f"],
                 g["layer_df"], g["dt"], g["Tobs"], g["t0"],
-                3, g["n_sparse_fd"], g["tukey_alpha"], _n_cp_kernel_arg(g))
+                3, g["n_sparse_fd"], g["tukey_alpha"], _n_cp_kernel_arg(
+                    g, allow_carrier=bool(g.get("v4_knots", 0)) and bool(int(g.get("v5", 0)))))
             c0_sparse_w[s:s + k] = c0_sparse_chunk
             folds.append(bin_fold_real(
                 res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
@@ -1240,6 +1276,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             self.params_ref_all[ref_idx] = refs
             # THE window shift. Same row order as the coefficient scatters.
             self._stash_w_lo[xp.asarray(ref_idx)] = w_lo_stash
+            self._update_anchor_offsets(buffer_aca, slots, ref_idx)
             return True
 
         # The coefficient stash is the per-block CACHE: built once here (on
@@ -1268,7 +1305,39 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         # copy above stays for the once-per-refresh patch bookkeeping.
         self._slot_to_ref_xp = xp.asarray(slot_map)
         self._in_model = True
+        self._anchor_off = None
+        self._update_anchor_offsets(buffer_aca, slots, np.arange(n))
         return True
+
+    def _update_anchor_offsets(self, buffer_aca, slots, ref_idx):
+        """Carrier mode: the exact-minus-sig-het ln L AT each (re)built reference.
+
+        The carrier-only reference makes the v5 deltas accurate at every
+        inclination, but its fold carries the full envelope's sub-stride
+        curvature, so ln L at the reference itself is off by a smooth,
+        SNR^2-scaling amount (measured 0.5 / 1.5 lnL median / max at SNR 100,
+        6 months). That offset cancels inside a cell but not across cells
+        (vertical swaps), so it is measured once per reference with the exact
+        chunked delegate and removed in ``get_ll_wdm`` (applied to h_h, which
+        is phase-independent, so the phase-max quadrature path inherits it).
+        ``SIGHET_ANCHOR_CORRECT=0`` skips it.
+        """
+        g = self._g
+        if (g.get("cp_repr") != "carrier"
+                or os.environ.get("SIGHET_ANCHOR_CORRECT", "1") == "0"):
+            self._anchor_off = None
+            return
+        xp = self.xp
+        ri = xp.asarray(np.asarray(ref_idx, dtype=np.int64))
+        P = self.params_ref_all[ri]
+        ll_sig = xp.asarray(self.get_ll(P, data_index=ri), dtype=float).ravel()
+        sl = xp.asarray(np.asarray(slots, dtype=np.int64))
+        ll_ex = xp.asarray(self.chunked.get_ll_wdm(P, buffer_aca, data_index=sl,
+                                                   noise_index=sl), dtype=float).ravel()
+        n_ref = int(self.params_ref_all.shape[0])
+        if self._anchor_off is None or int(self._anchor_off.shape[0]) != n_ref:
+            self._anchor_off = xp.zeros(n_ref, dtype=float)
+        self._anchor_off[ri] = ll_ex - ll_sig
 
     def clear_in_model(self) -> None:
         """Deactivate the in-model reference: get_ll_wdm routes back to the
@@ -1293,6 +1362,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         self._in_model = None
         self._slot_to_ref = None
         self._slot_to_ref_xp = None
+        self._anchor_off = None
         self.c0_mask_all = None
         if not was_active:
             return
@@ -1920,6 +1990,11 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         # params stay on their resident device (cupy on the CUDA path).
         ll = self.get_ll(self.xp.asarray(params, dtype=float),
                          data_index=ref_idx)
+        off = getattr(self, "_anchor_off", None)
+        if off is not None:
+            corr = off[ref_idx]
+            ll = ll + corr
+            self.last_h_h = self.last_h_h - 2.0 * corr
         if bool(bad.any()):
             raise RuntimeError(
                 "sig-het in-model scoring hit a buffer slot with no "
@@ -2046,10 +2121,9 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 self._v4_band_arrays[2],
                 x, self.params_ref_all, di, _w_lo,
                 N, num_data,
-                # NEGATED node count = the Re/Im node-ratio fit (the wrap
-                # decodes it); cp_repr selects the Re/Im family as a whole.
-                (-1 if g.get("cp_repr", "ampph") == "reim" else 1)
-                * self._resolve_v3_nodes(x, di), int(g["v4_knots"]),
+                # node-count CODE (the wrap decodes it): log-polar / Re/Im /
+                # Re/Im against the carrier-only reference, per cp_repr.
+                _v5_nodes_arg(g, self._resolve_v3_nodes(x, di)), int(g["v4_knots"]),
                 9, 1, 2,
                 g["Nf"], g["Nt"], g["Nf_active"], _W_slab, g["Nt_active"],
                 g["nt_layer"], g["N_sparse_t"], g["stride"],

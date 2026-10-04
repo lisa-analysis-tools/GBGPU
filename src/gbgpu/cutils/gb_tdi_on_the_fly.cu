@@ -35,6 +35,16 @@
 #include <cstdlib>   // getenv / atoi / atoll / free -- sig-het V5 slab + knobs
 #include <cstdint>   // uintptr_t -- sig-het V5 shared-tail alignment
 
+// Sig-het control-point / node-count CODES (GBSignalHetComputations._n_cp_kernel_arg and the
+// v5 node-count argument):
+//   n > 1                      amplitude / phase (log-polar for the v5 node ratio)
+//   -n            (n > 1)      Re/Im representation
+//   -(n + GB_SIGHET_CARRIER)   Re/Im against a CARRIER-ONLY reference: the reference envelope
+//                              is 1 in every channel (its common phase only), so the v5 node
+//                              "ratio" is each channel's own demodulated envelope -- no division
+//                              by a per-channel reference envelope, linear in the channels.
+#define GB_SIGHET_CARRIER 1048576
+
 // `N_PARAMS_MAX` is the upper bound on per-source parameter count
 // used by the shared-memory layout calculations below. Same value
 // as lisa-on-gpu's TDIonTheFly.cu (Phase 2 chunked-het work).
@@ -365,7 +375,8 @@ int GBTDIonTheFly::get_gb_fd_buffer_size(int N, int nchannels, int n_cp_sig)
     // The MAX of the two is reserved so a runtime path switch is safe.
     // n_cp_sig < -1 selects the same arena with the Re/Im representation
     // (see gbfd_build_one_source), so only its magnitude sizes it.
-    if (n_cp_sig < -1) n_cp_sig = -n_cp_sig;
+    if (n_cp_sig <= -GB_SIGHET_CARRIER) n_cp_sig = -n_cp_sig - GB_SIGHET_CARRIER;
+    else if (n_cp_sig < -1) n_cp_sig = -n_cp_sig;
     const size_t common =
           N_PARAMS_MAX * sizeof(double)
         + (size_t) N * sizeof(double)
@@ -501,8 +512,10 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
                            int *kf0_out, double *f0g_out, double *dts_out,
                            double tukey_alpha, double edge_frac, int n_cp_sig)
 {
-    const bool cp_reim = (n_cp_sig < -1);
-    if (cp_reim) n_cp_sig = -n_cp_sig;
+    const bool cp_carrier = (n_cp_sig <= -GB_SIGHET_CARRIER);
+    const bool cp_reim = cp_carrier || (n_cp_sig < -1);
+    if (cp_carrier) n_cp_sig = -n_cp_sig - GB_SIGHET_CARRIER;
+    else if (cp_reim) n_cp_sig = -n_cp_sig;
     // ---- carve up shared memory ------------------------------------------
     char *cur = (char*) shared_mem;
 
@@ -626,8 +639,9 @@ void gbfd_build_one_source(GBTDIonTheFly *tof, void *shared_mem,
                 {
                     const double a = amp_y[k];
                     const double p = ph_y[k];
-                    amp_y[k] = a * cos(p);
-                    ph_y[k]  = a * sin(p);
+                    // carrier-only reference: unit envelope, common phase only
+                    amp_y[k] = cp_carrier ? 1.0 : a * cos(p);
+                    ph_y[k]  = cp_carrier ? 0.0 : a * sin(p);
                 }
                 CUDA_SYNC_THREADS;
             }
@@ -5701,7 +5715,11 @@ void gb_signal_het_v5_score_one_source(
         CUDA_SYNC_THREADS;
         for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X) {
             double a = amp_y[k];
-            if (ratio_reim) {
+            if (ratio_reim == 2) {
+                // carrier-only reference: the candidate's own signed
+                // amplitude, no floor (nothing is divided)
+                dlnA[(size_t) c * n_nodes + k] = a;
+            } else if (ratio_reim) {
                 // Re/Im mode keeps the SIGNED amplitude (a1/a0 with the
                 // extraction's flip pi in both phases is the exact complex
                 // ratio), floored in MAGNITUDE exactly like the reference
@@ -5715,7 +5733,8 @@ void gb_signal_het_v5_score_one_source(
             dphi[(size_t) c * n_nodes + k] = ph_y[k] + phiun_c[k];
         }
         CUDA_SYNC_THREADS;
-        // reference
+        // reference (skipped against a carrier-only reference: unit envelope)
+        if (ratio_reim != 2) {
         tof->new_extract_amplitude_and_phase(count, fix_c, flip, pjump,
                                              n_nodes, amp_y, ph_y,
                                              &tdi_r[(size_t) c * n_nodes],
@@ -5723,6 +5742,7 @@ void gb_signal_het_v5_score_one_source(
         CUDA_SYNC_THREADS;
         tof->new_unwrap_phase(flip, n_nodes, ph_y);
         CUDA_SYNC_THREADS;
+        }
         if (THREAD_ZERO) {
             double amax = 0.0;
             for (int k = 0; k < n_nodes; ++k) {
@@ -5744,12 +5764,15 @@ void gb_signal_het_v5_score_one_source(
             // exp()-amplified garbage -- measured eps up to 1e7 x the true
             // dlnL on edge-on and pattern-null sources.
             for (int k = THREAD_START_X; k < n_nodes; k += BLOCK_INCR_X) {
-                const double a0  = (fabs(amp_y[k]) < pcr[0])
-                                 ? copysign(pcr[0], amp_y[k]) : amp_y[k];
+                const bool carrier = (ratio_reim == 2);
+                const double a0  = carrier ? 1.0
+                                 : ((fabs(amp_y[k]) < pcr[0])
+                                    ? copysign(pcr[0], amp_y[k]) : amp_y[k]);
+                const double ph0 = carrier ? 0.0 : ph_y[k];
                 const double rat = dlnA[(size_t) c * n_nodes + k] / a0;
                 const double tau = t_nodes[k] - t_start;
                 const double dph = dphi[(size_t) c * n_nodes + k]
-                    - (ph_y[k] + phiun_r[k])
+                    - (ph0 + phiun_r[k])
                     - TWO_PI * (df0 * tau + 0.5 * dfdot * tau * tau);
                 dlnA[(size_t) c * n_nodes + k] = rat * cos(dph);
                 dphi[(size_t) c * n_nodes + k] = rat * sin(dph);
@@ -6174,8 +6197,10 @@ void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
     gb_sighet_check_m_half(m_active_half_width);
     // n_nodes < 0 selects the Re/Im node-ratio fit (see the node stage of
     // gb_signal_het_v5_score_one_source) with |n_nodes| nodes.
-    const bool ratio_reim = (n_nodes < 0);
-    if (ratio_reim) n_nodes = -n_nodes;
+    // n_nodes <= -GB_SIGHET_CARRIER: Re/Im node fit against a carrier-only reference.
+    const int ratio_reim = (n_nodes <= -GB_SIGHET_CARRIER) ? 2 : ((n_nodes < 0) ? 1 : 0);
+    if (ratio_reim == 2) n_nodes = -n_nodes - GB_SIGHET_CARRIER;
+    else if (ratio_reim == 1) n_nodes = -n_nodes;
     if (n_nodes < 4) {
         throw std::invalid_argument(
             "[gb_signal_het_v5_get_ll_wrap] n_nodes must be >= 4 "
@@ -6245,7 +6270,7 @@ void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
         Nf, Nf_active, W_slab, N_sparse_t, stride,
         ind_min_t, ind_min_f, m_active_half_width,
         layer_df, dt, T_obs, t_start,
-        nchannels, tdi_type, project_real, (int) ratio_reim, d_h_im_out);
+        nchannels, tdi_type, project_real, ratio_reim, d_h_im_out);
 
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
