@@ -8015,20 +8015,22 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
                 }
                 D[c] = Dbase[(size_t) c * plane_d + (size_t) ml_d * a.Nt_active + nl];
             }
-            for (int c = 0; c < nch; ++c)
-            {
-                double Ch = 0.0, Chq = 0.0;
-                for (int d = 0; d < nch; ++d)
-                {
-                    const double iC = Cbase[((size_t) c * nch + d) * plane_c
-                                            + (size_t) ml_c * a.Nt_active + nl];
-                    Ch += iC * h[d];
-                    Chq += iC * hq[d];
-                }
-                dh += D[c] * Ch;
-                hh += h[c] * Ch;
-                dhim += D[c] * Chq;
-            }
+            // the XYZ inverse covariance is symmetric in its channel pair: read
+            // the 6 unique planes (00, 11, 22, 01, 02, 12) -- a quarter less
+            // traffic on the memory-bound contraction
+            const size_t pix = (size_t) ml_c * a.Nt_active + nl;
+            const double c00 = Cbase[0 * plane_c + pix], c11 = Cbase[4 * plane_c + pix];
+            const double c22 = Cbase[8 * plane_c + pix], c01 = Cbase[1 * plane_c + pix];
+            const double c02 = Cbase[2 * plane_c + pix], c12 = Cbase[5 * plane_c + pix];
+            const double Ch0 = c00 * h[0] + c01 * h[1] + c02 * h[2];
+            const double Ch1 = c01 * h[0] + c11 * h[1] + c12 * h[2];
+            const double Ch2 = c02 * h[0] + c12 * h[1] + c22 * h[2];
+            const double Cq0 = c00 * hq[0] + c01 * hq[1] + c02 * hq[2];
+            const double Cq1 = c01 * hq[0] + c11 * hq[1] + c12 * hq[2];
+            const double Cq2 = c02 * hq[0] + c12 * hq[1] + c22 * hq[2];
+            dh   += D[0] * Ch0 + D[1] * Ch1 + D[2] * Ch2;
+            hh   += h[0] * Ch0 + h[1] * Ch1 + h[2] * Ch2;
+            dhim += D[0] * Cq0 + D[1] * Cq1 + D[2] * Cq2;
         }
     }
 #undef GBLK_SPL
