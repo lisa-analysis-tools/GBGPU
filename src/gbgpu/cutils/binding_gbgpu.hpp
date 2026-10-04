@@ -1056,6 +1056,31 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         int nchannels,
         int N_sparse_fd, double tukey_alpha, int n_cp_sig);
 
+    // Carrier-mode reference producer: the FD build runs all ``nchannels`` but
+    // only channel 0 is emitted (the carrier is channel-independent), plus the
+    // packet first moment's dense transform (window -> wdm_window_dj) into
+    // c1_dense_out. c0_sparse_out (num_data,1,Nf_active,N_sparse_t);
+    // c0_dense_out / c1_dense_out (num_data,1,Nf_active,Nt_active).
+    void gb_signal_het_make_reference_carrier(
+        GBTDIonTheFlyWrap *tdi_wrap,
+        array_type<std::complex<double>> c0_sparse_out,
+        array_type<std::complex<double>> c0_dense_out,
+        array_type<std::complex<double>> c1_dense_out,
+        array_type<double> wdm_window,
+        array_type<double> wdm_window_dj,
+        array_type<int> n_sparse_local_arr,
+        array_type<int> w_lo_arr,
+        array_type<double> params_ref_all,
+        int num_data,
+        int nparams, int f0_idx, int fdot_idx,
+        int Nf, int Nt, int Nf_active, int Nt_active,
+        int Nt_layer, int N_sparse_t, int stride,
+        int ind_min_t, int ind_min_f,
+        double layer_df, double dt,
+        double T_obs, double t_start,
+        int nchannels,
+        int N_sparse_fd, double tukey_alpha, int n_cp_sig);
+
     // Signal-het central-difference gradient of logL = d_h - 0.5*h_h. Per
     // binary, performs 1 central + 2*nparams perturbed get_ll_in_kernel
     // evaluations. grad_out is (num_bin, nparams); d_h_central /

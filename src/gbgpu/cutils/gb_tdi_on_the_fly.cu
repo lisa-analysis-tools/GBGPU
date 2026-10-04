@@ -3215,6 +3215,8 @@ void gb_signal_het_make_reference_kernel(
     double  dt,
     int     nchannels,
     int     N_sparse_fd,
+    int     nch_out,            // output channels (<= nchannels; X_het_raw
+                                // keeps the nchannels stride)
     cmplx  *tw_global)          // non-null: pre-filled length-Nt twiddle
                                 // table in GLOBAL memory (the tw[Nt] shared
                                 // slab is then not carved) -- the wrap's
@@ -3246,11 +3248,11 @@ void gb_signal_het_make_reference_kernel(
     cmplx *Xw     = (cmplx*) cur;  cur += (size_t) N_sparse_fd * sizeof(cmplx);
     cmplx *fold_s = (cmplx*) cur;
 
-    const long n_blocks = (long) num_data * nchannels * Nf_active;
+    const long n_blocks = (long) num_data * nch_out * Nf_active;
     for (long blk = BLOCK_START_X; blk < n_blocks; blk += GRID_INCR_X)
     {
-        const int d       = (int) (blk / ((long) nchannels * Nf_active));
-        const int c       = (int) ((blk / Nf_active) % nchannels);
+        const int d       = (int) (blk / ((long) nch_out * Nf_active));
+        const int c       = (int) ((blk / Nf_active) % nch_out);
         const int m_local = (int) (blk % Nf_active);
 
         const int k_f0 = k_f0_buf[d];
@@ -3310,8 +3312,10 @@ void gb_signal_het_make_reference_kernel(
         CUDA_SYNC_THREADS;
         // Sparse fold: gather per slot rr over j = rr + q*Nt_layer
         // (increasing j = the CPU's increasing-i summation order), with
-        // the CPU's centered-j_off prephase.
-        for (int rr = THREAD_START_X; rr < Nt_layer; rr += BLOCK_INCR_X)
+        // the CPU's centered-j_off prephase. Skipped (block-uniformly) when
+        // no sparse output is requested (the c1 pass).
+        for (int rr = THREAD_START_X; (c0_sparse_out != nullptr) && rr < Nt_layer;
+             rr += BLOCK_INCR_X)
         {
             cmplx acc(0.0, 0.0);
             for (int j = rr; j < Nt; j += Nt_layer)
@@ -3330,7 +3334,8 @@ void gb_signal_het_make_reference_kernel(
         CUDA_SYNC_THREADS;
 
         // ---- SPARSE iFFT (length Nt_layer, N_sparse_t outputs) -------
-        for (int n_layer = THREAD_START_X; n_layer < N_sparse_t;
+        for (int n_layer = THREAD_START_X;
+             (c0_sparse_out != nullptr) && n_layer < N_sparse_t;
              n_layer += BLOCK_INCR_X)
         {
             cmplx acc(0.0, 0.0);
@@ -3346,7 +3351,7 @@ void gb_signal_het_make_reference_kernel(
                                                       : cmplx(0.0, -1.0);
             const double sign_mn    = (((m_global + 1) * n_global) & 1)
                                           ? -1.0 : 1.0;
-            c0_sparse_out[(((size_t) d * nchannels + c) * Nf_active + m_local)
+            c0_sparse_out[(((size_t) d * nch_out + c) * Nf_active + m_local)
                           * N_sparse_t + n_layer]
                 = acc * sign_scale * (kappa * sign_mn * conj_cmn);
         }
@@ -3374,7 +3379,7 @@ void gb_signal_het_make_reference_kernel(
                                                     : cmplx(0.0, -1.0);
             const double sign_mn  = (((m_global + 1) * n_global) & 1)
                                         ? -1.0 : 1.0;
-            c0_dense_out[(((size_t) d * nchannels + c) * Nf_active + m_local)
+            c0_dense_out[(((size_t) d * nch_out + c) * Nf_active + m_local)
                          * Nt_active + n]
                 = acc * (kappa * sign_mn * conj_cmn);
         }
@@ -3399,9 +3404,20 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
     double  layer_df, double dt,
     double  T_obs, double t_start,
     int     nchannels,
-    int     N_sparse_fd, double tukey_alpha, int n_cp_sig)
+    int     N_sparse_fd, double tukey_alpha, int n_cp_sig,
+    cmplx  *c1_dense_out, double *wdm_window_dj, int nch_out)
 {
     (void) f0_idx; (void) fdot_idx; (void) layer_df;
+    if (nch_out < 0) nch_out = nchannels;
+    if (nch_out < 1 || nch_out > nchannels) {
+        throw std::invalid_argument(
+            "[gb_signal_het_make_reference_wrap] nch_out must be in [1, nchannels].");
+    }
+    if ((c1_dense_out == nullptr) != (wdm_window_dj == nullptr)) {
+        throw std::invalid_argument(
+            "[gb_signal_het_make_reference_wrap] c1_dense_out and wdm_window_dj "
+            "go together.");
+    }
 
     if (Nt_layer * stride != Nt) {
         throw std::invalid_argument(
@@ -3484,14 +3500,16 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
 
     // (2) fold + iFFT/iDFT kernel. Pre-zero the outputs (the CPU branch's
     // std::fill contract; window-external blocks never write).
-    const size_t n_sparse_tot = (size_t) num_data * nchannels
+    const size_t n_sparse_tot = (size_t) num_data * nch_out
                                 * Nf_active * N_sparse_t;
-    const size_t n_dense_tot  = (size_t) num_data * nchannels
+    const size_t n_dense_tot  = (size_t) num_data * nch_out
                                 * Nf_active * Nt_active;
     gpuErrchk(cudaMemset(c0_sparse_out, 0, n_sparse_tot * sizeof(cmplx)));
     gpuErrchk(cudaMemset(c0_dense_out,  0, n_dense_tot  * sizeof(cmplx)));
+    if (c1_dense_out != nullptr)
+        gpuErrchk(cudaMemset(c1_dense_out, 0, n_dense_tot * sizeof(cmplx)));
 
-    const long n_blocks = (long) num_data * nchannels * Nf_active;
+    const long n_blocks = (long) num_data * nch_out * Nf_active;
     const int  grid_x   = (int) ((n_blocks < 65535L) ? n_blocks : 65535L);
     gb_signal_het_make_reference_kernel<<<grid_x, NUM_THREADS_HERE,
                                           shared_bytes>>>(
@@ -3505,7 +3523,25 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
         dt,
         nchannels,
         N_sparse_fd,
+        nch_out,
         d_tw);
+    // Packet first moment: the same FD build, the dense transform only, with
+    // the window derivative.
+    if (c1_dense_out != nullptr)
+        gb_signal_het_make_reference_kernel<<<grid_x, NUM_THREADS_HERE,
+                                              shared_bytes>>>(
+            nullptr, c1_dense_out,
+            d_X_het_raw, d_k_f0,
+            wdm_window_dj, n_sparse_local_arr, w_lo_arr,
+            num_data,
+            Nf, Nt, Nf_active, Nt_active,
+            Nt_layer, N_sparse_t, stride,
+            ind_min_t, ind_min_f,
+            dt,
+            nchannels,
+            N_sparse_fd,
+            nch_out,
+            d_tw);
 
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
@@ -3566,13 +3602,16 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
     // (window width Nt, layer stride half_Nt), so the dense iDFT totals
     // O(2 * N_sparse_fd * Nt_active) per (d, c) instead of the previous
     // O(Nf_active * Nt * Nt_active) full sweep.
-    const size_t n_sparse_tot = (size_t) num_data * nchannels * Nf_active * N_sparse_t;
-    const size_t n_dense_tot  = (size_t) num_data * nchannels * Nf_active * Nt_active;
+    const size_t n_sparse_tot = (size_t) num_data * nch_out * Nf_active * N_sparse_t;
+    const size_t n_dense_tot  = (size_t) num_data * nch_out * Nf_active * Nt_active;
     std::fill(c0_sparse_out, c0_sparse_out + n_sparse_tot, cmplx(0.0, 0.0));
     std::fill(c0_dense_out,  c0_dense_out  + n_dense_tot,  cmplx(0.0, 0.0));
+    if (c1_dense_out != nullptr)
+        std::fill(c1_dense_out, c1_dense_out + n_dense_tot, cmplx(0.0, 0.0));
 
     std::vector<cmplx> fold_s(Nt_layer);
     std::vector<cmplx> fold_d(Nt);
+    std::vector<cmplx> fold_d1(c1_dense_out != nullptr ? Nt : 0);
     std::vector<int>   nz_j;
     nz_j.reserve(N_sparse_fd);
     for (int d = 0; d < num_data; ++d) {
@@ -3583,12 +3622,14 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
         const int m_lo = std::max(0, (k_f0 - half_NS) / half_Nt - 1 - ind_min_f_d);
         const int m_hi = std::min(Nf_active - 1,
                                   (k_f0 + half_NS - 1) / half_Nt + 1 - ind_min_f_d);
-        for (int c = 0; c < nchannels; ++c) {
+        for (int c = 0; c < nch_out; ++c) {
             const cmplx *X_chan = X_het.data() + ((size_t) d * nchannels + c) * N_sparse_fd;
             for (int m_local = m_lo; m_local <= m_hi; ++m_local) {
                 const int m_global = ind_min_f_d + m_local;
                 std::fill(fold_s.begin(), fold_s.end(), cmplx(0.0, 0.0));
                 for (int jj : nz_j) fold_d[jj] = cmplx(0.0, 0.0);
+                if (c1_dense_out != nullptr)
+                    for (int jj : nz_j) fold_d1[jj] = cmplx(0.0, 0.0);
                 nz_j.clear();
                 // fold the N_sparse_fd nonzero bins into BOTH the sparse (mod
                 // Nt_layer) and dense (index j) accumulators, each with its own
@@ -3611,6 +3652,8 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
                     // the always-odd sparse grid, so it must NOT be reused for the dense
                     // full-Nt grid; doing so adds a spurious (-1)^n.)
                     fold_d[j]            += Xi * win * twn((long) j * (long) ind_min_t);
+                    if (c1_dense_out != nullptr)
+                        fold_d1[j] += Xi * wdm_window_dj[j] * twn((long) j * (long) ind_min_t);
                     nz_j.push_back(j);   // j strictly increasing in i, no dups
                 }
                 if (nz_j.empty()) continue;   // outputs stay pre-zeroed
@@ -3626,23 +3669,29 @@ void GBComputationGroup::gb_signal_het_make_reference_wrap(
                     const int    m_plus_n   = (m_global + n_global) & 1;
                     const cmplx  conj_cmn   = (m_plus_n == 0) ? cmplx(1.0, 0.0) : cmplx(0.0, -1.0);
                     const double sign_mn    = (((m_global + 1) * n_global) & 1) ? -1.0 : 1.0;
-                    c0_sparse_out[(((size_t) d * nchannels + c) * Nf_active + m_local)
+                    c0_sparse_out[(((size_t) d * nch_out + c) * Nf_active + m_local)
                                   * N_sparse_t + n_layer] = acc * sign_scale * (kappa * sign_mn * conj_cmn);
                 }
                 // DENSE iDFT (Nt_active outputs, origin ind_min_t) over the
                 // folded bins only -- all other fold_d entries are exact zeros.
                 for (int n = 0; n < Nt_active; ++n) {
-                    cmplx acc(0.0, 0.0);
-                    for (int jj : nz_j)
-                        acc += fold_d[jj] * twn((long) jj * (long) n);
+                    cmplx acc(0.0, 0.0), acc1(0.0, 0.0);
+                    for (int jj : nz_j) {
+                        const cmplx tw_n = twn((long) jj * (long) n);
+                        acc += fold_d[jj] * tw_n;
+                        if (c1_dense_out != nullptr) acc1 += fold_d1[jj] * tw_n;
+                    }
                     acc *= (1.0 / (double) Nt);       // 1/Nt = (1/Nt_layer)*(1/stride), stride_dense=1
                     const int    n_global   = ind_min_t + n;
                     const int    m_plus_n   = (m_global + n_global) & 1;
                     const cmplx  conj_cmn   = (m_plus_n == 0) ? cmplx(1.0, 0.0) : cmplx(0.0, -1.0);
                     const double sign_mn    = (((m_global + 1) * n_global) & 1) ? -1.0 : 1.0;
                     // no (-1)^n_global for the dense grid (transform convention).
-                    c0_dense_out[(((size_t) d * nchannels + c) * Nf_active + m_local)
-                                 * Nt_active + n] = acc * (kappa * sign_mn * conj_cmn);
+                    const size_t o = (((size_t) d * nch_out + c) * Nf_active + m_local)
+                                     * Nt_active + n;
+                    c0_dense_out[o] = acc * (kappa * sign_mn * conj_cmn);
+                    if (c1_dense_out != nullptr)
+                        c1_dense_out[o] = acc1 * (1.0 / (double) Nt) * (kappa * sign_mn * conj_cmn);
                 }
             }
         }
@@ -6042,7 +6091,10 @@ void gb_signal_het_v5_score_one_source(
         // with q the power of the in-bin offset: B0/B1 hold (a_q, b_q) of
         // sum |c0|^2 iC n^q and B0nc/B1nc those of sum c0^2 iC n^q, each
         // (num_data, 3 [q], W_slab, N_sparse_t). q = 2 multiplies conj(dr) dr,
-        // which makes <h|h> exact for the fold's own piecewise-linear r.
+        // which makes <h|h> exact for the fold's own piecewise-linear r. The
+        // q = 1 conj moments pair with 2 sum conj(r) dr (== the symmetric
+        // conj(r) dr + conj(dr) r for a real moment): setup may make them
+        // complex with the packet first-moment (c1) term.
         const size_t q_stride = (size_t) W_slab * N_sparse_t;
         const int n_hh = M * N_sparse_t;
         for (int idx = THREAD_START_X; idx < n_hh; idx += BLOCK_INCR_X)
@@ -6061,7 +6113,7 @@ void gb_signal_het_v5_score_one_source(
                                   rpix_im + (size_t) c * N_sparse_t,
                                   b, N_sparse_t, Dn, &r, &dr);
                 X0 += (gcmplx::conj(r) * r).real();
-                X1 += gcmplx::conj(r) * dr + gcmplx::conj(dr) * r;
+                X1 += gcmplx::conj(r) * dr;
                 X2 += (gcmplx::conj(dr) * dr).real();
                 Z0 += r * r;
                 Z1 += (r * dr) * 2.0;
@@ -6072,9 +6124,9 @@ void gb_signal_het_v5_score_one_source(
             const size_t i0 = (size_t) data_idx * 3 * q_stride
                               + (size_t) m_local * N_sparse_t + b;
             const size_t i1 = i0 + q_stride, i2 = i0 + 2 * q_stride;
-            h_h_raw += B0_all[i0] * X0 + B0_all[i1] * X1 + B0_all[i2] * X2
+            h_h_raw += B0_all[i0] * X0 + B0_all[i1] * (X1 * 2.0) + B0_all[i2] * X2
                      + B1_all[i0] * (gcmplx::conj(Sr) * Sr).real()
-                     + B1_all[i1] * (gcmplx::conj(Sr) * Sdr + gcmplx::conj(Sdr) * Sr)
+                     + B1_all[i1] * ((gcmplx::conj(Sr) * Sdr) * 2.0)
                      + B1_all[i2] * (gcmplx::conj(Sdr) * Sdr).real();
             if (project_real) {
                 h_h_raw += B0nc_all[i0] * Z0 + B0nc_all[i1] * Z1

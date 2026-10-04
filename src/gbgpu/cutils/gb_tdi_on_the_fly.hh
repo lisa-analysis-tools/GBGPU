@@ -594,7 +594,14 @@ class GBComputationGroup{
         double  layer_df, double dt,
         double  T_obs, double t_start,
         int     nchannels,
-        int     N_sparse_fd, double tukey_alpha, int n_cp_sig = 0);
+        int     N_sparse_fd, double tukey_alpha, int n_cp_sig = 0,
+        // Carrier-mode extensions (both default off): emit only the first
+        // ``nch_out`` channels (the carrier is channel-independent; the FD build
+        // still runs all ``nchannels``), and the packet first moment into
+        // ``c1_dense_out`` -- the same dense transform with the window replaced
+        // by ``wdm_window_dj`` (dW/dj; the caller scales by -i Nt / 2 pi).
+        cmplx  *c1_dense_out = nullptr, double *wdm_window_dj = nullptr,
+        int     nch_out = -1);
 
     // Stage 2b -- in-kernel sparse-FD signal-het. Fuses the existing
     // ``gb_run_fd_wave_tdi`` (sparse heterodyned rfft) with the polyphase +

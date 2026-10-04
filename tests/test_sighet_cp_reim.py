@@ -334,9 +334,12 @@ class V5RatioDeltaTest(unittest.TestCase):
         # correction; carrier_full_nocorr: the full nch x nch layout, which has
         # no second moment -- the pre-B2 fold.
         runs = list(eng.items()) + [
+            ("carrier_corr", eng["carrier"], dict(SIGHET_ANCHOR_CORRECT="1")),
             ("carrier_nocorr", eng["carrier"], dict(SIGHET_ANCHOR_CORRECT="0")),
             ("carrier_full_nocorr", eng["carrier"],
-             dict(SIGHET_ANCHOR_CORRECT="0", SIGHET_CARRIER_COLLAPSE="0"))]
+             dict(SIGHET_ANCHOR_CORRECT="0", SIGHET_CARRIER_COLLAPSE="0")),
+            ("carrier_noc1_nocorr", eng["carrier"],
+             dict(SIGHET_ANCHOR_CORRECT="0", SIGHET_CARRIER_C1="0"))]
         for run in runs:
             rep, e = run[:2]
             env = run[2] if len(run) > 2 else {}
@@ -357,6 +360,10 @@ class V5RatioDeltaTest(unittest.TestCase):
             cls.anchor[rep] = np.abs(ls0 - le0)
         cls.T = np.abs(D_ex)
         cls.edge = np.abs(np.cos(p0[:, 5])) < 0.05
+        # in-layer offset of each carrier: the packet first moment (c1) matters
+        # mid-transition of the Meyer window (u ~ 0.3-0.7), not on its flat top
+        u = (f0 / wdm.layer_df) % 1.0
+        cls.mid = (u > 0.3) & (u < 0.7)
 
     def test_reim_anchor_exact(self):
         worst = self.anchor["reim"].max()
@@ -382,8 +389,12 @@ class V5RatioDeltaTest(unittest.TestCase):
                            "the per-channel Re/Im ratio should still fail edge-on here")
 
     def test_carrier_anchor_corrected(self):
-        self.assertLess(self.anchor["carrier"].max(), 1e-8,
-                        f"carrier anchor {self.anchor['carrier'].max():.2e} with the correction")
+        """SIGHET_ANCHOR_CORRECT=1 makes the reference exact; the default (auto) skips it on
+        the collapsed + c1 stash, whose own anchor is already small."""
+        self.assertLess(self.anchor["carrier_corr"].max(), 1e-8,
+                        f"carrier anchor {self.anchor['carrier_corr'].max():.2e} with the correction")
+        self.assertLess(self.anchor["carrier"].max(), 1e-2,
+                        f"default (auto) carrier anchor {self.anchor['carrier'].max():.2e}")
 
     def test_second_moment_removes_the_anchor(self):
         """The pre-B2 fold (full layout) is off by ~0.5 lnL at the reference at SNR 100;
@@ -393,6 +404,15 @@ class V5RatioDeltaTest(unittest.TestCase):
         self.assertLess(coll.max(), 0.1, f"B2 anchor max {coll.max():.2e}")
         self.assertLess(np.median(coll), np.median(full) / 30.0,
                         f"B2 anchor median {np.median(coll):.2e} vs {np.median(full):.2e}")
+
+    def test_first_moment_removes_the_mid_layer_anchor(self):
+        """Without c1 the mid-transition sources (0.63 mHz, u = 0.54) keep an anchor offset
+        from the envelope slope across each wavelet; c1 takes it down by >~ 10x."""
+        self.assertTrue(np.any(self.mid))
+        no, yes = self.anchor["carrier_noc1_nocorr"], self.anchor["carrier_nocorr"]
+        self.assertLess(np.max(yes[self.mid]), np.max(no[self.mid]) / 10.0,
+                        f"mid-layer anchor with c1 {np.max(yes[self.mid]):.2e} vs without "
+                        f"{np.max(no[self.mid]):.2e}")
 
     def test_second_moment_keeps_the_deltas(self):
         e = self.eps["carrier_nocorr"]

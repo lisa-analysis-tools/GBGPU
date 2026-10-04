@@ -1181,6 +1181,55 @@ void GBComputationGroupWrap::gb_signal_het_make_reference(
         N_sparse_fd, tukey_alpha, n_cp_sig);
 }
 
+void GBComputationGroupWrap::gb_signal_het_make_reference_carrier(
+    GBTDIonTheFlyWrap *tdi_wrap,
+    array_type<std::complex<double>> c0_sparse_out,
+    array_type<std::complex<double>> c0_dense_out,
+    array_type<std::complex<double>> c1_dense_out,
+    array_type<double> wdm_window,
+    array_type<double> wdm_window_dj,
+    array_type<int> n_sparse_local_arr,
+    array_type<int> w_lo_arr,
+    array_type<double> params_ref_all,
+    int num_data,
+    int nparams, int f0_idx, int fdot_idx,
+    int Nf, int Nt, int Nf_active, int Nt_active,
+    int Nt_layer, int N_sparse_t, int stride,
+    int ind_min_t, int ind_min_f,
+    double layer_df, double dt,
+    double T_obs, double t_start,
+    int nchannels,
+    int N_sparse_fd, double tukey_alpha, int n_cp_sig)
+{
+    const size_t n_dense = (size_t) num_data * Nf_active * Nt_active;
+    gb_signal_het_make_reference_wrap(
+        tdi_wrap->waveform,
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            c0_sparse_out, "c0_sparse_out",
+            (size_t) num_data * Nf_active * N_sparse_t, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            c0_dense_out, "c0_dense_out", n_dense, 1)),
+        return_pointer_and_check_length(wdm_window, "wdm_window", Nt, 1),
+        return_pointer_and_check_length(n_sparse_local_arr, "n_sparse_local",
+                                         N_sparse_t, 1),
+        return_pointer_and_check_length(w_lo_arr, "w_lo_arr", num_data, 1),
+        return_pointer_and_check_length(params_ref_all, "params_ref_all",
+                                         nparams, num_data),
+        num_data,
+        nparams, f0_idx, fdot_idx,
+        Nf, Nt, Nf_active, Nt_active,
+        Nt_layer, N_sparse_t, stride,
+        ind_min_t, ind_min_f,
+        layer_df, dt,
+        T_obs, t_start,
+        nchannels,
+        N_sparse_fd, tukey_alpha, n_cp_sig,
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            c1_dense_out, "c1_dense_out", n_dense, 1)),
+        return_pointer_and_check_length(wdm_window_dj, "wdm_window_dj", Nt, 1),
+        1);
+}
+
 void GBComputationGroupWrap::gb_signal_het_get_ll_grad_in_kernel(
     GBTDIonTheFlyWrap *tdi_wrap,
     array_type<double> grad_out,
@@ -1517,6 +1566,14 @@ void gbgpu_part(nb::module_ &m) {
          "complex WDM c0 at the sparse grid (c0_sparse_out) and full Nt "
          "resolution (c0_dense_out). Replaces the Python polyphase so the sig-het "
          "reference comes from the backend. CPU-only (GPU TODO).")
+    .def("gb_signal_het_make_reference_carrier",
+         &GBComputationGroupWrap::gb_signal_het_make_reference_carrier,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Carrier-mode reference producer: the FD build runs all nchannels, "
+         "only channel 0 is emitted (the carrier-only reference is channel-"
+         "independent), and c1_dense_out gets the same dense transform with the "
+         "window replaced by wdm_window_dj (dW/dj) -- the packet first moment "
+         "up to the caller's -i Nt / 2 pi.")
     .def("gb_signal_het_get_ll_grad_in_kernel",
          &GBComputationGroupWrap::gb_signal_het_get_ll_grad_in_kernel,
          "Signal-het central-difference gradient of logL = d_h - 0.5*h_h. "

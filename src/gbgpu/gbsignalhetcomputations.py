@@ -185,7 +185,24 @@ def _invc_channel_symmetric(invC, xp, rtol=1e-12):
     return True
 
 
-def _collapsed_carrier_fold(res, c0_dense, invC, n_b_idx_local, stride, Nt_active):
+def _window_dj(window, xp):
+    """``dW/dj`` of the WDM analysis window on its own index grid (4th-order central
+    difference; the window is zero at both ends, and its transition band spans ~Nt/4
+    points, so the truncation error is ~1e-12 relative)."""
+    w = np.asarray(window.get() if hasattr(window, "get") else window, dtype=np.float64)
+    p = np.concatenate([np.zeros(2), w, np.zeros(2)])
+    return xp.asarray((-p[4:] + 8.0 * p[3:-1] - 8.0 * p[1:-3] + p[:-4]) / 12.0)
+
+
+def _c1_scale(Nt):
+    """make_reference(window = dW/dj) times this is the packet FIRST MOMENT
+    c1(m, n) = sum_t (t - t_n) / layer_dt * psi_mn(t) z(t): FT[(t - t_n) p_mn] =
+    (i / 2 pi) G'(f - f_m) e^{-2 pi i (f - f_m) t_n}, dG/df = Nt layer_dt dW/dj."""
+    return -1j * float(Nt) / (2.0 * np.pi)
+
+
+def _collapsed_carrier_fold(res, c0_dense, invC, n_b_idx_local, stride, Nt_active,
+                            c1_dense=None):
     """Carrier-mode bin fold with the channel-pair axes COLLAPSED, plus the second moment.
 
     In carrier mode c0 is the same in every channel, and the equal-arm XYZ inverse
@@ -197,10 +214,19 @@ def _collapsed_carrier_fold(res, c0_dense, invC, n_b_idx_local, stride, Nt_activ
     piecewise-linear r. It was dropped from the full layout (harmless while r ~ 1 near
     the reference; a first-order anchor error once r is the whole envelope).
 
+    ``c1_dense`` (the packet first moment, see ``_c1_scale``): the template becomes
+    ``c0 (r + dr n_off) + c1 dr`` -- the envelope's slope ACROSS each wavelet's time
+    support, which the carrier-only reference otherwise drops (largest mid-transition
+    of the Meyer window, zero on its flat top). It folds into the same moments: A1
+    gains ``(Dre c1) @ S``; the q = 1 conj moments gain ``F0 = sum conj(c0) c1 n^0``
+    (complex -- the kernel pairs them with ``2 sum conj(r) dr``, which equals the
+    symmetric pair whenever the moment is real); q = 2 gains ``2 Re F1 + sum |c1|^2``;
+    the non-conj q = 1 / q = 2 gain ``sum c0 c1`` / ``2 sum c0 c1 n + sum c1^2``.
+
     Returns ``(A0p, A1p, Pa, Pb, Pna, Pnb)``: A0p / A1p ``(k, nch, W, Ns)`` exactly as
-    ``bin_fold_real``; the moments ``(k, 3, W, Ns)`` indexed by q --
+    ``bin_fold_real`` (plus the c1 term); the moments ``(k, 3, W, Ns)`` indexed by q --
     ``Pa = sum |c0|^2 a n^q``, ``Pb = sum |c0|^2 b n^q``, ``Pna = sum c0^2 a n^q``,
-    ``Pnb = sum c0^2 b n^q``."""
+    ``Pnb = sum c0^2 b n^q`` (plus the c1 terms)."""
     from lisatools.utils.utility import get_array_module
 
     xp = get_array_module(c0_dense)
@@ -235,7 +261,21 @@ def _collapsed_carrier_fold(res, c0_dense, invC, n_b_idx_local, stride, Nt_activ
         return xp.ascontiguousarray(xp.stack(
             [(x @ Sq[q]).astype(xp.complex128) for q in range(3)], axis=1))
 
-    return A0p, A1p, mom(E * a_), mom(E * b_), mom(En * a_), mom(En * b_)
+    Pa, Pb, Pna, Pnb = mom(E * a_), mom(E * b_), mom(En * a_), mom(En * b_)
+    if c1_dense is not None:
+        c1 = xp.asarray(c1_dense)[:, 0]
+        A1p = A1p + 2.0 * ((Dre * c1[:, None]) @ Sq[0])
+        F = xp.conj(c0) * c1
+        K = xp.abs(c1) ** 2
+        G = c0 * c1
+        L = c1 * c1
+        for P, wgt in ((Pa, a_), (Pb, b_)):
+            P[:, 1] += (F * wgt) @ Sq[0]
+            P[:, 2] += 2.0 * xp.real((F * wgt) @ Sq[1]) + (K * wgt) @ Sq[0]
+        for P, wgt in ((Pna, a_), (Pnb, b_)):
+            P[:, 1] += (G * wgt) @ Sq[0]
+            P[:, 2] += 2.0 * ((G * wgt) @ Sq[1]) + (L * wgt) @ Sq[0]
+    return A0p, A1p, Pa, Pb, Pna, Pnb
 
 
 def _v5_nodes_arg(g, nodes):
@@ -950,6 +990,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     #: True when B0/B1/B0nc/B1nc hold the carrier-mode COLLAPSED moments
     #: (n, 3 [q], W, Ns) instead of the (n, nch, nch, W, Ns) blocks.
     _stash_collapsed = False
+    #: True when the collapsed moments carry the packet first-moment (c1) terms.
+    _stash_c1 = False
 
     def _resolve_stash_layout(self) -> bool:
         """True if this block's stash stays COMPACT (per-reference windows).
@@ -1225,11 +1267,46 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             raise RuntimeError(
                 "sig-het in-model patch would change the stash layout (collapsed "
                 f"{self._stash_collapsed} -> {collapse}); clear and rebuild instead.")
+        # Packet first moment (the envelope slope across each wavelet's time
+        # support; _collapsed_carrier_fold). Resolved at the block build; a
+        # patch keeps the block's choice so every reference folds one model.
+        use_c1 = (bool(self._stash_c1) if self._in_model is not None else
+                  (collapse and os.environ.get("SIGHET_CARRIER_C1", "1") != "0"))
+        if use_c1 and not collapse:
+            raise RuntimeError("sig-het c1 term needs the collapsed carrier stash.")
         per_src_bytes = (2 * nch * nch * W * g["Nt_active"] * 16    # Ec + En
-                         + nch * W * g["Nt_active"] * 16)            # dense c0
+                         + (2 if use_c1 else 1)
+                         * nch * W * g["Nt_active"] * 16)            # dense c0 (+ c1)
         chunk = max(1, min(n, _SIGHET_FOLD_MAX_BYTES // max(per_src_bytes, 1)))
+        if collapse and getattr(self, "_window_dj_arr", None) is None:
+            self._window_dj_arr = _window_dj(self.window_full, xp)
         w_lo_dev = xp.ascontiguousarray(xp.asarray(w_lo_host, dtype=xp.int32))
-        c0_dense_buf = xp.zeros((chunk, nch, W, g["Nt_active"]),
+        # Carrier mode: the reference is the same carrier in every channel, so
+        # the collapsed path emits ONE channel (c0, plus the c1 first moment
+        # from the same FD build) and broadcasts it -- the dense transform is
+        # the setup's dominant cost and scales with the channel count.
+        nch_ref = 1 if collapse else nch
+        _cp_code = _n_cp_kernel_arg(
+            g, allow_carrier=bool(g.get("v4_knots", 0)) and bool(int(g.get("v5", 0))))
+
+        def _make_ref(sparse_out, dense_out, c1_out, s0, k0):
+            args = (self.n_sparse_local,
+                    xp.ascontiguousarray(w_lo_dev[s0:s0 + k0]),
+                    xp.ascontiguousarray(refs[s0:s0 + k0]), k0, 9, 1, 2,
+                    g["Nf"], g["Nt"], W, g["Nt_active"],
+                    g["nt_layer"], g["N_sparse_t"], g["stride"],
+                    g["ind_min_t"], g["ind_min_f"],
+                    g["layer_df"], g["dt"], g["Tobs"], g["t0"],
+                    nch, g["n_sparse_fd"], g["tukey_alpha"], _cp_code)
+            if collapse:
+                self.cpp.gb_signal_het_make_reference_carrier(
+                    self.tdi_wrap, sparse_out, dense_out, c1_out,
+                    self.window_full, self._window_dj_arr, *args)
+            else:
+                self.cpp.gb_signal_het_make_reference(
+                    self.tdi_wrap, sparse_out, dense_out, self.window_full, *args)
+
+        c0_dense_buf = xp.zeros((chunk, nch_ref, W, g["Nt_active"]),
                                 dtype=xp.complex128)
         c0_dense_w = None   # bound even if n == 0, so the del below is safe
         folds = []
@@ -1239,27 +1316,27 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 c0_dense_w = c0_dense_buf
                 c0_dense_w[...] = 0.0
             else:
-                c0_dense_w = xp.zeros((k, nch, W, g["Nt_active"]),
+                c0_dense_w = xp.zeros((k, nch_ref, W, g["Nt_active"]),
                                       dtype=xp.complex128)
-            c0_sparse_chunk = xp.zeros((k, nch, W, g["N_sparse_t"]),
+            c0_sparse_chunk = xp.zeros((k, nch_ref, W, g["N_sparse_t"]),
                                        dtype=xp.complex128)
-            self.cpp.gb_signal_het_make_reference(
-                self.tdi_wrap, c0_sparse_chunk, c0_dense_w,
-                self.window_full, self.n_sparse_local,
-                xp.ascontiguousarray(w_lo_dev[s:s + k]),
-                xp.ascontiguousarray(refs[s:s + k]), k, 9, 1, 2,
-                g["Nf"], g["Nt"], W, g["Nt_active"],
-                g["nt_layer"], g["N_sparse_t"], g["stride"],
-                g["ind_min_t"], g["ind_min_f"],
-                g["layer_df"], g["dt"], g["Tobs"], g["t0"],
-                3, g["n_sparse_fd"], g["tukey_alpha"], _n_cp_kernel_arg(
-                    g, allow_carrier=bool(g.get("v4_knots", 0)) and bool(int(g.get("v5", 0)))))
-            c0_sparse_w[s:s + k] = c0_sparse_chunk
-            fold = _collapsed_carrier_fold if collapse else bin_fold_real
-            folds.append(fold(
-                res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
-                self.n_sparse_local, g["stride"], g["Nt_active"],
-                **({} if collapse else dict(tdi_type="XYZ"))))
+            # c1 (the packet first moment) comes out of the same carrier build
+            c1_dense_w = (xp.zeros((k, 1, W, g["Nt_active"]), dtype=xp.complex128)
+                          if collapse else None)
+            _make_ref(c0_sparse_chunk, c0_dense_w, c1_dense_w, s, k)
+            c0_sparse_w[s:s + k] = c0_sparse_chunk      # broadcasts a 1-channel build
+            if use_c1:
+                c1_dense_w *= _c1_scale(g["Nt"])
+            if collapse:
+                folds.append(_collapsed_carrier_fold(
+                    res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
+                    self.n_sparse_local, g["stride"], g["Nt_active"],
+                    c1_dense=c1_dense_w if use_c1 else None))
+            else:
+                folds.append(bin_fold_real(
+                    res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
+                    self.n_sparse_local, g["stride"], g["Nt_active"],
+                    tdi_type="XYZ"))
         del c0_dense_buf, c0_dense_w
 
         # Row helper for the full-band stash expansion below. The scatters
@@ -1401,6 +1478,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         self._stash_W = stash_W
         self._stash_w_lo = w_lo_stash
         self._stash_collapsed = collapse
+        self._stash_c1 = use_c1
 
         slot_map = np.full(int(slots.max()) + 1, -1, dtype=int)
         slot_map[slots] = np.arange(n)
@@ -1424,11 +1502,19 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         (vertical swaps), so it is measured once per reference with the exact
         chunked delegate and removed in ``get_ll_wdm`` (applied to h_h, which
         is phase-independent, so the phase-max quadrature path inherits it).
-        ``SIGHET_ANCHOR_CORRECT=0`` skips it.
+
+        ``SIGHET_ANCHOR_CORRECT``: ``auto`` (default) corrects only when the
+        stash lacks the exact-fold terms -- the collapsed stash with the second
+        moment and the packet first moment (c1) leaves ~3e-4 / 3e-2 lnL max at
+        SNR 100 / 1000 (6 months, stride 36), so it is skipped there; the
+        full-layout fallback (asymmetric noise, ``SIGHET_CARRIER_COLLAPSE=0``)
+        or ``SIGHET_CARRIER_C1=0`` keep it. ``1`` always, ``0`` never.
         """
         g = self._g
-        if (g.get("cp_repr") != "carrier"
-                or os.environ.get("SIGHET_ANCHOR_CORRECT", "1") == "0"):
+        knob = os.environ.get("SIGHET_ANCHOR_CORRECT", "auto")
+        exact_fold = bool(self._stash_collapsed) and bool(self._stash_c1)
+        if (g.get("cp_repr") != "carrier" or knob == "0"
+                or (knob != "1" and exact_fold)):
             self._anchor_off = None
             return
         xp = self.xp
@@ -1485,6 +1571,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         self._stash_w_lo = None
         self._stash_windowed = None
         self._stash_collapsed = False
+        self._stash_c1 = False
 
     # ------------------------------------------------------------------
     # F-stat against SHARED references (search / grid-fit path).

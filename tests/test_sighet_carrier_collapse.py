@@ -44,6 +44,7 @@ from gbgpu.gbsignalhetcomputations import (
     GBSignalHetComputations,
     _collapsed_carrier_fold,
     _invc_channel_symmetric,
+    _window_dj,
 )
 
 V5_KNOBS = dict(v3_n_nodes=32, v4_knots=64, v4_band=16, v5=1)
@@ -79,19 +80,25 @@ class _Toy:
         self.n_off = np.arange(Nt_active) - self.nb[self.bin_idx]
         self.rng = rng
 
-    def fold(self):
-        return _collapsed_carrier_fold(self.res, self.c0, self.iC, self.nb, self.stride, self.Nt)
+    def fold(self, c1=None):
+        return _collapsed_carrier_fold(self.res, self.c0, self.iC, self.nb, self.stride, self.Nt,
+                                       c1_dense=c1)
+
+    def random_c1(self, scale=0.4):
+        shp = (self.k, self.W, self.Nt)
+        c1 = scale * (self.rng.standard_normal(shp) + 1j * self.rng.standard_normal(shp))
+        return np.repeat(c1[:, None], 3, axis=1)
 
 
 def _fold_hh(P, r, dr, drop_q2=False):
     """Python mirror of the kernel's collapsed fold: 0.5 Re(sum ...) per source.
-    ``r, dr`` (k, 3, W, Ns)."""
+    ``r, dr`` (k, 3, W, Ns). The q = 1 conj moments pair with 2 sum conj(r) dr."""
     Pa, Pb, Pna, Pnb = P
     q2 = 0.0 if drop_q2 else 1.0
-    X = [np.sum(np.conj(r) * r, 1), np.sum(np.conj(r) * dr + np.conj(dr) * r, 1),
+    X = [np.sum(np.conj(r) * r, 1), 2 * np.sum(np.conj(r) * dr, 1),
          q2 * np.sum(np.conj(dr) * dr, 1)]
     Sr, Sdr = r.sum(1), dr.sum(1)
-    Y = [np.conj(Sr) * Sr, np.conj(Sr) * Sdr + np.conj(Sdr) * Sr, q2 * np.conj(Sdr) * Sdr]
+    Y = [np.conj(Sr) * Sr, 2 * np.conj(Sr) * Sdr, q2 * np.conj(Sdr) * Sdr]
     Z = [np.sum(r * r, 1), 2 * np.sum(r * dr, 1), q2 * np.sum(dr * dr, 1)]
     ZJ = [Sr * Sr, 2 * Sr * Sdr, q2 * Sdr * Sdr]
     tot = sum(Pa[:, q] * X[q] + Pb[:, q] * Y[q] + Pna[:, q] * Z[q] + Pnb[:, q] * ZJ[q]
@@ -152,6 +159,55 @@ class CollapsedMomentsTest(unittest.TestCase):
         miss = np.abs(_fold_hh(P, r, dr, drop_q2=True) / dense - 1)
         self.assertGreater(miss.min(), 1e-3,
                            "dropping the q = 2 moment must break exactness (mutation check)")
+
+
+class FirstMomentTest(unittest.TestCase):
+    """The packet first moment c1: template c0 (r + dr n_off) + c1 dr folds exactly."""
+
+    def _rdr(self, t):
+        rng = t.rng
+        r = rng.standard_normal((t.k, 3, t.W, t.Ns)) + 1j * rng.standard_normal((t.k, 3, t.W, t.Ns))
+        dr = 0.3 * (rng.standard_normal(r.shape) + 1j * rng.standard_normal(r.shape))
+        return r, dr
+
+    def test_hh_exact_with_c1(self):
+        t = _Toy(seed=3)
+        c1 = t.random_c1()
+        P = t.fold(c1)[2:]
+        r, dr = self._rdr(t)
+        h = t.c0 * (r[..., t.bin_idx] + dr[..., t.bin_idx] * t.n_off) + c1 * dr[..., t.bin_idx]
+        dense = np.einsum("kcwn,kcdwn,kdwn->k", h.real, t.iC, h.real)
+        np.testing.assert_allclose(_fold_hh(P, r, dr), dense, rtol=1e-12)
+        miss = np.abs(_fold_hh(t.fold()[2:], r, dr) / dense - 1)
+        self.assertGreater(miss.min(), 1e-3, "dropping c1 must break exactness (mutation check)")
+
+    def test_dh_exact_with_c1(self):
+        t = _Toy(seed=4)
+        c1 = t.random_c1()
+        A0, A1 = t.fold(c1)[:2]
+        r, dr = self._rdr(t)
+        h = t.c0 * (r[..., t.bin_idx] + dr[..., t.bin_idx] * t.n_off) + c1 * dr[..., t.bin_idx]
+        dense = np.einsum("kcwn,kcdwn,kdwn->k", t.res.real, t.iC, h.real)
+        fold = 0.5 * np.real(np.sum(A0 * r + A1 * dr, axis=(1, 2, 3)))
+        np.testing.assert_allclose(fold, dense, rtol=1e-12)
+
+    def test_window_derivative(self):
+        """_window_dj against the analytic derivative of the Meyer window (WDMSettings.phitilde)."""
+        from scipy import special
+        wdm = WDMSettings(180, 1440, 20.0, force_backend="cpu")
+        dO = np.pi / wdm.Nf
+        A, B, nn = wdm.A, dO - 2 * wdm.A, wdm.WAVELET_FILTER_CONSTANT
+        om = np.asarray(wdm.omega)
+        x = np.clip((np.abs(om) - A) / B, 0.0, 1.0)
+        trans = (np.abs(om) >= A) & (np.abs(om) < A + B)
+        y = special.betainc(nn, nn, x)
+        dy = x ** (nn - 1) * (1 - x) ** (nn - 1) / special.beta(nn, nn)
+        dphi = np.where(trans, -np.sqrt(1 / dO) * np.sin(np.pi * y / 2) * (np.pi / 2) * dy / B
+                        * np.sign(om), 0.0)
+        want = dphi * 2 * np.pi / wdm.N            # d omega / d j
+        got = np.asarray(_window_dj(wdm.window, np))
+        # 4th-order difference across a C^3 kink: ~3e-7 at this Nt (1440), ~27x less at 4320
+        self.assertLess(np.abs(got - want).max() / np.abs(want).max(), 1e-6)
 
 
 class NegativeControlTest(unittest.TestCase):
@@ -256,8 +312,9 @@ class CompiledCollapseTest(unittest.TestCase):
         return GBSignalHetComputations.for_band_engine(self.chunked, cp_repr="carrier",
                                                        **V5_KNOBS)
 
-    def _scores(self, comp, holder=None, collapse="1", zero_q2=False):
-        with _Env(SIGHET_CARRIER_COLLAPSE=collapse, SIGHET_ANCHOR_CORRECT="0"):
+    def _scores(self, comp, holder=None, collapse="1", zero_q2=False, c1="0"):
+        with _Env(SIGHET_CARRIER_COLLAPSE=collapse, SIGHET_ANCHOR_CORRECT="0",
+                  SIGHET_CARRIER_C1=c1):
             comp.setup_in_model(self.holder if holder is None else holder, self.params_ref,
                                 self.slots)
         try:
@@ -286,6 +343,59 @@ class CompiledCollapseTest(unittest.TestCase):
         np.testing.assert_array_equal(dh2, dh0)          # <d|h> has no q = 2 term
         self.assertGreater(np.min(hh2 - hh0), 0.0,
                            "conj(dr) dr n_off^2 is a positive-definite addition to <h|h>")
+
+    def test_c1_makes_the_anchor_exact(self):
+        """At the references (rows 0, 1) the c1 fold matches the exact chunked ln L ~100x
+        better than without it (mutation: SIGHET_CARRIER_C1=0 brings the offset back)."""
+        comp = self._comp()
+        ex = np.asarray(self.chunked.get_ll_wdm(self.params, self.holder, data_index=self.di,
+                                                noise_index=self.di)).ravel()
+        err = {}
+        for c1 in ("0", "1"):
+            with _Env(SIGHET_ANCHOR_CORRECT="0", SIGHET_CARRIER_C1=c1):
+                comp.setup_in_model(self.holder, self.params_ref, self.slots)
+            try:
+                self.assertEqual(comp._stash_c1, c1 == "1")
+                ll = np.asarray(comp.get_ll(self.params, data_index=self.di)).ravel()
+            finally:
+                comp.clear_in_model()
+            err[c1] = np.abs(ll - ex)[:2] / np.abs(ex[:2])
+        self.assertGreater(err["0"].min(), 1e-8, f"no-c1 anchor {err['0']}")
+        self.assertLess(err["1"].max(), err["0"].min() / 100.0,
+                        f"c1 anchor {err['1']} vs without {err['0']}")
+
+    def test_one_channel_carrier_build(self):
+        """The collapsed setup's carrier producer (gb_signal_het_make_reference_carrier)
+        emits channel 0 of c0 and the dW/dj (c1) transform from ONE FD build: it must equal
+        every channel of the 3-channel build with each window (carrier = channel-free)."""
+        from gbgpu.gbsignalhetcomputations import _n_cp_kernel_arg
+        comp = self._comp()
+        g = comp._g
+        win, dwin = np.asarray(comp.window_full), np.asarray(_window_dj(comp.window_full, np))
+        common = (np.asarray(comp.n_sparse_local), np.zeros(2, dtype=np.int32),
+                  np.ascontiguousarray(self.params_ref), 2, 9, 1, 2,
+                  g["Nf"], g["Nt"], g["Nf_active"], g["Nt_active"], g["nt_layer"],
+                  g["N_sparse_t"], g["stride"], g["ind_min_t"], g["ind_min_f"],
+                  g["layer_df"], g["dt"], g["Tobs"], g["t0"], 3, g["n_sparse_fd"],
+                  g["tukey_alpha"], _n_cp_kernel_arg(g, allow_carrier=True))
+        full = {}
+        for name, w in (("c0", win), ("c1", dwin)):
+            sp = np.zeros((2, 3, g["Nf_active"], g["N_sparse_t"]), dtype=np.complex128)
+            de = np.zeros((2, 3, g["Nf_active"], g["Nt_active"]), dtype=np.complex128)
+            comp.cpp.gb_signal_het_make_reference(comp.tdi_wrap, sp, de, w, *common)
+            full[name] = (sp, de)
+        sp1 = np.zeros((2, 1, g["Nf_active"], g["N_sparse_t"]), dtype=np.complex128)
+        de1 = np.zeros((2, 1, g["Nf_active"], g["Nt_active"]), dtype=np.complex128)
+        c11 = np.zeros_like(de1)
+        comp.cpp.gb_signal_het_make_reference_carrier(comp.tdi_wrap, sp1, de1, c11, win, dwin,
+                                                      *common)
+        self.assertGreater(np.abs(de1).max(), 0.0)
+        self.assertGreater(np.abs(c11).max(), 0.0)
+        for c in range(3):
+            np.testing.assert_array_equal(full["c0"][1][:, c], de1[:, 0], err_msg=f"c0 dense ch {c}")
+            np.testing.assert_array_equal(full["c0"][0][:, c], sp1[:, 0], err_msg=f"c0 sparse ch {c}")
+            np.testing.assert_allclose(full["c1"][1][:, c], c11[:, 0], rtol=0,
+                                       atol=1e-14 * np.abs(c11).max(), err_msg=f"c1 ch {c}")
 
     def test_asymmetric_buffer_falls_back_loudly(self):
         bad = self.invCs.copy()
