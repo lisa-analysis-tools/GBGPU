@@ -44,6 +44,8 @@
 //                              "ratio" is each channel's own demodulated envelope -- no division
 //                              by a per-channel reference envelope, linear in the channels.
 #define GB_SIGHET_CARRIER 1048576
+// v5_mode bit: B0/B1/B0nc/B1nc are the carrier-mode COLLAPSED moments.
+#define GB_SIGHET_V5_COLLAPSED 4
 
 // `N_PARAMS_MAX` is the upper bound on per-source parameter count
 // used by the shared-memory layout calculations below. Same value
@@ -5586,6 +5588,10 @@ void gb_signal_het_v5_score_one_source(
 {
     const int M      = 2 * m_active_half_width + 1;
     const int nwords = (N_sparse_t + 63) / 64;
+    // Bit 3 of ratio_reim: the stash is the carrier-mode COLLAPSED layout
+    // (set by the wrap from v5_mode & GB_SIGHET_V5_COLLAPSED).
+    const int stash_collapsed = (ratio_reim >> 3) & 1;
+    ratio_reim &= 7;
 
     // ---- shared carve (mirror gb_sighet_v5_shared_bytes exactly) ---------
     // Region OFFSETS differ between the aliased and flat layouts; region
@@ -6028,7 +6034,58 @@ void gb_signal_het_v5_score_one_source(
         d_h_raw += A0_all[coef_i] * r + A1_all[coef_i] * dr;
     }
 
-    if (tdi_type == 0)
+    if (tdi_type == 0 && stash_collapsed)
+    {
+        // CARRIER-mode COLLAPSED stash (setup: _collapsed_carrier_fold). c0 is
+        // the same in every channel and the equal-arm inverse covariance is
+        // iC_cd = a delta_cd + b, so each nch x nch block is a_q delta_cd + b_q
+        // with q the power of the in-bin offset: B0/B1 hold (a_q, b_q) of
+        // sum |c0|^2 iC n^q and B0nc/B1nc those of sum c0^2 iC n^q, each
+        // (num_data, 3 [q], W_slab, N_sparse_t). q = 2 multiplies conj(dr) dr,
+        // which makes <h|h> exact for the fold's own piecewise-linear r.
+        const size_t q_stride = (size_t) W_slab * N_sparse_t;
+        const int n_hh = M * N_sparse_t;
+        for (int idx = THREAD_START_X; idx < n_hh; idx += BLOCK_INCR_X)
+        {
+            const int im = idx / N_sparse_t;
+            const int b  = idx % N_sparse_t;
+            const int m_local = m_active[im];
+            if (m_local < 0) continue;      // off-window: moments = 0
+            double X0 = 0.0, X2 = 0.0;
+            cmplx X1(0.0, 0.0), Z0(0.0, 0.0), Z1(0.0, 0.0), Z2(0.0, 0.0);
+            cmplx Sr(0.0, 0.0), Sdr(0.0, 0.0);
+            for (int c = 0; c < nchannels; ++c) {
+                cmplx r, dr;
+                gb_sighet_v5_r_dr(mask_sh + (size_t) (c * M + im) * nwords,
+                                  rpix_re + (size_t) c * N_sparse_t,
+                                  rpix_im + (size_t) c * N_sparse_t,
+                                  b, N_sparse_t, Dn, &r, &dr);
+                X0 += (gcmplx::conj(r) * r).real();
+                X1 += gcmplx::conj(r) * dr + gcmplx::conj(dr) * r;
+                X2 += (gcmplx::conj(dr) * dr).real();
+                Z0 += r * r;
+                Z1 += (r * dr) * 2.0;
+                Z2 += dr * dr;
+                Sr += r;
+                Sdr += dr;
+            }
+            const size_t i0 = (size_t) data_idx * 3 * q_stride
+                              + (size_t) m_local * N_sparse_t + b;
+            const size_t i1 = i0 + q_stride, i2 = i0 + 2 * q_stride;
+            h_h_raw += B0_all[i0] * X0 + B0_all[i1] * X1 + B0_all[i2] * X2
+                     + B1_all[i0] * (gcmplx::conj(Sr) * Sr).real()
+                     + B1_all[i1] * (gcmplx::conj(Sr) * Sdr + gcmplx::conj(Sdr) * Sr)
+                     + B1_all[i2] * (gcmplx::conj(Sdr) * Sdr).real();
+            if (project_real) {
+                h_h_raw += B0nc_all[i0] * Z0 + B0nc_all[i1] * Z1
+                         + B0nc_all[i2] * Z2
+                         + B1nc_all[i0] * (Sr * Sr)
+                         + B1nc_all[i1] * ((Sr * Sdr) * 2.0)
+                         + B1nc_all[i2] * (Sdr * Sdr);
+            }
+        }
+    }
+    else if (tdi_type == 0)
     {
         const int n_hh = nchannels * nchannels * M * N_sparse_t;
         for (int idx = THREAD_START_X; idx < n_hh; idx += BLOCK_INCR_X)
@@ -6198,9 +6255,19 @@ void GBComputationGroup::gb_signal_het_v5_get_ll_wrap(
     // n_nodes < 0 selects the Re/Im node-ratio fit (see the node stage of
     // gb_signal_het_v5_score_one_source) with |n_nodes| nodes.
     // n_nodes <= -GB_SIGHET_CARRIER: Re/Im node fit against a carrier-only reference.
-    const int ratio_reim = (n_nodes <= -GB_SIGHET_CARRIER) ? 2 : ((n_nodes < 0) ? 1 : 0);
+    int ratio_reim = (n_nodes <= -GB_SIGHET_CARRIER) ? 2 : ((n_nodes < 0) ? 1 : 0);
     if (ratio_reim == 2) n_nodes = -n_nodes - GB_SIGHET_CARRIER;
     else if (ratio_reim == 1) n_nodes = -n_nodes;
+    // v5_mode | GB_SIGHET_V5_COLLAPSED: carrier-mode collapsed stash. Carried
+    // to the scorer as bit 3 of ratio_reim so the layout selector stays 1 / 2.
+    const int stash_collapsed = (v5_mode & GB_SIGHET_V5_COLLAPSED) ? 1 : 0;
+    v5_mode &= ~GB_SIGHET_V5_COLLAPSED;
+    if (stash_collapsed && (ratio_reim != 2 || tdi_type != 0 || nchannels != 3)) {
+        throw std::invalid_argument(
+            "[gb_signal_het_v5_get_ll_wrap] the collapsed stash needs the "
+            "carrier-only reference (n_nodes code) and XYZ with 3 channels.");
+    }
+    if (stash_collapsed) ratio_reim |= 8;
     if (n_nodes < 4) {
         throw std::invalid_argument(
             "[gb_signal_het_v5_get_ll_wrap] n_nodes must be >= 4 "

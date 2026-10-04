@@ -697,6 +697,10 @@ class GBComputationGroup{
     //                  blocks/SM -- the A/B that isolates occupancy
     // v5_mode = 2 against the v4 entry point isolates everything that is not
     // occupancy; v5_mode = 1 against v5_mode = 2 isolates occupancy alone.
+    // OR GB_SIGHET_V5_COLLAPSED (4) in: the carrier-mode COLLAPSED stash --
+    // B0/B1/B0nc/B1nc are the (a_q, b_q) moments of an a*I + b*J inverse
+    // covariance, (num_data, 3 [q = 0, 1, 2], W_slab, N_sparse_t), q = 2 the
+    // conj(dr) dr second moment. Needs the carrier n_nodes code.
     //
     // COMPACT-SLAB STASH (same contract as the F-stat scorer below): the
     // stash arrays are per-reference windows of width ``W_slab`` with

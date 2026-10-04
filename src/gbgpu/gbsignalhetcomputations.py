@@ -159,6 +159,85 @@ def _n_cp_kernel_arg(g, allow_carrier=False):
     return -n
 
 
+#: v5_mode bit: the stash is the carrier-mode COLLAPSED layout (moments
+#: (n, 3 [q], W, Ns) in B0/B1/B0nc/B1nc; see _collapsed_carrier_fold).
+_V5_COLLAPSED = 4
+
+
+def _invc_channel_symmetric(invC, xp, rtol=1e-12):
+    """True if every pixel's XYZ inverse covariance has the form a*I + b*J (equal
+    diagonals, equal off-diagonals) to ``rtol`` -- the equal-arm noise model's
+    structure, which lets the carrier-mode stash collapse its channel-pair axes.
+    ``invC`` (..., 3, 3, W, Nt)."""
+    iC = xp.real(invC)
+    if iC.size == 0:
+        return True
+    d0, o0 = iC[..., 0, 0, :, :], iC[..., 0, 1, :, :]
+    scale = float(xp.abs(d0).max())
+    tol = rtol * scale
+    # one (c, d) plane at a time: no temporary larger than a ninth of invC
+    for c, d in ((1, 1), (2, 2)):
+        if float(xp.abs(iC[..., c, d, :, :] - d0).max()) > tol:
+            return False
+    for c, d in ((0, 2), (1, 2), (1, 0), (2, 0), (2, 1)):
+        if float(xp.abs(iC[..., c, d, :, :] - o0).max()) > tol:
+            return False
+    return True
+
+
+def _collapsed_carrier_fold(res, c0_dense, invC, n_b_idx_local, stride, Nt_active):
+    """Carrier-mode bin fold with the channel-pair axes COLLAPSED, plus the second moment.
+
+    In carrier mode c0 is the same in every channel, and the equal-arm XYZ inverse
+    covariance is ``iC_cd = a delta_cd + b`` (checked by the caller), so every
+    ``sum_bin conj(c0) iC_cd c0 n_off^q`` is ``a_q delta_cd + b_q``: the stash keeps
+    ``(a_q, b_q)`` for q = 0, 1, 2 (conj and non-conj) instead of nch^2 blocks, and the
+    fold becomes ``a_q sum_c X_cc + b_q sum_cd X_cd``. The q = 2 moment multiplies
+    ``conj(dr) dr`` -- the term that makes the fold's ``<h|h>`` exact for its own
+    piecewise-linear r. It was dropped from the full layout (harmless while r ~ 1 near
+    the reference; a first-order anchor error once r is the whole envelope).
+
+    Returns ``(A0p, A1p, Pa, Pb, Pna, Pnb)``: A0p / A1p ``(k, nch, W, Ns)`` exactly as
+    ``bin_fold_real``; the moments ``(k, 3, W, Ns)`` indexed by q --
+    ``Pa = sum |c0|^2 a n^q``, ``Pb = sum |c0|^2 b n^q``, ``Pna = sum c0^2 a n^q``,
+    ``Pnb = sum c0^2 b n^q``."""
+    from lisatools.utils.utility import get_array_module
+
+    xp = get_array_module(c0_dense)
+    N_sparse_t = len(n_b_idx_local)
+    bin_edges = np.arange(N_sparse_t + 1) * stride
+    bin_edges[-1] = Nt_active
+    bin_idx = np.repeat(np.arange(N_sparse_t), np.diff(bin_edges).astype(int))
+    nb_loc = np.asarray(n_b_idx_local.get() if hasattr(n_b_idx_local, "get")
+                        else n_b_idx_local)
+    n_off = (np.arange(Nt_active) - nb_loc[bin_idx]).astype(float)
+    S_np = np.zeros((Nt_active, N_sparse_t))
+    S_np[np.arange(Nt_active), bin_idx] = 1.0
+    Sq = [xp.asarray(S_np * n_off[:, None] ** q) for q in range(3)]
+    iC = xp.real(xp.asarray(invC))
+    Dre = xp.einsum("kcmn,kcdmn->kdmn", xp.real(xp.asarray(res)), iC)
+    c0_all = xp.asarray(c0_dense)
+    c0 = c0_all[:, 0]                                     # (k, W, Nt): the carrier
+    if c0_all.size and float(xp.abs(c0_all - c0[:, None]).max()) > (
+            1e-12 * float(xp.abs(c0).max())):
+        raise RuntimeError(
+            "collapsed sig-het fold: the reference c0 differs across channels "
+            "(the carrier-only reference must be channel-independent).")
+    u, w = xp.real(c0)[:, None], xp.imag(c0)[:, None]
+    A0p = 2.0 * (((Dre * u) @ Sq[0]) + 1j * ((Dre * w) @ Sq[0]))
+    A1p = 2.0 * (((Dre * u) @ Sq[1]) + 1j * ((Dre * w) @ Sq[1]))
+    b_ = iC[:, 0, 1]
+    a_ = iC[:, 0, 0] - b_
+    E = xp.abs(c0) ** 2
+    En = c0 * c0
+
+    def mom(x):
+        return xp.ascontiguousarray(xp.stack(
+            [(x @ Sq[q]).astype(xp.complex128) for q in range(3)], axis=1))
+
+    return A0p, A1p, mom(E * a_), mom(E * b_), mom(En * a_), mom(En * b_)
+
+
 def _v5_nodes_arg(g, nodes):
     """The v5 node-count argument: log-polar (``ampph``), Re/Im (``reim``,
     negated) or Re/Im against the carrier-only reference (``carrier``)."""
@@ -868,6 +947,9 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     #: Layout resolved for the CURRENT block, so a mid-block patch can never
     #: disagree with the build (e.g. via an env flip between the two calls).
     _stash_windowed = None
+    #: True when B0/B1/B0nc/B1nc hold the carrier-mode COLLAPSED moments
+    #: (n, 3 [q], W, Ns) instead of the (n, nch, nch, W, Ns) blocks.
+    _stash_collapsed = False
 
     def _resolve_stash_layout(self) -> bool:
         """True if this block's stash stays COMPACT (per-reference windows).
@@ -1125,6 +1207,24 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         # window and the fold reads the whole slab.
         c0_sparse_w = xp.zeros((n, nch, W, g["N_sparse_t"]),
                                dtype=xp.complex128)
+        # CARRIER mode + channel-symmetric noise: the COLLAPSED stash (the
+        # channel-pair axes folded into (a, b) moments, plus the second moment
+        # the full layout lacks -- see _collapsed_carrier_fold). Resolved per
+        # build; a mid-block patch must keep the block's layout.
+        _carrier_v5 = (g.get("cp_repr") == "carrier" and bool(g.get("v4_knots", 0))
+                       and bool(int(g.get("v5", 0)))
+                       and os.environ.get("SIGHET_CARRIER_COLLAPSE", "1") != "0")
+        collapse = bool(_carrier_v5 and _invc_channel_symmetric(invC_w, xp))
+        if _carrier_v5 and not collapse and not getattr(self, "_warned_asym_invc", False):
+            self._warned_asym_invc = True
+            logger.warning(
+                "sig-het carrier mode: the inverse covariance is NOT channel-"
+                "symmetric (a*I + b*J); falling back to the full nch x nch stash "
+                "WITHOUT the second moment (the anchor correction still applies).")
+        if self._in_model is not None and collapse != bool(self._stash_collapsed):
+            raise RuntimeError(
+                "sig-het in-model patch would change the stash layout (collapsed "
+                f"{self._stash_collapsed} -> {collapse}); clear and rebuild instead.")
         per_src_bytes = (2 * nch * nch * W * g["Nt_active"] * 16    # Ec + En
                          + nch * W * g["Nt_active"] * 16)            # dense c0
         chunk = max(1, min(n, _SIGHET_FOLD_MAX_BYTES // max(per_src_bytes, 1)))
@@ -1155,10 +1255,11 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 3, g["n_sparse_fd"], g["tukey_alpha"], _n_cp_kernel_arg(
                     g, allow_carrier=bool(g.get("v4_knots", 0)) and bool(int(g.get("v5", 0)))))
             c0_sparse_w[s:s + k] = c0_sparse_chunk
-            folds.append(bin_fold_real(
+            fold = _collapsed_carrier_fold if collapse else bin_fold_real
+            folds.append(fold(
                 res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
                 self.n_sparse_local, g["stride"], g["Nt_active"],
-                tdi_type="XYZ"))
+                **({} if collapse else dict(tdi_type="XYZ"))))
         del c0_dense_buf, c0_dense_w
 
         # Row helper for the full-band stash expansion below. The scatters
@@ -1221,8 +1322,10 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
 
             c0_sparse = _expand_A(c0_sparse_w)
             A0s, A1s = _expand_A(A0s), _expand_A(A1s)
-            B0s, B1s = _expand_B(B0s), _expand_B(B1s)
-            B0ncs, B1ncs = _expand_B(B0ncs), _expand_B(B1ncs)
+            # collapsed moments are (n, 3 [q], W, Ns): A-shaped
+            _eB = _expand_A if collapse else _expand_B
+            B0s, B1s = _eB(B0s), _eB(B1s)
+            B0ncs, B1ncs = _eB(B0ncs), _eB(B1ncs)
             stash_W = int(g["Nf_active"])
         # The |c0| row-floor mask is the ONLY thing the fold needs from c0,
         # and it depends only on the reference -- so build it here, once,
@@ -1297,6 +1400,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         self.params_ref_all = refs
         self._stash_W = stash_W
         self._stash_w_lo = w_lo_stash
+        self._stash_collapsed = collapse
 
         slot_map = np.full(int(slots.max()) + 1, -1, dtype=int)
         slot_map[slots] = np.arange(n)
@@ -1380,6 +1484,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         self._stash_W = None
         self._stash_w_lo = None
         self._stash_windowed = None
+        self._stash_collapsed = False
 
     # ------------------------------------------------------------------
     # F-stat against SHARED references (search / grid-fit path).
@@ -2100,7 +2205,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             # ``v5 == 2`` -> flat carve at the same arithmetic and traffic
             # (~3 blocks/SM), the A/B that isolates occupancy. Opt-in;
             # default 0 never reaches here.
-            _v5_mode = 1 if int(g["v5"]) == 1 else 2
+            _v5_mode = (1 if int(g["v5"]) == 1 else 2) | (
+                _V5_COLLAPSED if self._stash_collapsed else 0)
             if self.c0_mask_all is None:
                 raise RuntimeError(
                     "sig-het v5 needs the |c0| row-floor mask, which "

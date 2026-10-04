@@ -45,7 +45,11 @@ from lisatools.domains import WDMSettings
 from lisatools.utils.constants import YRSID_SI
 
 from gbgpu.gbcomps import GBWDMComputations
-from gbgpu.gbsignalhetcomputations import GBSignalHetComputations
+from gbgpu.gbsignalhetcomputations import (
+    GBSignalHetComputations,
+    _V5_COLLAPSED,
+    _v5_nodes_arg,
+)
 
 #: v5 knobs. v5 is the only in-model scorer that takes the windowed
 #: contract (and the only one production runs use), so every windowed comp
@@ -97,7 +101,10 @@ def _expand_A(vals, w_lo, Nf_active):
 
 
 def _expand_B(vals, w_lo, Nf_active):
-    """(n, nch, nch, W, Nsp) compact -> (n, nch, nch, Nf_active, Nsp)."""
+    """(n, nch, nch, W, Nsp) compact -> (n, nch, nch, Nf_active, Nsp).
+    The carrier-mode COLLAPSED moments are (n, 3 [q], W, Nsp): A-shaped."""
+    if vals.ndim == 4:
+        return _expand_A(vals, w_lo, Nf_active)
     n, nch, nch2, W, nsp = vals.shape
     out = np.zeros((n, nch, nch2, Nf_active, nsp), dtype=vals.dtype)
     for i in range(n):
@@ -310,14 +317,14 @@ class DegenerateFullBandTest(_Grid):
             x, comp.params_ref_all, di,
             xp.ascontiguousarray(xp.asarray(w_lo, dtype=xp.int32)),
             n, int(comp.params_ref_all.shape[0]),
-            comp._resolve_v3_nodes(x, di), int(g["v4_knots"]),
+            _v5_nodes_arg(g, comp._resolve_v3_nodes(x, di)), int(g["v4_knots"]),
             9, 1, 2,
             g["Nf"], g["Nt"], g["Nf_active"], int(W_slab), g["Nt_active"],
             g["nt_layer"], g["N_sparse_t"], g["stride"],
             g["ind_min_t"], g["ind_min_f"], g["m_half"],
             g["layer_df"], g["dt"], g["Tobs"], g["t0"],
             3, 0, 1,
-            1, d_h_im)
+            1 | (_V5_COLLAPSED if comp._stash_collapsed else 0), d_h_im)
         return dict(d_h=np.asarray(d_h).copy(), h_h=np.asarray(h_h).copy(),
                     d_h_im=np.asarray(d_h_im).copy())
 
@@ -351,7 +358,8 @@ class WindowedVsFullBandTest(_Grid):
         self.assertLess(int(self.win._stash_W), Nf_active)
         self.assertEqual(self.full.A0_all.shape[2], Nf_active)
         self.assertEqual(self.win.A0_all.shape[2], int(self.win._stash_W))
-        self.assertEqual(self.win.B0_all.shape[3], int(self.win._stash_W))
+        # (n, nch, nch, W, Ns), or (n, 3 [q], W, Ns) when carrier-collapsed
+        self.assertEqual(self.win.B0_all.shape[-2], int(self.win._stash_W))
         # the windowed origins are the real per-reference offsets
         self.assertTrue(bool(np.any(np.asarray(self.win._stash_w_lo) > 0)))
         np.testing.assert_array_equal(np.asarray(self.full._stash_w_lo), 0)

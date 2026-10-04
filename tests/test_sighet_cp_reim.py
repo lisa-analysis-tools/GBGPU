@@ -25,8 +25,12 @@ Pinned here, all through the real kernels (CPU):
   chunked deltas, the catastrophic log-polar tail is gone and the anchor is
   exact.
 * **Knob plumbing.** ``cp_repr`` / ``SIGHET_CP_REPR`` resolution (default
-  ``"reim"``, ``"ampph"`` the rollback) and the negative ``n_cp_sig`` /
-  ``n_nodes`` the kernels decode.
+  ``"carrier"`` on v5, ``"reim"`` elsewhere, ``"ampph"`` the rollback) and the
+  negative ``n_cp_sig`` / ``n_nodes`` the kernels decode.
+* **Second fold moment.** The carrier-mode collapsed stash carries the
+  ``conj(dr) dr`` moment the full layout lacks: the uncorrected anchor offset
+  drops from ~0.5 lnL to ~1e-4 (median, SNR 100) and the deltas stay inside
+  the tier bar.
 """
 
 import os
@@ -326,22 +330,29 @@ class V5RatioDeltaTest(unittest.TestCase):
         le0 = ll(e0, p0)                       # exact (no reference active)
         D_ex = np.array([ll(e0, p1) - le0 for p1 in cands])
         cls.eps, cls.anchor = {}, {}
-        runs = list(eng.items()) + [("carrier_nocorr", eng["carrier"])]
-        for rep, e in runs:
-            saved = os.environ.get("SIGHET_ANCHOR_CORRECT")
-            if rep == "carrier_nocorr":
-                os.environ["SIGHET_ANCHOR_CORRECT"] = "0"
+        # carrier_nocorr: the collapsed stash WITH the second fold moment, no
+        # correction; carrier_full_nocorr: the full nch x nch layout, which has
+        # no second moment -- the pre-B2 fold.
+        runs = list(eng.items()) + [
+            ("carrier_nocorr", eng["carrier"], dict(SIGHET_ANCHOR_CORRECT="0")),
+            ("carrier_full_nocorr", eng["carrier"],
+             dict(SIGHET_ANCHOR_CORRECT="0", SIGHET_CARRIER_COLLAPSE="0"))]
+        for run in runs:
+            rep, e = run[:2]
+            env = run[2] if len(run) > 2 else {}
+            saved = {k: os.environ.get(k) for k in env}
+            os.environ.update(env)
             try:
                 e.setup_in_model(data, p0, idx)
                 ls0 = ll(e, p0)
                 D = np.array([ll(e, p1) - ls0 for p1 in cands])
                 e.clear_in_model()
             finally:
-                if rep == "carrier_nocorr":
-                    if saved is None:
-                        os.environ.pop("SIGHET_ANCHOR_CORRECT", None)
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
                     else:
-                        os.environ["SIGHET_ANCHOR_CORRECT"] = saved
+                        os.environ[k] = v
             cls.eps[rep] = np.abs(D - D_ex)
             cls.anchor[rep] = np.abs(ls0 - le0)
         cls.T = np.abs(D_ex)
@@ -373,8 +384,20 @@ class V5RatioDeltaTest(unittest.TestCase):
     def test_carrier_anchor_corrected(self):
         self.assertLess(self.anchor["carrier"].max(), 1e-8,
                         f"carrier anchor {self.anchor['carrier'].max():.2e} with the correction")
-        self.assertGreater(self.anchor["carrier_nocorr"].max(), 1e-2,
-                           "without the correction the carrier anchor offset should show")
+
+    def test_second_moment_removes_the_anchor(self):
+        """The pre-B2 fold (full layout) is off by ~0.5 lnL at the reference at SNR 100;
+        the second moment takes the uncorrected offset down by >~ 30x."""
+        full, coll = self.anchor["carrier_full_nocorr"], self.anchor["carrier_nocorr"]
+        self.assertGreater(np.median(full), 0.2, f"pre-B2 anchor median {np.median(full):.2e}")
+        self.assertLess(coll.max(), 0.1, f"B2 anchor max {coll.max():.2e}")
+        self.assertLess(np.median(coll), np.median(full) / 30.0,
+                        f"B2 anchor median {np.median(coll):.2e} vs {np.median(full):.2e}")
+
+    def test_second_moment_keeps_the_deltas(self):
+        e = self.eps["carrier_nocorr"]
+        bar = np.maximum(0.1, self.T / 100.0)
+        self.assertTrue(np.all(e <= bar), f"B2 worst eps/bar {np.max(e / bar):.2f}")
 
 
 if __name__ == "__main__":

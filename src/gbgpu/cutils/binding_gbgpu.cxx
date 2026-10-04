@@ -950,6 +950,10 @@ void GBComputationGroupWrap::gb_signal_het_v5_get_ll(
     const size_t b_xyz  = (size_t) num_data * nchannels * nchannels
                         * W_slab * N_sparse_t;
     const size_t b_diag = (size_t) num_data * nchannels * W_slab * N_sparse_t;
+    // v5_mode & 4: carrier-mode COLLAPSED moments, (num_data, 3 [q], W, Ns).
+    const size_t b_coll = (size_t) num_data * 3 * W_slab * N_sparse_t;
+    const size_t b_len  = (v5_mode & 4) ? b_coll
+                        : ((tdi_type == 0) ? b_xyz : b_diag);
     // One bit per (data, channel, window layer, sparse pixel), packed along
     // the pixel axis -- 1/128 the size of c0_sparse_all itself.
     const size_t n_mask = (size_t) num_data * nchannels * W_slab
@@ -967,13 +971,13 @@ void GBComputationGroupWrap::gb_signal_het_v5_get_ll(
         reinterpret_cast<cmplx*>(return_pointer_and_check_length(
             A1_all, "A1_all", b_diag, 1)),
         reinterpret_cast<cmplx*>(return_pointer_and_check_length(
-            B0_all, "B0_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+            B0_all, "B0_all", b_len, 1)),
         reinterpret_cast<cmplx*>(return_pointer_and_check_length(
-            B1_all, "B1_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+            B1_all, "B1_all", b_len, 1)),
         reinterpret_cast<cmplx*>(return_pointer_and_check_length(
-            B0nc_all, "B0nc_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+            B0nc_all, "B0nc_all", b_len, 1)),
         reinterpret_cast<cmplx*>(return_pointer_and_check_length(
-            B1nc_all, "B1nc_all", (tdi_type == 0) ? b_xyz : b_diag, 1)),
+            B1nc_all, "B1nc_all", b_len, 1)),
         return_pointer_and_check_length(n_sparse_local_arr, "n_sparse_local",
                                          N_sparse_t, 1),
         band_w.data(), band_j0.data(), band_len,
@@ -1450,6 +1454,9 @@ void gbgpu_part(nb::module_ &m) {
          "v5_mode: 1 = phase-aliased arena (production; ~5 blocks/SM on an "
          "A100 vs v4's 1), 2 = flat carve at the same arithmetic and "
          "traffic (~3 blocks/SM) -- the A/B that isolates occupancy. "
+         "OR 4 into v5_mode for the carrier-mode COLLAPSED stash (B0/B1/"
+         "B0nc/B1nc = (a_q, b_q) moments q = 0..2, shape (num_data, 3, W, Ns); "
+         "needs the carrier n_nodes code). "
          "GB_SIGHET_V5_VERBOSE=1 prints registers/thread and CUDA's own "
          "achieved blocks/SM for the launch.")
     .def("gb_signal_het_fstat_get_ll",
