@@ -6652,6 +6652,133 @@ static inline size_t gb_sighet_fstat_shared_bytes(
 }
 
 
+// CARRIER SYM stash Gram fold of the sig-het F-stat (setup: _collapsed_carrier_fold,
+// layout "sym"): per unique channel pair p the q = 0, 1, 2 moments, B0 / B0nc the
+// diagonal pairs and B1 / B1nc the off-diagonal ones, each
+// (num_data, 3 [q], 3 [pair], W_slab, N_sparse_t). The cores are the EXACT complex
+// Grams over the ordered channel pairs:
+//   K  = sum P0 conj(r_i) r_j + P1 conj(r_i) dr_j + conj(P1) conj(dr_i) r_j + P2 conj(dr_i) dr_j
+// (P1 carries the complex c1 cross moment, so its two orderings take P1 and conj(P1);
+// P0 / P2 are real), and the anomalous
+//   Kn = sum Q0 r_i r_j + Q1 (r_i dr_j + dr_i r_j) + Q2 dr_i dr_j.
+// NS = node-stage count (2 folded, 4 the self-check), a template parameter so the
+// per-pixel arrays are register-resident.
+template <int NS>
+CUDA_DEVICE
+static void gb_fstat_sym_fold(
+    double *M_partial,
+    const cmplx *B0_all, const cmplx *B1_all, const cmplx *B0nc_all, const cmplx *B1nc_all,
+    const unsigned long long *mask_sh, const double *rpix_all, size_t stage_stride,
+    int nchannels, int M, int N_sparse_t, int nwords, double Dn,
+    const int *m_active, int w0, int data_idx, int W_slab, int project_real,
+    const int *s_of, const cmplx *alpha)
+{
+    const size_t blk = (size_t) W_slab * N_sparse_t;
+    const int pc[6] = {0, 1, 2, 0, 0, 1};
+    const int pd[6] = {0, 1, 2, 1, 2, 2};
+    const int n_hh = M * N_sparse_t;
+    for (int idx = THREAD_START_X; idx < n_hh; idx += BLOCK_INCR_X)
+    {
+        const int im = idx / N_sparse_t;
+        const int b  = idx % N_sparse_t;
+        const int m_local = m_active[im] - w0;
+        cmplx rr[NS][3], dd[NS][3];
+#pragma unroll
+        for (int st = 0; st < NS; ++st) {
+            const double *rp = rpix_all + (size_t) st * stage_stride;
+#pragma unroll
+            for (int c = 0; c < 3; ++c)
+                gb_sighet_v5_r_dr(mask_sh + (size_t) (c * M + im) * nwords,
+                                  rp + (size_t) c * N_sparse_t,
+                                  rp + (size_t) nchannels * N_sparse_t
+                                     + (size_t) c * N_sparse_t,
+                                  b, N_sparse_t, Dn, &rr[st][c], &dd[st][c]);
+        }
+        const size_t base = (size_t) data_idx * 9 * blk
+                            + (size_t) m_local * N_sparse_t + b;
+        cmplx K[NS][NS], Kn[NS][NS];
+#pragma unroll
+        for (int si = 0; si < NS; ++si)
+#pragma unroll
+            for (int sj = 0; sj < NS; ++sj) {
+                K[si][sj] = cmplx(0.0, 0.0);
+                Kn[si][sj] = cmplx(0.0, 0.0);
+            }
+        for (int p = 0; p < 6; ++p)
+        {
+            const cmplx *Bc = (p < 3) ? B0_all : B1_all;
+            const cmplx *Bn = (p < 3) ? B0nc_all : B1nc_all;
+            const int pp = (p < 3) ? p : p - 3;
+            const cmplx P0 = Bc[base + (size_t) pp * blk];
+            const cmplx P1 = Bc[base + (size_t) (3 + pp) * blk];
+            const cmplx P2 = Bc[base + (size_t) (6 + pp) * blk];
+            cmplx Q0(0.0, 0.0), Q1(0.0, 0.0), Q2(0.0, 0.0);
+            if (project_real) {
+                Q0 = Bn[base + (size_t) pp * blk];
+                Q1 = Bn[base + (size_t) (3 + pp) * blk];
+                Q2 = Bn[base + (size_t) (6 + pp) * blk];
+            }
+            const cmplx P1c = gcmplx::conj(P1);
+            for (int o = 0; o < ((p < 3) ? 1 : 2); ++o)        // (c, d), then (d, c)
+            {
+                const int c = (o == 0) ? pc[p] : pd[p];
+                const int d = (o == 0) ? pd[p] : pc[p];
+#pragma unroll
+                for (int si = 0; si < NS; ++si)
+#pragma unroll
+                    for (int sj = 0; sj < NS; ++sj) {
+                        const cmplx ri = rr[si][c], dri = dd[si][c];
+                        const cmplx rj = rr[sj][d], drj = dd[sj][d];
+                        K[si][sj] += P0 * (gcmplx::conj(ri) * rj)
+                                   + P1 * (gcmplx::conj(ri) * drj)
+                                   + P1c * (gcmplx::conj(dri) * rj)
+                                   + P2 * (gcmplx::conj(dri) * drj);
+                        if (project_real)
+                            Kn[si][sj] += Q0 * (ri * rj)
+                                        + Q1 * (ri * drj + dri * rj)
+                                        + Q2 * (dri * drj);
+                    }
+            }
+        }
+        if (NS == 2) {
+            double v10[GB_FSTAT_N_M_UPPER];
+            v10[0] =  K[0][0].real();
+            v10[1] = -K[0][1].real();
+            v10[2] = -K[0][0].imag();
+            v10[3] =  K[0][1].imag();
+            v10[4] =  K[1][1].real();
+            v10[5] =  K[1][0].imag();
+            v10[6] = -K[1][1].imag();
+            v10[7] =  K[0][0].real();
+            v10[8] = -K[0][1].real();
+            v10[9] =  K[1][1].real();
+            if (project_real) {
+                v10[0] += Kn[0][0].real();
+                v10[1] -= Kn[0][1].real();
+                v10[2] -= Kn[0][0].imag();
+                v10[3] += Kn[0][1].imag();
+                v10[4] += Kn[1][1].real();
+                v10[5] += Kn[1][0].imag();
+                v10[6] -= Kn[1][1].imag();
+                v10[7] -= Kn[0][0].real();
+                v10[8] += Kn[0][1].real();
+                v10[9] -= Kn[1][1].real();
+            }
+            for (int k = 0; k < GB_FSTAT_N_M_UPPER; ++k)
+                M_partial[k] += v10[k];
+        } else {
+            for (int fi = 0; fi < GB_FSTAT_N_FILTERS; ++fi)
+                for (int fj = fi; fj < GB_FSTAT_N_FILTERS; ++fj) {
+                    const int si = s_of[fi], sj = s_of[fj];
+                    cmplx v = gcmplx::conj(alpha[fi]) * alpha[fj] * K[si][sj];
+                    if (project_real) v += alpha[fi] * alpha[fj] * Kn[si][sj];
+                    M_partial[fi * GB_FSTAT_N_FILTERS - (fi * (fi + 1)) / 2 + fj] += v.real();
+                }
+        }
+    }
+}
+
+
 CUDA_DEVICE
 void gb_signal_het_fstat_score_one_source(
     double *N_partial,          // per-thread [4]  accumulators (raw, no 0.5)
@@ -7147,115 +7274,18 @@ void gb_signal_het_fstat_score_one_source(
 
     if (tdi_type == 0 && fs_sym)
     {
-        // CARRIER SYM stash (setup: _collapsed_carrier_fold, layout "sym"):
-        // per unique channel pair p the q = 0, 1, 2 moments, B0 / B0nc the
-        // diagonal pairs and B1 / B1nc the off-diagonal ones, each
-        // (num_data, 3 [q], 3 [pair], W_slab, N_sparse_t). The cores are the
-        // EXACT complex Grams over the ordered channel pairs:
-        //   K = sum P0 conj(r_i) r_j + P1 conj(r_i) dr_j + conj(P1) conj(dr_i) r_j
-        //       + P2 conj(dr_i) dr_j
-        // (P1 carries the complex c1 cross moment, so its two orderings take
-        // P1 and conj(P1); P0 / P2 are real), and the anomalous
-        //   Kn = sum Q0 r_i r_j + Q1 (r_i dr_j + dr_i r_j) + Q2 dr_i dr_j.
-        const size_t blk = (size_t) W_slab * N_sparse_t;
-        const int pc[6] = {0, 1, 2, 0, 0, 1};
-        const int pd[6] = {0, 1, 2, 1, 2, 2};
-        const int n_hh = M * N_sparse_t;
-        for (int idx = THREAD_START_X; idx < n_hh; idx += BLOCK_INCR_X)
-        {
-            const int im = idx / N_sparse_t;
-            const int b  = idx % N_sparse_t;
-            const int m_local = m_active[im] - w0;
-            cmplx rr[GB_FSTAT_MAX_STAGES][3], dd[GB_FSTAT_MAX_STAGES][3];
-            for (int st = 0; st < n_stages; ++st) {
-                const double *rp = rpix_all + (size_t) st * stage_stride;
-                for (int c = 0; c < 3; ++c)
-                    gb_sighet_v5_r_dr(mask_sh + (size_t) (c * M + im) * nwords,
-                                      rp + (size_t) c * N_sparse_t,
-                                      rp + (size_t) nchannels * N_sparse_t
-                                         + (size_t) c * N_sparse_t,
-                                      b, N_sparse_t, Dn, &rr[st][c], &dd[st][c]);
-            }
-            const size_t base = (size_t) data_idx * 9 * blk
-                                + (size_t) m_local * N_sparse_t + b;
-            cmplx K[GB_FSTAT_MAX_STAGES][GB_FSTAT_MAX_STAGES];
-            cmplx Kn[GB_FSTAT_MAX_STAGES][GB_FSTAT_MAX_STAGES];
-            for (int si = 0; si < n_stages; ++si)
-                for (int sj = 0; sj < n_stages; ++sj) {
-                    K[si][sj] = cmplx(0.0, 0.0);
-                    Kn[si][sj] = cmplx(0.0, 0.0);
-                }
-            for (int p = 0; p < 6; ++p)
-            {
-                const cmplx *Bc = (p < 3) ? B0_all : B1_all;
-                const cmplx *Bn = (p < 3) ? B0nc_all : B1nc_all;
-                const int pp = (p < 3) ? p : p - 3;
-                const cmplx P0 = Bc[base + (size_t) pp * blk];
-                const cmplx P1 = Bc[base + (size_t) (3 + pp) * blk];
-                const cmplx P2 = Bc[base + (size_t) (6 + pp) * blk];
-                cmplx Q0(0.0, 0.0), Q1(0.0, 0.0), Q2(0.0, 0.0);
-                if (project_real) {
-                    Q0 = Bn[base + (size_t) pp * blk];
-                    Q1 = Bn[base + (size_t) (3 + pp) * blk];
-                    Q2 = Bn[base + (size_t) (6 + pp) * blk];
-                }
-                const cmplx P1c = gcmplx::conj(P1);
-                // ordered pairs: (c, d) and, off the diagonal, (d, c)
-                for (int o = 0; o < ((p < 3) ? 1 : 2); ++o)
-                {
-                    const int c = (o == 0) ? pc[p] : pd[p];
-                    const int d = (o == 0) ? pd[p] : pc[p];
-                    for (int si = 0; si < n_stages; ++si)
-                        for (int sj = 0; sj < n_stages; ++sj) {
-                            const cmplx ri = rr[si][c], dri = dd[si][c];
-                            const cmplx rj = rr[sj][d], drj = dd[sj][d];
-                            K[si][sj] += P0 * (gcmplx::conj(ri) * rj)
-                                       + P1 * (gcmplx::conj(ri) * drj)
-                                       + P1c * (gcmplx::conj(dri) * rj)
-                                       + P2 * (gcmplx::conj(dri) * drj);
-                            if (project_real)
-                                Kn[si][sj] += Q0 * (ri * rj)
-                                            + Q1 * (ri * drj + dri * rj)
-                                            + Q2 * (dri * drj);
-                        }
-                }
-            }
-            if (n_stages == 2) {
-                double v10[GB_FSTAT_N_M_UPPER];
-                v10[0] =  K[0][0].real();
-                v10[1] = -K[0][1].real();
-                v10[2] = -K[0][0].imag();
-                v10[3] =  K[0][1].imag();
-                v10[4] =  K[1][1].real();
-                v10[5] =  K[1][0].imag();
-                v10[6] = -K[1][1].imag();
-                v10[7] =  K[0][0].real();
-                v10[8] = -K[0][1].real();
-                v10[9] =  K[1][1].real();
-                if (project_real) {
-                    v10[0] += Kn[0][0].real();
-                    v10[1] -= Kn[0][1].real();
-                    v10[2] -= Kn[0][0].imag();
-                    v10[3] += Kn[0][1].imag();
-                    v10[4] += Kn[1][1].real();
-                    v10[5] += Kn[1][0].imag();
-                    v10[6] -= Kn[1][1].imag();
-                    v10[7] -= Kn[0][0].real();
-                    v10[8] += Kn[0][1].real();
-                    v10[9] -= Kn[1][1].real();
-                }
-                for (int k = 0; k < GB_FSTAT_N_M_UPPER; ++k)
-                    M_partial[k] += v10[k];
-                continue;
-            }
-            for (int fi = 0; fi < GB_FSTAT_N_FILTERS; ++fi)
-                for (int fj = fi; fj < GB_FSTAT_N_FILTERS; ++fj) {
-                    const int si = s_of[fi], sj = s_of[fj];
-                    cmplx v = gcmplx::conj(alpha[fi]) * alpha[fj] * K[si][sj];
-                    if (project_real) v += alpha[fi] * alpha[fj] * Kn[si][sj];
-                    M_partial[fi * GB_FSTAT_N_FILTERS - (fi * (fi + 1)) / 2 + fj] += v.real();
-                }
-        }
+        // CARRIER SYM stash: see gb_fstat_sym_fold (templated on the stage count
+        // so the per-pixel r / dr / Gram-core arrays stay in registers).
+        if (n_stages == 2)
+            gb_fstat_sym_fold<2>(M_partial, B0_all, B1_all, B0nc_all, B1nc_all, mask_sh,
+                                 rpix_all, stage_stride, nchannels, M, N_sparse_t, nwords,
+                                 Dn, m_active, w0, data_idx, W_slab, project_real,
+                                 s_of, alpha);
+        else
+            gb_fstat_sym_fold<4>(M_partial, B0_all, B1_all, B0nc_all, B1nc_all, mask_sh,
+                                 rpix_all, stage_stride, nchannels, M, N_sparse_t, nwords,
+                                 Dn, m_active, w0, data_idx, W_slab, project_real,
+                                 s_of, alpha);
     }
     else if (tdi_type == 0)
     {
