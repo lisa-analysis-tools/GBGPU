@@ -2318,9 +2318,11 @@ void gb_signal_het_consume_one_source(
     // Active m-band (every thread computes the same tiny array).
     const int Nf_active_idx_max = Nf_active - 1;
     const int m_floor = (int) floor(f0_cand / layer_df);
+    bool m_ok[GB_SIGHET_M_ACTIVE_MAX];   // false = row outside the active band
     int m_active[GB_SIGHET_M_ACTIVE_MAX];
     for (int im = 0; im < M; ++im) {
         int m_g = m_floor + (im - m_active_half_width);
+        m_ok[im] = (m_g >= ind_min_f && m_g <= ind_min_f + Nf_active_idx_max);
         if (m_g < ind_min_f) m_g = ind_min_f;
         if (m_g > ind_min_f + Nf_active_idx_max) m_g = ind_min_f + Nf_active_idx_max;
         m_active[im] = m_g;
@@ -2459,6 +2461,7 @@ void gb_signal_het_consume_one_source(
         const int im = (idx / N_sparse_t) % M;
         const int b  = idx % N_sparse_t;
         const int m_local = m_active[im] - ind_min_f;
+        if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
         const size_t coef_i = ((size_t) data_idx * nchannels + c)
                               * Nf_active * N_sparse_t
                               + (size_t) m_local * N_sparse_t + b;
@@ -2477,6 +2480,7 @@ void gb_signal_het_consume_one_source(
             const int im = (idx / N_sparse_t) % M;
             const int b  = idx % N_sparse_t;
             const int m_local = m_active[im] - ind_min_f;
+            if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
             const size_t rc_i  = ((size_t) c  * M + im) * N_sparse_t + b;
             const size_t rc2_i = ((size_t) c2 * M + im) * N_sparse_t + b;
             const cmplx r_c   = r_sparse[rc_i];
@@ -2509,6 +2513,7 @@ void gb_signal_het_consume_one_source(
             const int im = (idx / N_sparse_t) % M;
             const int b  = idx % N_sparse_t;
             const int m_local = m_active[im] - ind_min_f;
+            if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
             const cmplx r  = r_sparse[idx];
             const cmplx dr = dr_sparse[idx];
             const size_t coef_i = ((size_t) data_idx * nchannels + c)
@@ -2585,9 +2590,11 @@ void GBComputationGroup::gb_signal_het_get_ll_wrap(
     for (int bin = 0; bin < num_bin; ++bin) {
         const double f0_cand = params_cand_all[(size_t) bin * nparams + f0_idx];
         const int    m_floor = (int) std::floor(f0_cand / layer_df);
+        bool m_ok[GB_SIGHET_M_ACTIVE_MAX];   // false = row outside the active band
         int m_active[GB_SIGHET_M_ACTIVE_MAX];
         for (int im = 0; im < M; ++im) {
             int m_g = m_floor + (im - m_active_half_width);
+            m_ok[im] = (m_g >= ind_min_f && m_g <= ind_min_f + Nf_active_idx_max);
             if (m_g < ind_min_f) m_g = ind_min_f;
             if (m_g > ind_min_f + Nf_active_idx_max) m_g = ind_min_f + Nf_active_idx_max;
             m_active[im] = m_g;
@@ -2679,6 +2686,7 @@ void GBComputationGroup::gb_signal_het_get_ll_wrap(
         for (int c = 0; c < nchannels; ++c) {
             for (int im = 0; im < M; ++im) {
                 const int m_local = m_active[im] - ind_min_f;
+                if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
                 for (int b = 0; b < N_sparse_t; ++b) {
                     const cmplx r  = r_sparse[ (size_t) c * M * N_sparse_t
                                             + (size_t) im * N_sparse_t + b];
@@ -2701,6 +2709,7 @@ void GBComputationGroup::gb_signal_het_get_ll_wrap(
                 for (int c2 = 0; c2 < nchannels; ++c2) {
                     for (int im = 0; im < M; ++im) {
                         const int m_local = m_active[im] - ind_min_f;
+                        if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
                         for (int b = 0; b < N_sparse_t; ++b) {
                             const cmplx r_c  = r_sparse[ (size_t) c  * M * N_sparse_t
                                                      + (size_t) im * N_sparse_t + b];
@@ -2731,6 +2740,7 @@ void GBComputationGroup::gb_signal_het_get_ll_wrap(
             for (int c = 0; c < nchannels; ++c) {
                 for (int im = 0; im < M; ++im) {
                     const int m_local = m_active[im] - ind_min_f;
+                    if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
                     for (int b = 0; b < N_sparse_t; ++b) {
                         const cmplx r  = r_sparse[ (size_t) c * M * N_sparse_t
                                                  + (size_t) im * N_sparse_t + b];
@@ -3774,9 +3784,11 @@ void GBComputationGroup::gb_signal_het_fill_global_sparse_wrap(
         const double f0_cand   = params_cand_all[(size_t) bin * nparams + f0_idx];
         const double fdot_cand = params_cand_all[(size_t) bin * nparams + fdot_idx];
         const int    m_floor   = (int) std::floor(f0_cand / layer_df);
+        bool m_ok[GB_SIGHET_M_ACTIVE_MAX];   // false = row outside the active band
         int m_active[GB_SIGHET_M_ACTIVE_MAX];
         for (int im = 0; im < M; ++im) {
             int m_g = m_floor + (im - m_active_half_width);
+            m_ok[im] = (m_g >= ind_min_f && m_g <= ind_min_f + Nf_active_idx_max);
             if (m_g < ind_min_f) m_g = ind_min_f;
             if (m_g > ind_min_f + Nf_active_idx_max) m_g = ind_min_f + Nf_active_idx_max;
             m_active[im] = m_g;
@@ -3926,6 +3938,7 @@ void GBComputationGroup::gb_signal_het_fill_global_sparse_wrap(
                     const cmplx r_dense = r_demod_dense * rot_back;
 
                     const int m_local = m_active[im] - ind_min_f;
+                    if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
                     const cmplx c0v = c0_dense_complex_all[
                         ((size_t) data_idx * nchannels + c) * Nf_active * Nt_active
                         + (size_t) m_local * Nt_active + n_dense];
@@ -4381,9 +4394,11 @@ void gb_signal_het_v3_score_one_source(
     const double f0_cand = params_c[f0_idx];
     const int Nf_active_idx_max = Nf_active - 1;
     const int m_floor = (int) floor(f0_cand / layer_df);
+    bool m_ok[GB_SIGHET_M_ACTIVE_MAX];   // false = row outside the active band
     int m_active[GB_SIGHET_M_ACTIVE_MAX];
     for (int im = 0; im < M; ++im) {
         int m_g = m_floor + (im - m_active_half_width);
+        m_ok[im] = (m_g >= ind_min_f && m_g <= ind_min_f + Nf_active_idx_max);
         if (m_g < ind_min_f) m_g = ind_min_f;
         if (m_g > ind_min_f + Nf_active_idx_max)
             m_g = ind_min_f + Nf_active_idx_max;
@@ -4474,6 +4489,7 @@ void gb_signal_het_v3_score_one_source(
         const int im = (idx / N_sparse_t) % M;
         const int b  = idx % N_sparse_t;
         const int m_local = m_active[im] - ind_min_f;
+        if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
         const size_t coef_i = ((size_t) data_idx * nchannels + c)
                               * Nf_active * N_sparse_t
                               + (size_t) m_local * N_sparse_t + b;
@@ -4491,6 +4507,7 @@ void gb_signal_het_v3_score_one_source(
             const int im = (idx / N_sparse_t) % M;
             const int b  = idx % N_sparse_t;
             const int m_local = m_active[im] - ind_min_f;
+            if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
             const size_t rc_i  = ((size_t) c  * M + im) * N_sparse_t + b;
             const size_t rc2_i = ((size_t) c2 * M + im) * N_sparse_t + b;
             const cmplx r_c   = r_sparse[rc_i];
@@ -4520,6 +4537,7 @@ void gb_signal_het_v3_score_one_source(
             const int im = (idx / N_sparse_t) % M;
             const int b  = idx % N_sparse_t;
             const int m_local = m_active[im] - ind_min_f;
+            if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
             const cmplx r  = r_sparse[idx];
             const cmplx dr = dr_sparse[idx];
             const size_t coef_i = ((size_t) data_idx * nchannels + c)
@@ -5060,9 +5078,11 @@ void gb_signal_het_v4_score_one_source(
     const double f0_cand = params_c[f0_idx];
     const int Nf_active_idx_max = Nf_active - 1;
     const int m_floor = (int) floor(f0_cand / layer_df);
+    bool m_ok[GB_SIGHET_M_ACTIVE_MAX];   // false = row outside the active band
     int m_active[GB_SIGHET_M_ACTIVE_MAX];
     for (int im = 0; im < M; ++im) {
         int m_g = m_floor + (im - m_active_half_width);
+        m_ok[im] = (m_g >= ind_min_f && m_g <= ind_min_f + Nf_active_idx_max);
         if (m_g < ind_min_f) m_g = ind_min_f;
         if (m_g > ind_min_f + Nf_active_idx_max)
             m_g = ind_min_f + Nf_active_idx_max;
@@ -5130,6 +5150,7 @@ void gb_signal_het_v4_score_one_source(
         const int im = (idx / N_sparse_t) % M;
         const int b  = idx % N_sparse_t;
         const int m_local = m_active[im] - ind_min_f;
+        if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
         const size_t coef_i = ((size_t) data_idx * nchannels + c)
                               * Nf_active * N_sparse_t
                               + (size_t) m_local * N_sparse_t + b;
@@ -5147,6 +5168,7 @@ void gb_signal_het_v4_score_one_source(
             const int im = (idx / N_sparse_t) % M;
             const int b  = idx % N_sparse_t;
             const int m_local = m_active[im] - ind_min_f;
+            if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
             const size_t rc_i  = ((size_t) c  * M + im) * N_sparse_t + b;
             const size_t rc2_i = ((size_t) c2 * M + im) * N_sparse_t + b;
             const cmplx r_c   = r_sparse[rc_i];
@@ -5176,6 +5198,7 @@ void gb_signal_het_v4_score_one_source(
             const int im = (idx / N_sparse_t) % M;
             const int b  = idx % N_sparse_t;
             const int m_local = m_active[im] - ind_min_f;
+            if (!m_ok[im]) continue;   // out-of-band row (clamped only for safe reads)
             const cmplx r  = r_sparse[idx];
             const cmplx dr = dr_sparse[idx];
             const size_t coef_i = ((size_t) data_idx * nchannels + c)
@@ -6030,10 +6053,15 @@ void gb_signal_het_v5_score_one_source(
     const int m_floor = (int) floor(f0_cand / layer_df);
     int m_active[GB_SIGHET_M_ACTIVE_MAX];   // WINDOW-LOCAL row, or -1
     for (int im = 0; im < M; ++im) {
-        int m_g = m_floor + (im - m_active_half_width);
-        if (m_g < ind_min_f) m_g = ind_min_f;
-        if (m_g > ind_min_f + Nf_active_idx_max)
-            m_g = ind_min_f + Nf_active_idx_max;
+        const int m_g = m_floor + (im - m_active_half_width);
+        // A row outside the active band does not exist: SKIP it. (It used to
+        // be clamped onto the edge row, which then entered the folds 2-3x for
+        // every source within m_half layers of a band edge -- e.g. sig-het
+        // delta errors of 1-3 lnL at 0.3 mHz on a 2.5e-4 Hz band floor.)
+        if (m_g < ind_min_f || m_g > ind_min_f + Nf_active_idx_max) {
+            m_active[im] = -1;
+            continue;
+        }
         const int ml = m_g - w0;
         m_active[im] = (ml >= 0 && ml < W_slab) ? ml : -1;
     }
@@ -6681,6 +6709,7 @@ static void gb_fstat_sym_fold(
     {
         const int im = idx / N_sparse_t;
         const int b  = idx % N_sparse_t;
+        if (m_active[im] < 0) continue;          // skipped (out-of-band) row
         const int m_local = m_active[im] - w0;
         cmplx rr[NS][3], dd[NS][3];
 #pragma unroll
@@ -7208,12 +7237,12 @@ void gb_signal_het_fstat_score_one_source(
     if (m_clip_lo < ind_min_f)                 m_clip_lo = ind_min_f;
     if (m_clip_hi > ind_min_f + Nf_active - 1) m_clip_hi = ind_min_f + Nf_active - 1;
     const int m_floor = (int) floor(f0_cand / layer_df);
-    int m_active[GB_SIGHET_M_ACTIVE_MAX];
+    int m_active[GB_SIGHET_M_ACTIVE_MAX];   // ABSOLUTE row, or -1 (skipped)
     for (int im = 0; im < M; ++im) {
-        int m_g = m_floor + (im - m_active_half_width);
-        if (m_g < m_clip_lo) m_g = m_clip_lo;
-        if (m_g > m_clip_hi) m_g = m_clip_hi;
-        m_active[im] = m_g;
+        const int m_g = m_floor + (im - m_active_half_width);
+        // rows outside the window / band are SKIPPED, not clamped onto the
+        // edge row (clamping counted that row 2-3x at the band edges)
+        m_active[im] = (m_g < m_clip_lo || m_g > m_clip_hi) ? -1 : m_g;
     }
 
     // ---- stage the mask rows (shared by every stage and filter) -----------
@@ -7224,7 +7253,7 @@ void gb_signal_het_fstat_score_one_source(
         const int w       = idx % nwords;
         const int c       = row / M;
         const int m_local = m_active[row % M] - w0;
-        mask_sh[idx] = c0_mask_all[
+        mask_sh[idx] = (m_active[row % M] < 0) ? 0ULL : c0_mask_all[
             (((size_t) data_idx * nchannels + c) * W_slab
              + (size_t) m_local) * nwords + w];
     }
@@ -7241,6 +7270,7 @@ void gb_signal_het_fstat_score_one_source(
         const int c  = idx / (M * N_sparse_t);
         const int im = (idx / N_sparse_t) % M;
         const int b  = idx % N_sparse_t;
+        if (m_active[im] < 0) continue;          // skipped (out-of-band) row
         const int m_local = m_active[im] - w0;
         const size_t coef_i = ((size_t) data_idx * nchannels + c)
                               * W_slab * N_sparse_t
@@ -7296,7 +7326,8 @@ void gb_signal_het_fstat_score_one_source(
             const int c2 = (idx / (M * N_sparse_t)) % nchannels;
             const int im = (idx / N_sparse_t) % M;
             const int b  = idx % N_sparse_t;
-            const int m_local = m_active[im] - w0;
+            if (m_active[im] < 0) continue;          // skipped (out-of-band) row
+        const int m_local = m_active[im] - w0;
             const unsigned long long *mrow_c =
                 mask_sh + (size_t) (c * M + im) * nwords;
             const unsigned long long *mrow_c2 =
@@ -7411,7 +7442,8 @@ void gb_signal_het_fstat_score_one_source(
             const int c  = idx / (M * N_sparse_t);
             const int im = (idx / N_sparse_t) % M;
             const int b  = idx % N_sparse_t;
-            const int m_local = m_active[im] - w0;
+            if (m_active[im] < 0) continue;          // skipped (out-of-band) row
+        const int m_local = m_active[im] - w0;
             const unsigned long long *mrow =
                 mask_sh + (size_t) (c * M + im) * nwords;
             cmplx r1[GB_FSTAT_MAX_STAGES], dr1[GB_FSTAT_MAX_STAGES];
