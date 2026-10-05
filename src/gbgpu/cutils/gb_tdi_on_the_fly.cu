@@ -7815,23 +7815,45 @@ static inline bool gb_lookup_table_cs_dcs(const WDMLookupTableView &tab, const i
 // num_m_layers); a row needing more falls back to per-pixel reads.
 #define GB_LOOKUP_LMAX 8
 
-// Dynamic shared bytes of one lookup block (mirrors the carve below).
+// Coarse-cache layers actually carved: the carrier's own layer(s) +- num_m_layers.
+// A GB carrier crosses at most one layer boundary over the span (Doppler + fdot T
+// << layer_df), so 2 L + 2 covers every row; a row needing more keeps per-pixel reads.
 CUDA_CALLABLE_MEMBER
-static inline size_t gb_lookup_shared_bytes(int n_nodes, int nchannels)
+static inline int gb_lookup_lay_cap(int num_m_layers)
+{
+    const int c = 2 * num_m_layers + 2;
+    return (c < GB_LOOKUP_LMAX) ? c : GB_LOOKUP_LMAX;
+}
+
+// The node stage's scratch (response, unwrap, spline solve) is dead once the
+// splines are built, so the coarse cache OVERLAYS it: the union is the larger.
+CUDA_CALLABLE_MEMBER
+static inline size_t gb_lookup_union_bytes(int n_nodes, int nchannels, int num_m_layers)
+{
+    const size_t n = (size_t) n_nodes;
+    const size_t kv = (size_t) 4 * gb_lookup_lay_cap(num_m_layers) * n * sizeof(double);
+    const size_t node = n * (size_t) nchannels * sizeof(cmplx)   /* tdi_cp */
+                      + n * sizeof(double) * (1      /* phi_un */
+                                              + 1    /* B */
+                                              + 8    /* pcr */
+                                              + 2)   /* flip, pjump */
+                      + n * sizeof(int) + n * sizeof(bool);
+    return (kv > node) ? kv : node;
+}
+
+// Dynamic shared bytes of one lookup block (mirrors the carve below). Blocks per
+// SM is what the latency-bound pixel stage lives on: ~425 B per node keeps 2
+// blocks / SM on a 228 KB SM up to ~260 nodes (2 yr at the 2.8-d auto spacing).
+CUDA_CALLABLE_MEMBER
+static inline size_t gb_lookup_shared_bytes(int n_nodes, int nchannels, int num_m_layers)
 {
     const size_t n = (size_t) n_nodes;
     return N_PARAMS_MAX * sizeof(double)
-         + (size_t) 4 * GB_LOOKUP_LMAX * n * sizeof(double)     /* coarse (c, s, dc, ds) */
-         + (size_t) (2 + GB_LOOKUP_LMAX) * sizeof(int)          /* m_lo, n_lay, flags */
+         + (size_t) (2 + 2 * GB_LOOKUP_LMAX) * sizeof(int)  /* m_lo, n_lay, flag[], n_in[] */
          + n * sizeof(double) * (1        /* t_cp */
-                                 + 1      /* phi_un */
                                  + 4      /* dp spline */
-                                 + 8 * (size_t) nchannels   /* Re / Im splines */
-                                 + 1      /* B */
-                                 + 8      /* pcr */
-                                 + 2)     /* flip, pjump */
-         + n * (size_t) nchannels * sizeof(cmplx)   /* tdi_cp */
-         + n * sizeof(int) + n * sizeof(bool) + 16;
+                                 + 8 * (size_t) nchannels)  /* Re / Im splines */
+         + gb_lookup_union_bytes(n_nodes, nchannels, num_m_layers) + 16;
 }
 
 
@@ -7842,22 +7864,24 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
 {
     const int n   = a.n_nodes;
     const int nch = a.nchannels;
+    const int cap = gb_lookup_lay_cap(a.num_m_layers);
     char *cur = (char *) shared_mem;
     double *params_here = (double *) cur; cur += N_PARAMS_MAX * sizeof(double);
-    double *Kv     = (double *) cur; cur += (size_t) 4 * GB_LOOKUP_LMAX * n * sizeof(double);
-    int    *kmeta  = (int *) cur;    cur += (size_t) (2 + GB_LOOKUP_LMAX) * sizeof(int);
+    int    *kmeta  = (int *) cur;    cur += (size_t) (2 + 2 * GB_LOOKUP_LMAX) * sizeof(int);
     double *t_cp   = (double *) cur; cur += (size_t) n * sizeof(double);
-    double *phi_un = (double *) cur; cur += (size_t) n * sizeof(double);
     double *dp_y   = (double *) cur; cur += (size_t) n * sizeof(double);
     double *dp_c1  = (double *) cur; cur += (size_t) n * sizeof(double);
     double *dp_c2  = (double *) cur; cur += (size_t) n * sizeof(double);
     double *dp_c3  = (double *) cur; cur += (size_t) n * sizeof(double);
     double *wsp    = (double *) cur; cur += (size_t) 8 * nch * n * sizeof(double);
+    // union: node-stage scratch, then (after the splines) the coarse cache
+    double *Kv     = (double *) cur;
+    cmplx  *tdi_cp = (cmplx *) cur;  cur += (size_t) nch * n * sizeof(cmplx);
+    double *phi_un = (double *) cur; cur += (size_t) n * sizeof(double);
     double *B_b    = (double *) cur; cur += (size_t) n * sizeof(double);
     double *pcr    = (double *) cur; cur += (size_t) 8 * n * sizeof(double);
     double *flip   = (double *) cur; cur += (size_t) n * sizeof(double);
     double *pjump  = (double *) cur; cur += (size_t) n * sizeof(double);
-    cmplx  *tdi_cp = (cmplx *) cur;  cur += (size_t) nch * n * sizeof(cmplx);
     int    *count  = (int *) cur;    cur += (size_t) n * sizeof(int);
     bool   *fix_c  = (bool *) cur;
     // channel c's Re spline: wsp + (8c + 0..3) n, Im spline: wsp + (8c + 4..7) n
@@ -7913,10 +7937,14 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
     // value (c, s, dc/df, ds/df) is a smooth function of time: read it once per
     // control point and interpolate at the pixels (4-point Lagrange). A layer
     // whose table support starts / ends inside the span keeps per-pixel reads.
-    // kmeta = {m_lo, n_lay (0 = coarse off for this row), flag[j]: 0 out, 1 in, 2 mixed}
-#define GBLK_KV(q, j, k) Kv[(((size_t) (q) * GB_LOOKUP_LMAX + (j)) * n) + (k)]
+    // kmeta = {m_lo, n_lay (0 = coarse off for this row), flag[j]: 0 out, 1 in, 2 mixed,
+    //          n_in[j]: control points inside the table support}
+    // Kv overlays the node-stage scratch: every thread is past the last spline fit
+    // (the sync above) before the first Kv write.
+#define GBLK_KV(q, j, k) Kv[(((size_t) (q) * cap + (j)) * n) + (k)]
     if (a.k_coarse)
     {
+        int *n_in = kmeta + 2 + GB_LOOKUP_LMAX;
         if (THREAD_ZERO)
         {
             double fmin = 1e300, fmax = -1e300;
@@ -7936,35 +7964,42 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
             if (m_hi > a.ind_max_f) m_hi = a.ind_max_f;
             const int n_lay = m_hi - m_lo + 1;
             kmeta[0] = m_lo;
-            kmeta[1] = (n_lay >= 1 && n_lay <= GB_LOOKUP_LMAX) ? n_lay : 0;
+            kmeta[1] = (n_lay >= 1 && n_lay <= cap) ? n_lay : 0;
+            for (int j = 0; j < GB_LOOKUP_LMAX; ++j) n_in[j] = 0;
         }
         CUDA_SYNC_THREADS;
         const int m_lo = kmeta[0], n_lay = kmeta[1];
-        for (int j = THREAD_START_X; j < n_lay; j += BLOCK_INCR_X)
+        // one (layer, control point) per thread: the whole block reads the table
+        for (int idx = THREAD_START_X; idx < n_lay * n; idx += BLOCK_INCR_X)
         {
+            const int j = idx / n, k = idx % n;
             const int m = m_lo + j;
-            int n_in = 0;
-            for (int k = 0; k < n; ++k)
+            const int sk = (k < n - 1) ? k : n - 2;
+            double v, d1, d2;
+            wdm_spline_derivs(dp_y, dp_c1, dp_c2, dp_c3, sk, t_cp[k] - t_cp[sk],
+                              &v, &d1, &d2);
+            const double f = d1 * inv2pi + f0, fdot = d2 * inv2pi;
+            const double f_norm = f - (double) m * a.layer_df;
+            double tc = 0.0, ts = 0.0, tdc = 0.0, tds = 0.0;
+            int td[4];
+            double wd[4];
+            if (fdot >= a.fdot_lo && fdot <= a.fdot_hi
+                && f_norm >= a.tab.f_lo && f_norm <= a.tab.f_hi
+                && wdm_table_fdot_axis(a.tab, fdot, td, wd)
+                && gb_lookup_table_cs_dcs(a.tab, td, wd, f_norm, &tc, &ts, &tdc, &tds))
             {
-                const int sk = (k < n - 1) ? k : n - 2;
-                double v, d1, d2;
-                wdm_spline_derivs(dp_y, dp_c1, dp_c2, dp_c3, sk, t_cp[k] - t_cp[sk],
-                                  &v, &d1, &d2);
-                const double f = d1 * inv2pi + f0, fdot = d2 * inv2pi;
-                const double f_norm = f - (double) m * a.layer_df;
-                double tc = 0.0, ts = 0.0, tdc = 0.0, tds = 0.0;
-                int td[4];
-                double wd[4];
-                if (fdot >= a.fdot_lo && fdot <= a.fdot_hi
-                    && f_norm >= a.tab.f_lo && f_norm <= a.tab.f_hi
-                    && wdm_table_fdot_axis(a.tab, fdot, td, wd)
-                    && gb_lookup_table_cs_dcs(a.tab, td, wd, f_norm, &tc, &ts, &tdc, &tds))
-                    ++n_in;
-                GBLK_KV(0, j, k) = tc;  GBLK_KV(1, j, k) = ts;
-                GBLK_KV(2, j, k) = tdc; GBLK_KV(3, j, k) = tds;
+#ifdef __CUDA_ARCH__
+                atomicAdd(&n_in[j], 1);
+#else
+                ++n_in[j];
+#endif
             }
-            kmeta[2 + j] = (n_in == 0) ? 0 : ((n_in == n) ? 1 : 2);
+            GBLK_KV(0, j, k) = tc;  GBLK_KV(1, j, k) = ts;
+            GBLK_KV(2, j, k) = tdc; GBLK_KV(3, j, k) = tds;
         }
+        CUDA_SYNC_THREADS;
+        for (int j = THREAD_START_X; j < n_lay; j += BLOCK_INCR_X)
+            kmeta[2 + j] = (n_in[j] == 0) ? 0 : ((n_in[j] == n) ? 1 : 2);
         CUDA_SYNC_THREADS;
     }
 
@@ -8168,7 +8203,7 @@ void GBComputationGroup::gb_lookup_get_ll_wrap(GBTDIonTheFly *tdi_on_fly, GBLook
     if (a.nparams > N_PARAMS_MAX)
         throw std::invalid_argument("[gb_lookup_get_ll_wrap] nparams > N_PARAMS_MAX.");
     if (a.num_bin <= 0) return;
-    const size_t shared_bytes = gb_lookup_shared_bytes(a.n_nodes, a.nchannels);
+    const size_t shared_bytes = gb_lookup_shared_bytes(a.n_nodes, a.nchannels, a.num_m_layers);
 
 #ifdef __CUDACC__
     GBTDIonTheFly *gb_host = new GBTDIonTheFly(
@@ -8188,6 +8223,21 @@ void GBComputationGroup::gb_lookup_get_ll_wrap(GBTDIonTheFly *tdi_on_fly, GBLook
     if (shared_bytes > 48 * 1024)
         cudaFuncSetAttribute(gb_lookup_get_ll_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shared_bytes);
+    if (getenv("GB_LOOKUP_VERBOSE") != nullptr)
+    {
+        int blocks_per_sm = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, gb_lookup_get_ll_kernel, NUM_THREADS_HERE, shared_bytes);
+        int nregs = 0;
+        cudaFuncAttributes attr;
+        if (cudaFuncGetAttributes(&attr, gb_lookup_get_ll_kernel) == cudaSuccess)
+            nregs = attr.numRegs;
+        printf("[gb lookup] n_nodes=%d  layer cap=%d  shared=%.1f KB  regs/thread=%d  "
+               "blocks/SM=%d  %s\n",
+               a.n_nodes, gb_lookup_lay_cap(a.num_m_layers), (double) shared_bytes / 1024.0,
+               nregs, blocks_per_sm, (a.fill_out != nullptr) ? "fill" : "score");
+        fflush(stdout);
+    }
     const int grid_x = (a.num_bin < 65535) ? a.num_bin : 65535;
     gb_lookup_get_ll_kernel<<<grid_x, NUM_THREADS_HERE, shared_bytes>>>(d_gb, a);
     cudaDeviceSynchronize();
