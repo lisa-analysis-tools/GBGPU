@@ -30,7 +30,7 @@ from gbgpu.gbcomps import GBWDMComputations
 from gbgpu.gbsignalhetcomputations import (GBSignalHetComputations, _c1_scale,
                                            _n_cp_kernel_arg, _window_dj)
 
-from .test_gb_lookup_kernel import _table
+from .test_gb_lookup_kernel import GPU, _table
 
 NF, DT, NT, EDGE = 180, 20.0, 720, 60
 V5_KNOBS = dict(v3_n_nodes=32, v4_knots=64, v4_band=16, v5=1)
@@ -179,6 +179,57 @@ class SighetLookupReferenceTest(unittest.TestCase):
                 self._scores(self._comp(table=False))
         _, _, b = self._scores(self._comp(table=False))
         self.assertEqual(b, "fd")
+
+
+@unittest.skipIf(GPU is None, "no CUDA backend (set SIGHET_GPU_TEST_BACKEND on the cluster)")
+class SighetLookupReferenceGpuTest(SighetLookupReferenceTest):
+    """GPU == CPU for the lookup-built carrier reference and the v5 scores on it."""
+
+    def test_gpu_matches_cpu(self):
+        import cupy as cp
+
+        wdm = self.wdm
+        g_wdm = WDMSettings(NF, NT, DT, t0=wdm.t0, min_freq=1e-4, max_freq=2.5e-2,
+                            min_time=EDGE * NF * DT, max_time=(NT - EDGE) * NF * DT,
+                            force_backend=GPU)
+        g_ch = GBWDMComputations(
+            g_wdm, t_ref=self.ch.t_ref, Nt_sub=256, n_pad=32, N_sparse=256, N_cp_sig=48,
+            N_cp_orbit=32, orbits=ESAOrbits(force_backend=GPU), tdi_config="2nd generation",
+            force_backend=GPU, d_d=0.0, tdi_type="XYZ")
+        g_ch.convert_to_ra_dec = False
+        g_comp = GBSignalHetComputations.for_band_engine(
+            g_ch, cp_repr="carrier", lookup_table=self.table, **V5_KNOBS)
+        comp = self._comp()
+        W = 9
+        w_lo = (np.floor(self.p[:, 1] / wdm.layer_df).astype(int)
+                - comp._g["ind_min_f"] - W // 2).astype(np.int32)
+        c0, c1 = comp._ref_lookup.make_carrier_reference(self.p, w_lo, W)
+        g0, g1 = g_comp._ref_lookup.make_carrier_reference(cp.asarray(self.p), cp.asarray(w_lo), W)
+        for name, a, b in (("c0", g0, c0), ("c1", g1, c1)):
+            np.testing.assert_allclose(cp.asnumpy(a), b, rtol=0,
+                                       atol=1e-10 * np.abs(c0).max(), err_msg=f"{name} GPU vs CPU")
+        h = self.holder
+
+        class _G:
+            linear_data_arr = [cp.asarray(h.linear_data_arr[0])]
+            linear_psd_arr = [cp.asarray(h.linear_psd_arr[0])]
+
+            def __len__(self):
+                return 1
+
+        di = np.arange(self.R, dtype=np.int32)
+        out = {}
+        for name, c, hold, xp in (("cpu", comp, h, np), ("gpu", g_comp, _G(), cp)):
+            with _Env(SIGHET_ANCHOR_CORRECT="0"):
+                c.setup_in_model(hold, xp.asarray(self.ref), xp.asarray(di))
+            try:
+                c.get_ll(xp.asarray(self.cand), data_index=xp.asarray(di))
+                out[name] = (cp.asnumpy(xp.asarray(c.last_d_h)), cp.asnumpy(xp.asarray(c.last_h_h)))
+            finally:
+                c.clear_in_model()
+        for k, a, b in zip(("d_h", "h_h"), out["gpu"], out["cpu"]):
+            np.testing.assert_allclose(a, b, rtol=1e-9, atol=1e-9 * np.abs(out["cpu"][1]).max(),
+                                       err_msg=f"{k} GPU vs CPU (lookup-built reference)")
 
 
 if __name__ == "__main__":
