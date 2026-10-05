@@ -244,7 +244,7 @@ def _collapsed_carrier_fold(res, c0_dense, invC, n_b_idx_local, stride, Nt_activ
     ``c0 (r + dr n_off) + c1 dr`` -- the envelope's slope ACROSS each wavelet's time
     support, which the carrier-only reference otherwise drops (largest mid-transition
     of the Meyer window, zero on its flat top). It folds into the same moments: A1
-    gains ``(Dre c1) @ S``; the q = 1 conj moments gain ``F0 = sum conj(c0) c1 n^0``
+    gains ``S(Dre c1)``; the q = 1 conj moments gain ``F0 = sum conj(c0) c1 n^0``
     (complex -- the kernel pairs them with ``2 sum conj(r) dr``, which equals the
     symmetric pair whenever the moment is real); q = 2 gains ``2 Re F1 + sum |c1|^2``;
     the non-conj q = 1 / q = 2 gain ``sum c0 c1`` / ``2 sum c0 c1 n + sum c1^2``.
@@ -269,9 +269,25 @@ def _collapsed_carrier_fold(res, c0_dense, invC, n_b_idx_local, stride, Nt_activ
     nb_loc = np.asarray(n_b_idx_local.get() if hasattr(n_b_idx_local, "get")
                         else n_b_idx_local)
     n_off = (np.arange(Nt_active) - nb_loc[bin_idx]).astype(float)
-    S_np = np.zeros((Nt_active, N_sparse_t))
-    S_np[np.arange(Nt_active), bin_idx] = 1.0
-    Sq = [xp.asarray(S_np * n_off[:, None] ** q) for q in range(3)]
+    # The bins are contiguous runs of ``stride`` pixels (the last one runs to
+    # Nt_active), so "sum over each bin of x n_off^q" is a reshape-sum: O(Nt). It
+    # used to be a dense (Nt, Ns) indicator matmul, O(Nt Ns) -- quadratic in the span
+    # (CPU, 16 refs: 103 ms / ref at 180 d, 1269 ms at 720 d) and the dominant setup
+    # cost once the reference comes from the lookup table.
+    head = (N_sparse_t - 1) * stride
+    if head > Nt_active:
+        raise ValueError(f"sparse grid ({N_sparse_t} bins of {stride}) overruns "
+                         f"Nt_active={Nt_active}")
+    nq = (None, xp.asarray(n_off), xp.asarray(n_off ** 2))
+
+    def S(x, q=0):
+        if q:
+            x = x * nq[q]
+        out = xp.empty(x.shape[:-1] + (N_sparse_t,), dtype=x.dtype)
+        out[..., :-1] = x[..., :head].reshape(x.shape[:-1] + (N_sparse_t - 1, stride)).sum(-1)
+        out[..., -1] = x[..., head:].sum(-1)
+        return out
+
     iC = xp.real(xp.asarray(invC))
     Dre = xp.einsum("kcmn,kcdmn->kdmn", xp.real(xp.asarray(res)), iC)
     c0_all = xp.asarray(c0_dense)
@@ -282,8 +298,8 @@ def _collapsed_carrier_fold(res, c0_dense, invC, n_b_idx_local, stride, Nt_activ
             "collapsed sig-het fold: the reference c0 differs across channels "
             "(the carrier-only reference must be channel-independent).")
     u, w = xp.real(c0)[:, None], xp.imag(c0)[:, None]
-    A0p = 2.0 * (((Dre * u) @ Sq[0]) + 1j * ((Dre * w) @ Sq[0]))
-    A1p = 2.0 * (((Dre * u) @ Sq[1]) + 1j * ((Dre * w) @ Sq[1]))
+    A0p = 2.0 * (S(Dre * u) + 1j * S(Dre * w))
+    A1p = 2.0 * (S(Dre * u, 1) + 1j * S(Dre * w, 1))
     if layout == "collapsed":
         b_ = iC[:, 0, 1]
         weights = (iC[:, 0, 0] - b_, b_)
@@ -295,23 +311,23 @@ def _collapsed_carrier_fold(res, c0_dense, invC, n_b_idx_local, stride, Nt_activ
     En = c0 * c0
 
     def mom(x):
-        return xp.stack([(x @ Sq[q]).astype(xp.complex128) for q in range(3)], axis=1)
+        return xp.stack([S(x, q).astype(xp.complex128) for q in range(3)], axis=1)
 
     Pc = [mom(E * wgt) for wgt in weights]       # conj moments per weight
     Pn = [mom(En * wgt) for wgt in weights]      # non-conj
     if c1_dense is not None:
         c1 = xp.asarray(c1_dense)[:, 0]
-        A1p = A1p + 2.0 * ((Dre * c1[:, None]) @ Sq[0])
+        A1p = A1p + 2.0 * S(Dre * c1[:, None])
         F = xp.conj(c0) * c1
         K = xp.abs(c1) ** 2
         G = c0 * c1
         L = c1 * c1
         for P, wgt in zip(Pc, weights):
-            P[:, 1] += (F * wgt) @ Sq[0]
-            P[:, 2] += 2.0 * xp.real((F * wgt) @ Sq[1]) + (K * wgt) @ Sq[0]
+            P[:, 1] += S(F * wgt)
+            P[:, 2] += 2.0 * xp.real(S(F * wgt, 1)) + S(K * wgt)
         for P, wgt in zip(Pn, weights):
-            P[:, 1] += (G * wgt) @ Sq[0]
-            P[:, 2] += 2.0 * ((G * wgt) @ Sq[1]) + (L * wgt) @ Sq[0]
+            P[:, 1] += S(G * wgt)
+            P[:, 2] += 2.0 * S(G * wgt, 1) + S(L * wgt)
     if layout == "collapsed":
         return (A0p, A1p, xp.ascontiguousarray(Pc[0]), xp.ascontiguousarray(Pc[1]),
                 xp.ascontiguousarray(Pn[0]), xp.ascontiguousarray(Pn[1]))
@@ -777,8 +793,16 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     def for_band_engine(cls, chunked_comp, *, nt_layer=64, n_sparse_fd=1024,
                         m_active_half_width=2, max_r=0.0, n_cp_build=-1,
                         v3_n_nodes=0, v4_knots=0, v4_band=0, v5=0,
-                        tukey_alpha=None, cp_repr=None):
+                        tukey_alpha=None, cp_repr=None, lookup_table=None,
+                        lookup_n_nodes=-1, lookup_k_coarse=True, anchor_engine=None):
         """Build a data-less engine-mode instance around ``chunked_comp``.
+
+        ``lookup_table`` (a ``WDMLookupTable`` or a path, built at the grid's layer
+        duration): build the v5 CARRIER reference from the table instead of the FD
+        transform (see :meth:`attach_lookup_reference`); ``lookup_n_nodes`` /
+        ``lookup_k_coarse`` as in :class:`gbgpu.gblookupcomputations.GBLookupComputations`.
+        ``anchor_engine``: ``"chunked"`` / ``"lookup"`` for the carrier anchor offset (see
+        ``_update_anchor_offsets``); the env ``SIGHET_ANCHOR_ENGINE`` wins when set.
 
         ``max_r=0`` disables the kernel's heterodyne-ratio magnitude clip.
         The clip SILENTLY saturates every candidate whose amplitude ratio
@@ -1005,6 +1029,11 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         # Deltas are what the in-model repeats consume; keep the chunked
         # delegate's d_d convention so absolute ll values line up too.
         self.d_d = float(getattr(chunked_comp, "d_d", 0.0))
+        self._ref_lookup = None
+        self._anchor_engine = anchor_engine
+        if lookup_table is not None:
+            self.attach_lookup_reference(lookup_table, n_nodes=lookup_n_nodes,
+                                         k_coarse=lookup_k_coarse)
         self._in_model = None
         self._slot_to_ref = None
         self._slot_to_ref_xp = None
@@ -1112,6 +1141,39 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 f"active stash is COMPACT (W_slab={self._stash_W}). Only the "
                 "v5 scorer takes the windowed contract; set "
                 "GB_SIGHET_INMODEL_WINDOWED=0 to keep the expansion.")
+
+    def attach_lookup_reference(self, table, *, n_nodes=-1, k_coarse=True):
+        """Build the v5 CARRIER reference from a WDM lookup table.
+
+        The carrier-only reference is a unit envelope on the source's common phase:
+        exactly the chirping tone the table stores. So its complex WDM coefficients c0
+        are one table read per (pixel, layer) at the reference's carrier, and the packet
+        first moment c1 is the same B-spline's f-derivative (the lookup scorer's K1
+        read) -- no FD build, FFT or polyphase transform (measured against
+        ``gb_signal_het_make_reference_carrier``: c0 to ~1e-6 relative, c1 to <= 3e-5 of
+        |c0|, the table's own accuracy). The stash fold, the scorer and the anchor are
+        unchanged. ``SIGHET_REF_BUILD``: ``auto`` (default: the lookup when a table is
+        attached), ``fd`` (force the FD transform), ``lookup`` (require the table).
+        Carrier-fold layouts only (sym / collapsed); the ``full`` layout keeps the FD
+        build.
+        """
+        from .gblookupcomputations import GBLookupComputations
+
+        self._ref_lookup = GBLookupComputations(self.chunked, table, n_nodes=n_nodes,
+                                                k_coarse=k_coarse)
+        return self._ref_lookup
+
+    def _ref_build_is_lookup(self, carrier_fold):
+        knob = os.environ.get("SIGHET_REF_BUILD", "auto").lower()
+        if knob not in ("auto", "fd", "lookup"):
+            raise ValueError(f"SIGHET_REF_BUILD={knob!r}: auto, fd or lookup.")
+        lk = getattr(self, "_ref_lookup", None)
+        if knob == "lookup" and (lk is None or not carrier_fold):
+            raise RuntimeError(
+                "SIGHET_REF_BUILD=lookup needs an attached lookup table "
+                "(attach_lookup_reference / for_band_engine(lookup_table=...)) and a "
+                "carrier-fold stash layout.")
+        return knob != "fd" and lk is not None and carrier_fold
 
     def setup_in_model(self, buffer_aca, params_ref_phys, data_index,
                        N_vals=None) -> bool:
@@ -1356,7 +1418,19 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         _cp_code = _n_cp_kernel_arg(
             g, allow_carrier=bool(g.get("v4_knots", 0)) and bool(int(g.get("v5", 0))))
 
+        ref_lookup = self._ref_build_is_lookup(carrier_fold)
+        self._stash_ref_build = "lookup" if ref_lookup else "fd"
+
         def _make_ref(sparse_out, dense_out, c1_out, s0, k0):
+            if ref_lookup:
+                # c0 / c1 straight from the table (c1 already in _c1_scale units);
+                # the sparse c0 is the dense one at the sparse pixels
+                self._ref_lookup.make_carrier_reference(
+                    refs[s0:s0 + k0], w_lo_dev[s0:s0 + k0], W,
+                    c0_dense=dense_out.reshape(k0, W, g["Nt_active"]),
+                    c1_dense=c1_out.reshape(k0, W, g["Nt_active"]))
+                sparse_out[...] = dense_out[..., self.n_sparse_local]
+                return
             args = (self.n_sparse_local,
                     xp.ascontiguousarray(w_lo_dev[s0:s0 + k0]),
                     xp.ascontiguousarray(refs[s0:s0 + k0]), k0, 9, 1, 2,
@@ -1392,7 +1466,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                           if carrier_fold else None)
             _make_ref(c0_sparse_chunk, c0_dense_w, c1_dense_w, s, k)
             c0_sparse_w[s:s + k] = c0_sparse_chunk      # broadcasts a 1-channel build
-            if use_c1:
+            if use_c1 and not ref_lookup:
                 c1_dense_w *= _c1_scale(g["Nt"])
             if carrier_fold:
                 folds.append(_collapsed_carrier_fold(
@@ -1592,8 +1666,22 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         P = self.params_ref_all[ri]
         ll_sig = xp.asarray(self.get_ll(P, data_index=ri), dtype=float).ravel()
         sl = xp.asarray(np.asarray(slots, dtype=np.int64))
-        ll_ex = xp.asarray(self.chunked.get_ll_wdm(P, buffer_aca, data_index=sl,
-                                                   noise_index=sl), dtype=float).ravel()
+        # SIGHET_ANCHOR_ENGINE (else the engine's anchor_engine): chunked (default) or
+        # lookup -- the attached lookup
+        # scorer, ~10x cheaper than chunked per reference, exact to the table
+        # (h_h ~1e-7 relative): once the reference itself comes from the table the
+        # chunked anchor is the largest remaining setup cost
+        a_eng = (os.environ.get("SIGHET_ANCHOR_ENGINE")
+                 or getattr(self, "_anchor_engine", None) or "chunked").lower()
+        if a_eng not in ("chunked", "lookup"):
+            raise ValueError(f"SIGHET_ANCHOR_ENGINE={a_eng!r}: chunked or lookup.")
+        if a_eng == "lookup" and getattr(self, "_ref_lookup", None) is None:
+            raise RuntimeError("SIGHET_ANCHOR_ENGINE=lookup needs an attached lookup table.")
+        exact = self._ref_lookup if a_eng == "lookup" else self.chunked
+        if a_eng == "lookup":
+            exact.d_d = self.d_d          # same -d_d / 2 as ll_sig: it cancels exactly
+        ll_ex = xp.asarray(exact.get_ll_wdm(P, buffer_aca, data_index=sl,
+                                            noise_index=sl), dtype=float).ravel()
         n_ref = int(self.params_ref_all.shape[0])
         if self._anchor_off is None or int(self._anchor_off.shape[0]) != n_ref:
             self._anchor_off = xp.zeros(n_ref, dtype=float)

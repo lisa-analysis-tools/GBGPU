@@ -7865,6 +7865,8 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
     const int n   = a.n_nodes;
     const int nch = a.nchannels;
     const int cap = gb_lookup_lay_cap(a.num_m_layers);
+    // carrier-reference mode: unit envelope -> no per-channel envelope splines
+    const bool cref = (a.cref_dense != nullptr);
     char *cur = (char *) shared_mem;
     double *params_here = (double *) cur; cur += N_PARAMS_MAX * sizeof(double);
     int    *kmeta  = (int *) cur;    cur += (size_t) (2 + 2 * GB_LOOKUP_LMAX) * sizeof(int);
@@ -7904,7 +7906,7 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
     wdm_fit_cubic_spline(t_cp, dp_y, dp_c1, dp_c2, dp_c3, B_b, pcr, n,
                          CUBIC_SPLINE_LINEAR_SPACING);
     CUDA_SYNC_THREADS;
-    for (int c = 0; c < nch; ++c)
+    for (int c = 0; c < (cref ? 0 : nch); ++c)
     {
         double *re_y = GBLK_SPL(c, 0), *im_y = GBLK_SPL(c, 4);
         // signed amplitude + phase relative to the UN-heterodyned phi_ref (the
@@ -8013,10 +8015,12 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
     const size_t plane_d = (size_t) a.W_slab * a.Nt_active;
     const size_t plane_c = (size_t) a.W_invC * a.Nt_active;
     const bool fill = (a.fill_out != nullptr);
-    const double *Dbase = fill ? nullptr : a.data + (size_t) d_slot * nch * plane_d;
-    const double *Cbase = fill ? nullptr
-                               : a.invC + (size_t) (mirror ? a.invC_row[n_slot] : n_slot)
-                                          * nch * nch * plane_c;
+    const bool no_score = fill || cref;
+    const double *Dbase = no_score ? nullptr : a.data + (size_t) d_slot * nch * plane_d;
+    const double *Cbase = no_score ? nullptr
+                                   : a.invC + (size_t) (mirror ? a.invC_row[n_slot] : n_slot)
+                                              * nch * nch * plane_c;
+    const int ref_lo = cref ? a.ind_min_f + a.ref_w_lo[bin_i] : 0;
     double *Fbase = fill ? a.fill_out + (size_t) d_slot * nch * plane_d : nullptr;
     const double fac = fill ? a.factors[bin_i] : 0.0;
     const bool coarse = a.k_coarse && kmeta[1] > 0;
@@ -8057,7 +8061,7 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
         const double phi = dpv + 2.0 * M_PI * (ft - floor(ft));
         const double cphi = cos(phi), sphi = sin(phi);
         double Wr[3], Wi[3], Vr[3], Vi[3];
-        for (int c = 0; c < nch; ++c)
+        for (int c = 0; c < (cref ? 0 : nch); ++c)
         {
             double rv, r1, r2, iv, i1, i2;
             wdm_spline_derivs(GBLK_SPL(c, 0), GBLK_SPL(c, 1), GBLK_SPL(c, 2), GBLK_SPL(c, 3),
@@ -8077,7 +8081,8 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
             if (m < a.ind_min_f || m > a.ind_max_f) continue;
             const int ml_d = m - d_lo, ml_c = m - n_lo;
             if (ml_d < 0 || ml_d >= a.W_slab) continue;
-            if (!fill && (ml_c < 0 || ml_c >= a.W_invC)) continue;
+            if (!no_score && (ml_c < 0 || ml_c >= a.W_invC)) continue;
+            if (cref && (m < ref_lo || m >= ref_lo + a.W_ref)) continue;
             const double f_norm = f_ref - (double) m * a.layer_df;
             double tc, ts, tdc, tds;
             const int jl = coarse ? m - kmeta[0] : -1;
@@ -8106,6 +8111,18 @@ static void gb_lookup_score_one_source(const GBLookupArgs &a, GBTDIonTheFly *tof
             const bool odd = ((m + n_abs) & 1) != 0;
             const double cc = odd ? ts : tc, ss = odd ? -tc : ts;
             const double dcc = odd ? tds : tdc, dss = odd ? -tdc : tds;
+            if (cref)
+            {
+                // c0 = (cc + i ss) e^{i phi}: h = Re(c0 W) is the scorer's rule with
+                // W = e^{i phi}; c1 = -i / (2 pi layer_dt) (dcc + i dss) e^{i phi} is the
+                // K1 term with V = -i wdot e^{i phi}, dr = wdot layer_dt per pixel.
+                const cmplx eph(cphi, sphi);
+                const size_t o = ((size_t) bin_i * a.W_ref + (m - ref_lo)) * a.Nt_active + nl;
+                a.cref_dense[o] = cmplx(cc, ss) * eph;
+                if (a.cref_c1 != nullptr)
+                    a.cref_c1[o] = cmplx(0.0, -inv2pi / a.layer_dt) * cmplx(dcc, dss) * eph;
+                continue;
+            }
             double h[3], hq[3], D[3];
             for (int c = 0; c < nch; ++c)
             {
@@ -8235,7 +8252,8 @@ void GBComputationGroup::gb_lookup_get_ll_wrap(GBTDIonTheFly *tdi_on_fly, GBLook
         printf("[gb lookup] n_nodes=%d  layer cap=%d  shared=%.1f KB  regs/thread=%d  "
                "blocks/SM=%d  %s\n",
                a.n_nodes, gb_lookup_lay_cap(a.num_m_layers), (double) shared_bytes / 1024.0,
-               nregs, blocks_per_sm, (a.fill_out != nullptr) ? "fill" : "score");
+               nregs, blocks_per_sm,
+               (a.cref_dense != nullptr) ? "carrier-ref" : (a.fill_out != nullptr) ? "fill" : "score");
         fflush(stdout);
     }
     const int grid_x = (a.num_bin < 65535) ? a.num_bin : 65535;

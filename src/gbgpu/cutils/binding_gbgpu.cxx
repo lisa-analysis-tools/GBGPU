@@ -1230,6 +1230,7 @@ void GBComputationGroupWrap::gb_lookup_get_ll(
     a.tab.ref_odd = ref_odd;
     a.fdot_lo = fdot_lo; a.fdot_hi = fdot_hi;
     a.fill_out = nullptr; a.factors = nullptr;
+    a.cref_dense = nullptr; a.cref_c1 = nullptr; a.ref_w_lo = nullptr; a.W_ref = 0;
     gb_lookup_get_ll_wrap(tdi_wrap->waveform, a);
 }
 
@@ -1265,6 +1266,52 @@ void GBComputationGroupWrap::gb_lookup_fill(
     a.ind_min_t = ind_min_t; a.Nt_active = Nt_active;
     a.ind_min_f = ind_min_f; a.ind_max_f = ind_max_f;
     a.num_m_layers = num_m_layers; a.k1 = k1; a.k_coarse = k_coarse;
+    a.tab.coeff_c = return_pointer_and_check_length(coeff_c, "coeff_c", FF, FD);
+    a.tab.coeff_s = return_pointer_and_check_length(coeff_s, "coeff_s", FF, FD);
+    a.tab.FD = FD; a.tab.FF = FF; a.tab.fdot0 = fdot0; a.tab.dfdot = dfdot;
+    a.tab.f0 = f0; a.tab.df = df; a.tab.f_lo = f_lo; a.tab.f_hi = f_hi;
+    a.tab.ref_odd = ref_odd;
+    a.fdot_lo = fdot_lo; a.fdot_hi = fdot_hi;
+    a.cref_dense = nullptr; a.cref_c1 = nullptr; a.ref_w_lo = nullptr; a.W_ref = 0;
+    gb_lookup_get_ll_wrap(tdi_wrap->waveform, a);
+}
+
+void GBComputationGroupWrap::gb_lookup_carrier_ref(
+    GBTDIonTheFlyWrap *tdi_wrap,
+    array_type<std::complex<double>> c0_dense_out,
+    array_type<std::complex<double>> c1_dense_out,
+    array_type<double> params, array_type<int> ref_w_lo, int W_ref,
+    int num_bin, int nparams, int nchannels,
+    int n_nodes, double t_node0, double dt_node,
+    double t0, double layer_dt, double layer_df,
+    int ind_min_t, int Nt_active, int ind_min_f, int ind_max_f,
+    int num_m_layers, int k_coarse,
+    array_type<double> coeff_c, array_type<double> coeff_s,
+    int FD, int FF, double fdot0, double dfdot, double f0, double df,
+    double f_lo, double f_hi, int ref_odd, double fdot_lo, double fdot_hi)
+{
+    GBLookupArgs a;
+    a.d_h_out = nullptr; a.h_h_out = nullptr; a.d_h_im_out = nullptr;
+    a.fill_out = nullptr; a.factors = nullptr;
+    a.cref_dense = reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+        c0_dense_out, "c0_dense_out", (size_t) W_ref * Nt_active, num_bin));
+    a.cref_c1 = (c1_dense_out.size() > 0)
+        ? reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+              c1_dense_out, "c1_dense_out", (size_t) W_ref * Nt_active, num_bin))
+        : nullptr;
+    a.ref_w_lo = return_pointer_and_check_length(ref_w_lo, "ref_w_lo", num_bin, 1);
+    a.W_ref = W_ref;
+    a.params = return_pointer_and_check_length(params, "params", nparams, num_bin);
+    a.data_index = a.ref_w_lo;      // read but unused in this mode
+    a.noise_index = a.ref_w_lo;
+    a.data = nullptr; a.invC = nullptr; a.invC_row = nullptr; a.slab_lo = nullptr;
+    a.W_slab = ind_max_f - ind_min_f + 1; a.W_invC = a.W_slab;
+    a.num_bin = num_bin; a.nparams = nparams; a.nchannels = nchannels;
+    a.n_nodes = n_nodes; a.t_node0 = t_node0; a.dt_node = dt_node;
+    a.t0 = t0; a.layer_dt = layer_dt; a.layer_df = layer_df;
+    a.ind_min_t = ind_min_t; a.Nt_active = Nt_active;
+    a.ind_min_f = ind_min_f; a.ind_max_f = ind_max_f;
+    a.num_m_layers = num_m_layers; a.k1 = 0; a.k_coarse = k_coarse;
     a.tab.coeff_c = return_pointer_and_check_length(coeff_c, "coeff_c", FF, FD);
     a.tab.coeff_s = return_pointer_and_check_length(coeff_s, "coeff_s", FF, FD);
     a.tab.FD = FD; a.tab.FF = FF; a.tab.fdot0 = fdot0; a.tab.dfdot = dfdot;
@@ -1677,6 +1724,13 @@ void gbgpu_part(nb::module_ &m) {
          "GB lookup FILL: add factors[row] * (the lookup template of row) into fill_out "
          "(slab layout (n_slots, nch, W_slab, Nt_active), slot data_index[row]; slab_lo "
          "empty = full band). Atomic on the GPU (rows may share a slot).")
+    .def("gb_lookup_carrier_ref",
+         &GBComputationGroupWrap::gb_lookup_carrier_ref,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Sig-het v5 CARRIER REFERENCE from the lookup table: per row the unit-envelope "
+         "tone on the common phase, written as complex c0 (and the packet first moment "
+         "c1 when c1_dense_out is non-empty) into (num_bin, W_ref, Nt_active) windows at "
+         "the active-local origins ref_w_lo. The outputs must be zeroed by the caller.")
     .def("gb_signal_het_make_reference_carrier",
          &GBComputationGroupWrap::gb_signal_het_make_reference_carrier,
          nb::call_guard<nb::gil_scoped_release>(),

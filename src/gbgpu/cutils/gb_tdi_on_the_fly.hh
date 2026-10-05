@@ -82,6 +82,17 @@ struct GBLookupArgs {
     // data / invC / noise_index and the d_h / h_h outputs are then unused.
     double *fill_out;
     const double *factors;
+    // CARRIER-REFERENCE mode (cref_dense != nullptr): the sig-het v5 carrier-only
+    // reference -- a UNIT envelope on the row's common phase, exactly the tone the
+    // table stores -- written as complex c0 (the WDM transform of e^{i phi_ref}) and the
+    // packet first moment c1 (the table's f-derivative) per pixel into a W_ref-wide
+    // layer window at the absolute origin ind_min_f + ref_w_lo[row]; nothing is scored,
+    // data / invC are unused. Outputs (num_bin, W_ref, Nt_active), zeroed by the caller
+    // (only the num_m_layers band around the carrier is written).
+    cmplx *cref_dense;
+    cmplx *cref_c1;             // or nullptr
+    const int *ref_w_lo;        // (num_bin) active-local window origins
+    int W_ref;
 };
 
 // CPU/GPU class-name aliasing -- one rule, both layers.

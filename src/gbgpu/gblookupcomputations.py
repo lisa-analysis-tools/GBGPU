@@ -156,6 +156,42 @@ class GBLookupComputations(GBGPUParallelModule):
             self.ind_min_t, self.Nt_active, self.ind_min_f, self.ind_max_f,
             self.num_m_layers, int(self.k1), int(self.k_coarse), *self._tab)
 
+    def make_carrier_reference(self, params, w_lo, W, c0_dense=None, c1_dense=None,
+                               with_c1=True):
+        """The sig-het v5 CARRIER reference straight from the table.
+
+        The carrier-only reference is a unit envelope on the source's common phase --
+        exactly the chirping tone the table stores -- so c0 (its complex WDM transform)
+        is one table read per (pixel, layer) and the packet first moment c1 is the same
+        B-spline's f-derivative (the scorer's K1 read): no FD build, FFT or polyphase.
+
+        ``params`` (n, 9) ICRS; ``w_lo`` (n,) active-local window origins; ``W`` the
+        window width. Fills / returns ``c0_dense`` and ``c1_dense`` (n, W, Nt_active)
+        complex -- c1 already carries the ``_c1_scale`` normalization of the FD path.
+        Only the ``num_m_layers`` band around the carrier is written; the rest is zero.
+        """
+        xp = self.xp
+        x = xp.ascontiguousarray(xp.atleast_2d(xp.asarray(params, dtype=float)))
+        num_bin, nparams = x.shape
+        W = int(W)
+        shape = (num_bin, W, self.Nt_active)
+        if c0_dense is None:
+            c0_dense = xp.zeros(shape, dtype=xp.complex128)
+        if with_c1 and c1_dense is None:
+            c1_dense = xp.zeros(shape, dtype=xp.complex128)
+        if num_bin == 0:
+            return c0_dense, c1_dense
+        self.cpp.gb_lookup_carrier_ref(
+            self.tdi_wrap, c0_dense,
+            c1_dense if with_c1 else xp.zeros(0, dtype=xp.complex128),
+            x.reshape(-1), xp.ascontiguousarray(xp.asarray(w_lo, dtype=xp.int32)), W,
+            num_bin, nparams, 3,
+            self.n_nodes, self.t_node0, self.dt_node,
+            self.t0, self.layer_dt, self.layer_df,
+            self.ind_min_t, self.Nt_active, self.ind_min_f, self.ind_max_f,
+            self.num_m_layers, int(self.k_coarse), *self._tab)
+        return c0_dense, (c1_dense if with_c1 else None)
+
     def __getattr__(self, name):
         # delegate the rest of the computation-object surface to the chunked comp;
         # never for dunders / before __init__ set ``chunked`` (deepcopy / pickle)
