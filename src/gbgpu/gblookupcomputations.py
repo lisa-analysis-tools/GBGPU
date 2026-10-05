@@ -35,7 +35,11 @@ class GBLookupComputations(GBGPUParallelModule):
             backend, WDM grid, orbits, TDI configuration and ``t_ref`` are used.
         table: a ``lisatools.domains.WDMLookupTable`` (or a path to one) built at the
             grid's layer duration.
-        n_nodes: response control points per row over the active span.
+        n_nodes: response control points per row over the active span; <= 0 = AUTO, a
+            constant node spacing of ``GB_LOOKUP_NODE_SPACING_DAYS`` (default 2.8 d, i.e.
+            64 nodes at 6 months; never fewer than 64). A fixed count loses accuracy
+            with the span: at 540 d, 64 nodes left 1e-5 relative h_h error vs chunked,
+            192 nodes 3e-7 (the 6-month floor).
         num_m_layers: layers each side of the carrier layer (2 -> 5 layers).
         k1: include the amplitude-slope term.
         fill: ``fill_global_wdm`` writes the lookup template (``fill_lookup``) instead of
@@ -46,7 +50,7 @@ class GBLookupComputations(GBGPUParallelModule):
             table support starts or ends inside the span keeps per-pixel reads.
     """
 
-    def __init__(self, chunked_comp, table, *, n_nodes=64, num_m_layers=2, k1=True,
+    def __init__(self, chunked_comp, table, *, n_nodes=-1, num_m_layers=2, k1=True,
                  k_coarse=True, fill=False):
         flavor = chunked_comp.backend.name.split("_", 1)[1]
         GBGPUParallelModule.__init__(self, force_backend=flavor)
@@ -63,6 +67,12 @@ class GBLookupComputations(GBGPUParallelModule):
                              f"{wdm.layer_dt}")
         self.ev = WDMLookupEvaluator(table, interp="spline", force_backend=flavor)
         self.cpp = self.backend.GBComputationGroupWrap()
+        if int(n_nodes) <= 0:
+            import os
+
+            spacing = float(os.environ.get("GB_LOOKUP_NODE_SPACING_DAYS", "2.8")) * 86400.0
+            span = (int(wdm.Nt_active) + 1) * float(wdm.layer_dt)
+            n_nodes = max(64, int(np.ceil(span / spacing)) + 1)
         self.n_nodes = int(n_nodes)
         self.num_m_layers = int(num_m_layers)
         self.k1 = bool(k1)
@@ -224,7 +234,7 @@ class GBLookupWDMComputations(_gbwdm_base()):
     ``lookup_fill`` (default off: fills stay chunked-het).
     """
 
-    def __init__(self, *args, lookup_table, lookup_n_nodes=64, lookup_num_m_layers=2,
+    def __init__(self, *args, lookup_table, lookup_n_nodes=-1, lookup_num_m_layers=2,
                  lookup_k_coarse=True, lookup_fill=False, **kwargs):
         super().__init__(*args, **kwargs)
         self._lookup = GBLookupComputations(self, lookup_table, n_nodes=lookup_n_nodes,
