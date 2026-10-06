@@ -1175,6 +1175,41 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                 "carrier-fold stash layout.")
         return knob != "fd" and lk is not None and carrier_fold
 
+    #: SIGHET_SETUP_PROFILE=1: setup_in_model calls between summary log lines
+    _PROF_EVERY = 200
+
+    def _prof_tick(self, phase, n_refs=None):
+        """``SIGHET_SETUP_PROFILE=1``: device-synchronized wall time of each
+        setup_in_model phase (gather, checks, ref_build, fold, stash, anchor),
+        summed and logged as ms per call / per reference every ``_PROF_EVERY``
+        calls. ``phase=None`` starts a call. Off (no syncs, no cost) by default."""
+        if os.environ.get("SIGHET_SETUP_PROFILE", "0") != "1":
+            return
+        import time
+
+        if getattr(self.backend, "uses_cupy", False):
+            import cupy as _cp
+
+            _cp.cuda.Device().synchronize()
+        now = time.perf_counter()
+        prof = self.__dict__.setdefault(
+            "_setup_prof", dict(t=now, calls=0, refs=0, sums={}))
+        if phase is not None:
+            prof["sums"][phase] = prof["sums"].get(phase, 0.0) + (now - prof["t"])
+        prof["t"] = now
+        if n_refs is None:
+            return
+        prof["calls"] += 1
+        prof["refs"] += int(n_refs)
+        if prof["calls"] % self._PROF_EVERY == 0:
+            c, r = prof["calls"], max(prof["refs"], 1)
+            tot = sum(prof["sums"].values())
+            logger.info(
+                "[SIGHET_SETUP_PROFILE] %d calls / %d refs (ref build %s): %.2f ms/call = %s",
+                c, r, getattr(self, "_stash_ref_build", "fd"), 1e3 * tot / c,
+                "  ".join(f"{k} {1e3 * v / c:.2f}" for k, v in prof["sums"].items()))
+            prof.update(calls=0, refs=0, sums={})
+
     def setup_in_model(self, buffer_aca, params_ref_phys, data_index,
                        N_vals=None) -> bool:
         """Build (or patch) the per-source heterodyne references.
@@ -1200,6 +1235,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         tell an active sig-het setup from the no-op hooks (which return
         None)."""
         g = self._g
+        self._prof_tick(None)
         self._clamp_n_sparse_fd_for_device()
         # Stash layout FIRST: a misconfiguration (windowing forced onto a
         # scorer that cannot read it) must raise before the reference build,
@@ -1324,6 +1360,8 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                                ch[None, None, :, None],
                                layers[:, None, None, :], :]
 
+        self._prof_tick("gather")
+
         # Compact windowed c0 slabs -- ONE batched backend call. The kernel
         # takes the per-ref window origins as ``w_lo_arr`` (active-local,
         # added to ind_min_f per reference inside), writing each reference's
@@ -1392,6 +1430,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                     "in its channel pair; falling back to the full nch x nch stash "
                     "WITHOUT the second moment / c1 (the anchor correction applies).")
         carrier_fold = layout in ("collapsed", "sym")
+        self._prof_tick("checks")
         if self._in_model is not None and layout != self._stash_layout:
             raise RuntimeError(
                 "sig-het in-model patch would change the stash layout "
@@ -1468,6 +1507,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             c0_sparse_w[s:s + k] = c0_sparse_chunk      # broadcasts a 1-channel build
             if use_c1 and not ref_lookup:
                 c1_dense_w *= _c1_scale(g["Nt"])
+            self._prof_tick("ref_build")
             if carrier_fold:
                 folds.append(_collapsed_carrier_fold(
                     res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
@@ -1478,6 +1518,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
                     res_w[s:s + k], c0_dense_w, invC_w[s:s + k],
                     self.n_sparse_local, g["stride"], g["Nt_active"],
                     tdi_type="XYZ"))
+            self._prof_tick("fold")
         del c0_dense_buf, c0_dense_w
 
         # Row helper for the full-band stash expansion below. The scatters
@@ -1597,7 +1638,9 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             self.params_ref_all[ref_idx] = refs
             # THE window shift. Same row order as the coefficient scatters.
             self._stash_w_lo[xp.asarray(ref_idx)] = w_lo_stash
+            self._prof_tick("stash")
             self._update_anchor_offsets(buffer_aca, slots, ref_idx)
+            self._prof_tick("anchor", n_refs=n)
             return True
 
         # The coefficient stash is the per-block CACHE: built once here (on
@@ -1630,7 +1673,9 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         self._slot_to_ref_xp = xp.asarray(slot_map)
         self._in_model = True
         self._anchor_off = None
+        self._prof_tick("stash")
         self._update_anchor_offsets(buffer_aca, slots, np.arange(n))
+        self._prof_tick("anchor", n_refs=n)
         return True
 
     def _update_anchor_offsets(self, buffer_aca, slots, ref_idx):
@@ -1651,8 +1696,13 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         edge-on sources (first cluster GPU probe, 3 months: zero-data h_h ratio
         up to 1.0005 with the correction off); a data = source gate hides it
         (the anchor error is then second order, ~3e-4 lnL at SNR 100), real
-        residuals do not. On the GPU the correction is one batched chunked
-        scoring per reference block (0.1 s for 2048 references), so it stays on.
+        residuals do not. Cost: one batched scoring per setup call. With the chunked
+        delegate that is ~20 ms PER CALL at production block sizes (8-64
+        references; H100, 180 d: chunked 2.6 ms / row at 8 rows, 0.33 ms at 64 --
+        the "0.1 s per 2048 references" large-batch figure does not apply), which
+        is what grew the in-run setup (6mo jobs 717 -> 719, +12 s per propose).
+        ``SIGHET_ANCHOR_ENGINE=lookup`` scores the anchor with the lookup instead
+        (~15x cheaper per call).
         """
         g = self._g
         knob = os.environ.get("SIGHET_ANCHOR_CORRECT", "1").lower()
@@ -2224,6 +2274,17 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         from lisatools.info_matrix_ll import (
             infomat_knob, information_matrix_from_ll,
         )
+
+        # SIGHET_INFOMAT_ENGINE=lookup: the Fisher <dh|dh> (the chunked
+        # delegate's definition) from lookup fills + one contraction -- needs an
+        # attached lookup table, no in-model block.
+        if os.environ.get("SIGHET_INFOMAT_ENGINE", "").lower() == "lookup":
+            if getattr(self, "_ref_lookup", None) is None:
+                raise RuntimeError("SIGHET_INFOMAT_ENGINE=lookup needs an attached "
+                                   "lookup table (SIGHET_REF_BUILD=lookup).")
+            return self._ref_lookup.information_matrix(
+                params, wdm_holder, inds=inds, param_eps=param_eps,
+                noise_index=noise_index)
 
         # ``data_index`` here means BUFFER SLOT (get_ll_wdm maps it through
         # ``_slot_to_ref`` while an in-model reference is live), NOT the

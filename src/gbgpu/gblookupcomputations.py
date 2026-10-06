@@ -86,6 +86,7 @@ class GBLookupComputations(GBGPUParallelModule):
         Nobs = int(wdm.Nf) * int(wdm.Nt)
         self.layer_dt = float(wdm.layer_dt)
         self.layer_df = float(wdm.layer_df)
+        self.Tobs = Tobs
         self.t0 = t0
         self.ind_min_t = int(wdm.ind_min_t)
         self.Nt_active = int(wdm.Nt_active)
@@ -191,6 +192,64 @@ class GBLookupComputations(GBGPUParallelModule):
             self.ind_min_t, self.Nt_active, self.ind_min_f, self.ind_max_f,
             self.num_m_layers, int(self.k_coarse), *self._tab)
         return c0_dense, (c1_dense if with_c1 else None)
+
+    def information_matrix(self, params, wdm_holder, inds=None, param_eps=None,
+                           noise_index=None, max_bytes=256 * 2**20, **kwargs):
+        """Fisher matrix ``<dh_a | dh_b>`` from lookup templates -- the chunked
+        delegate's definition (``chunked_het.information_matrix``), built from
+        2 * len(inds) lookup FILLS per source (central differences) and ONE
+        contraction against the invC rows ``noise_index`` of ``wdm_holder`` (a
+        full-band ACA), instead of 4 swap launches per parameter pair. Same
+        normalization as ``get_ll_wdm`` (plain sums). ICRS params."""
+        xp = self.xp
+        p = xp.ascontiguousarray(xp.atleast_2d(xp.asarray(params, dtype=float)))
+        n, nparams = p.shape
+        inds = list(range(nparams)) if inds is None else [int(i) for i in np.asarray(
+            inds.get() if hasattr(inds, "get") else inds).ravel()]
+        nd = len(inds)
+        eps = np.asarray(self.chunked._info_matrix_param_eps(nparams, param_eps), dtype=float)
+        if param_eps is None and nparams > 2:
+            # f0 / fdot steps scaled to the observation: the chunked defaults (2e-14 Hz,
+            # 1e-21 Hz/s) move the phase by ~1e-7 / 1e-8 rad, where the lookup's
+            # interpolation noise dominates the difference (fdot-fdot came out 6x the
+            # exact-template Gram at 30 d). 1e-4 / Tobs^k is flat in k over 1e-2..1e-5.
+            eps[1] = 1e-4 / self.Tobs
+            eps[2] = 1e-4 / self.Tobs ** 2
+        Nt = self.Nt_active
+        W = 2 * self.num_m_layers + 4        # carrier layer(s) +- L, plus Doppler drift
+        f0 = np.asarray(p[:, 1].get() if hasattr(p, "get") else p[:, 1])
+        lo = np.clip(np.floor(f0 / self.layer_df).astype(int) - self.num_m_layers - 1,
+                     self.ind_min_f, self.ind_max_f - W + 1).astype(np.int32)
+        ni = np.zeros(n, dtype=np.int64) if noise_index is None else np.asarray(
+            noise_index.get() if hasattr(noise_index, "get") else noise_index).ravel()
+        iC_all = xp.asarray(wdm_holder.linear_psd_arr[0]).reshape(
+            -1, 3, 3, self.Nf_active, Nt)
+        out = xp.zeros((n, nd, nd))
+        per_src = 2 * nd * 3 * W * Nt * 8 + 9 * W * Nt * 8
+        chunk = max(1, int(max_bytes // per_src))
+        lay = np.arange(W)
+        for s0 in range(0, n, chunk):
+            k = min(chunk, n - s0)
+            ps = p[s0:s0 + k]
+            rows = []
+            for a, i in enumerate(inds):
+                for sgn in (1.0, -1.0):
+                    q = ps.copy()
+                    q[:, i] += sgn * eps[i]
+                    rows.append(q)
+            P = xp.concatenate(rows)                     # (2 nd k, 9): [a][sign][src]
+            nr = int(P.shape[0])
+            buf = xp.zeros(nr * 3 * W * Nt)
+            lo_r = np.tile(lo[s0:s0 + k], 2 * nd)
+            self.fill_lookup(P, buf, data_index=xp.arange(nr, dtype=xp.int32),
+                             factors=xp.ones(nr), band_slab_Nf=W, slab_min_f=lo_r)
+            F = buf.reshape(nd, 2, k, 3, W, Nt)
+            dh = (F[:, 0] - F[:, 1]) / xp.asarray(2.0 * eps[inds])[:, None, None, None, None]
+            ll = xp.asarray(lo[s0:s0 + k] - self.ind_min_f)
+            iC = iC_all[xp.asarray(ni[s0:s0 + k])[:, None],
+                        :, :, (ll[:, None] + xp.asarray(lay)[None, :]), :]   # (k, W, 3, 3, Nt)
+            out[s0:s0 + k] = xp.einsum("akcwt,kwcdt,bkdwt->kab", dh, iC, dh)
+        return out
 
     def __getattr__(self, name):
         # delegate the rest of the computation-object surface to the chunked comp;
