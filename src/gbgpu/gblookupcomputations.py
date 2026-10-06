@@ -207,7 +207,9 @@ class GBLookupComputations(GBGPUParallelModule):
         inds = list(range(nparams)) if inds is None else [int(i) for i in np.asarray(
             inds.get() if hasattr(inds, "get") else inds).ravel()]
         nd = len(inds)
-        eps = np.asarray(self.chunked._info_matrix_param_eps(nparams, param_eps), dtype=float)
+        eps = self.chunked._info_matrix_param_eps(nparams, param_eps)
+        # the chunked helper returns an xp (cupy on GPU) array; the steps are host math
+        eps = np.asarray(eps.get() if hasattr(eps, "get") else eps, dtype=float)
         if param_eps is None and nparams > 2:
             # f0 / fdot steps scaled to the observation: the chunked defaults (2e-14 Hz,
             # 1e-21 Hz/s) move the phase by ~1e-7 / 1e-8 rad, where the lookup's

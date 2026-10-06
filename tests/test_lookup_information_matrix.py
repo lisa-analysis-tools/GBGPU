@@ -89,6 +89,31 @@ class LookupInformationMatrixTest(unittest.TestCase):
                 self._comp(table=False).information_matrix(
                     self.ref, self.holder, inds=INDS, noise_index=di)
 
+    def test_device_array_steps_from_the_chunked_helper(self):
+        """On GPU ``_info_matrix_param_eps`` returns a cupy array, which
+        ``np.asarray`` refuses (job 735: the cache's first refresh died on it).
+        Stand-in: an array-like that only converts through ``.get()``."""
+
+        class _Dev:
+            def __init__(self, a):
+                self.a = a
+
+            def get(self):
+                return self.a
+
+            def __array__(self, *a, **k):
+                raise TypeError("Implicit conversion to a NumPy array is not allowed.")
+
+        comp = self._comp()
+        ch = comp._ref_lookup.chunked
+        orig = ch._info_matrix_param_eps
+        ch._info_matrix_param_eps = lambda n, pe: _Dev(np.asarray(orig(n, pe)))
+        try:
+            got = self._lookup(comp)
+        finally:
+            del ch._info_matrix_param_eps
+        np.testing.assert_allclose(got, self._lookup(), rtol=1e-12, atol=0)
+
     def test_NEGATIVE_CONTROL_a_wrong_noise_row_is_caught(self):
         """The comparison has teeth: scoring against a 2x invC must fail it."""
         ch = self._chunked()
