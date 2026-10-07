@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from copy import deepcopy
 
 import logging
@@ -1179,19 +1180,25 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     _PROF_EVERY = 200
 
     def _prof_tick(self, phase, n_refs=None):
-        """``SIGHET_SETUP_PROFILE=1``: device-synchronized wall time of each
-        setup_in_model phase (gather, checks, ref_build, fold, stash, anchor),
-        summed and logged as ms per call / per reference every ``_PROF_EVERY``
-        calls. ``phase=None`` starts a call. Off (no syncs, no cost) by default."""
+        """Phase timer of :meth:`setup_in_model`, armed by ``SIGHET_SETUP_PROFILE=1``.
+
+        ``phase=None`` opens a call; every later tick charges the wall time since the
+        previous tick to ``phase`` (``gather``, ``checks``, ``ref_build``, ``fold``,
+        ``stash``, ``anchor``); the closing tick passes ``n_refs`` (references built or
+        patched by the call). Every ``_PROF_EVERY`` closed calls one INFO line logs the
+        mean ms per call per phase, the total ms per call and per reference, and the
+        reference build (``fd`` / ``lookup``, i.e. ``SIGHET_REF_BUILD``), then the sums
+        reset. On a cupy backend each tick synchronizes the device first so a phase
+        is charged its kernels. Off by default: one env read per tick, no sync, no state.
+        """
         if os.environ.get("SIGHET_SETUP_PROFILE", "0") != "1":
             return
-        import time
-
         if getattr(self.backend, "uses_cupy", False):
             import cupy as _cp
 
             _cp.cuda.Device().synchronize()
         now = time.perf_counter()
+        # created lazily: for_band_engine builds instances without __init__
         prof = self.__dict__.setdefault(
             "_setup_prof", dict(t=now, calls=0, refs=0, sums={}))
         if phase is not None:
@@ -1205,8 +1212,10 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
             c, r = prof["calls"], max(prof["refs"], 1)
             tot = sum(prof["sums"].values())
             logger.info(
-                "[SIGHET_SETUP_PROFILE] %d calls / %d refs (ref build %s): %.2f ms/call = %s",
-                c, r, getattr(self, "_stash_ref_build", "fd"), 1e3 * tot / c,
+                "[SIGHET_SETUP_PROFILE] %d calls / %d refs (ref build %s): %.2f ms/call, "
+                "%.3f ms/ref = %s",
+                c, prof["refs"], getattr(self, "_stash_ref_build", "fd"), 1e3 * tot / c,
+                1e3 * tot / r,
                 "  ".join(f"{k} {1e3 * v / c:.2f}" for k, v in prof["sums"].items()))
             prof.update(calls=0, refs=0, sums={})
 
@@ -2254,37 +2263,63 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
     def hessian_wdm(self, *args, **kwargs):
         return self.chunked.hessian_wdm(*args, **kwargs)
 
+    #: ``SIGHET_INFOMAT_ENGINE`` values: unset / empty / ``default`` (the routes below)
+    #: or ``lookup``.
+    _INFOMAT_ENGINES = ("", "default", "lookup")
+
     def information_matrix(self, params, wdm_holder, inds=None, param_eps=None,
                            noise_index=None, data_index=None, **kwargs):
-        """Information matrix; sig-het second-difference path when armed.
+        """Per-source information matrix in raw physical parameters; three routes.
 
-        ``SIGHET_INFOMAT=1`` routes to
-        :func:`lisatools.info_matrix_ll.information_matrix_from_ll`, driven by
-        THIS object's in-model scorer -- so every evaluation reuses the block
-        reference ``setup_in_model`` already built and costs one fast candidate
-        score instead of a chunked-het swap launch. Requires an active in-model
-        block (``_in_model``); otherwise, and whenever the knob is off, falls
-        through to the validated chunked delegate.
+        1. ``SIGHET_INFOMAT_ENGINE=lookup``: the lookup Fisher / Gram matrix
+           ``<dh_a|dh_b>`` (:meth:`gbgpu.gblookupcomputations.GBLookupComputations.
+           information_matrix`: 2 lookup fills per parameter per source, Tobs-scaled
+           steps, ~1e-4 of the exact-template Gram). Reference-free: no in-model block
+           is needed and ``data_index`` is ignored, so it also serves slot-less callers
+           (LAT ``GB_CHOL_CACHE`` refreshes every alive source in one batch). Needs the
+           attached lookup table (``for_band_engine(lookup_table=...)`` /
+           :meth:`attach_lookup_reference`; in the LAT fit, ``SIGHET_REF_BUILD=lookup``)
+           and raises without it. ``kwargs`` are forwarded (the chunked swap knobs are
+           ignored there, ``convert_to_ra_dec=True`` is refused).
+        2. ``SIGHET_INFOMAT=1`` with an active in-model block and explicit
+           ``data_index`` (the per-source BUFFER SLOTS): second differences of THIS
+           object's in-model ln L
+           (:func:`lisatools.info_matrix_ll.information_matrix_from_ll`), reusing the
+           block reference ``setup_in_model`` built -- one fast candidate score per
+           evaluation instead of a chunked swap launch. Cost target: per 120-source
+           block, ~163 evaluations / source at sig-het speed is ~0.3 s against ~2.3 s
+           of repeats (~13 %); the chunked route is ~5.6 s (~250 %).
+        3. Otherwise the chunked delegate's swap-kernel Gram matrix.
 
-        Cost target: the point is to amortize against the block's repeats.
-        Per 120-source block, ~163 evaluations/source at sig-het speed is
-        ~0.3 s against ~2.3 s of repeats (~13%); the chunked path is ~5.6 s
-        (~250%).
+        Routes 2 and 3 default to the chunked delegate's step table (amp 1e-25,
+        f0 2e-14 Hz, fdot 1e-21 Hz/s, fddot 1e-28, angles 1e-6 rad; route 2 times
+        ``SIGHET_INFOMAT_EPS_SCALE``). Those f0 / fdot steps move the phase by only
+        ~2e-8..2e-6 rad over 30 d - 6 months, and the differences are noise-dominated
+        (measured on the ``tests/test_lookup_information_matrix.py`` fixture against
+        the exact-template Gram: route 3 fdot-fdot diagonal 19x / negative at 30 d,
+        0.94-1.22x at 6 months; route 2 f0 and fdot diagonals negative at 30 d - 6
+        months, and with its 1e-6 rad angle steps the phi0 / lam / beta diagonals too
+        at 6 months). Route 1 does not use that table; for routes 2 / 3 pass
+        ``param_eps`` (e.g. ``GBLookupComputations.info_matrix_param_eps()``, 2.5e-3 of
+        the exact Gram on route 2 at 6 months).
         """
         from lisatools.info_matrix_ll import (
             infomat_knob, information_matrix_from_ll,
         )
 
-        # SIGHET_INFOMAT_ENGINE=lookup: the Fisher <dh|dh> (the chunked
-        # delegate's definition) from lookup fills + one contraction -- needs an
-        # attached lookup table, no in-model block.
-        if os.environ.get("SIGHET_INFOMAT_ENGINE", "").lower() == "lookup":
+        engine = os.environ.get("SIGHET_INFOMAT_ENGINE", "").strip().lower()
+        if engine not in self._INFOMAT_ENGINES:
+            raise ValueError(f"SIGHET_INFOMAT_ENGINE={engine!r}: unset / 'default' or "
+                             "'lookup'.")
+        if engine == "lookup":
             if getattr(self, "_ref_lookup", None) is None:
-                raise RuntimeError("SIGHET_INFOMAT_ENGINE=lookup needs an attached "
-                                   "lookup table (SIGHET_REF_BUILD=lookup).")
+                raise RuntimeError(
+                    "SIGHET_INFOMAT_ENGINE=lookup needs an attached lookup table "
+                    "(for_band_engine(lookup_table=...) / attach_lookup_reference; in the "
+                    "LAT fit SIGHET_REF_BUILD=lookup attaches it).")
             return self._ref_lookup.information_matrix(
                 params, wdm_holder, inds=inds, param_eps=param_eps,
-                noise_index=noise_index)
+                noise_index=noise_index, **kwargs)
 
         # ``data_index`` here means BUFFER SLOT (get_ll_wdm maps it through
         # ``_slot_to_ref`` while an in-model reference is live), NOT the

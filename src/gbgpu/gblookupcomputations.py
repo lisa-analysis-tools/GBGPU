@@ -16,15 +16,26 @@ design notes: LAT ``scripts/gb/gb_lookup_scorer.py``.
 The table must be built at the run's layer duration (the GB recipe:
 ``scripts/gb/_gb_testbox.py::GB_TABLE_RECIPE``, a 128-layer build record and a
 narrow fdot axis -- the shared 32-layer EMRI table carries a ~2e-5 norm bias).
+
+The same fill also gives the reference-free Fisher / Gram information matrix
+(:meth:`GBLookupComputations.information_matrix`, the sig-het
+``SIGHET_INFOMAT_ENGINE=lookup`` route and LAT's ``GB_CHOL_CACHE`` factors).
 """
 
 from __future__ import annotations
+
+import os
 
 import numpy as np
 
 from lisatools.response.tdionfly import GBTDIonTheFly
 
 from .parallelbase import GBGPUParallelModule
+
+
+def _host(a):
+    """``a`` on the host: cupy arrays through ``.get()`` (``np.asarray`` refuses them)."""
+    return a.get() if hasattr(a, "get") else a
 
 
 class GBLookupComputations(GBGPUParallelModule):
@@ -68,8 +79,6 @@ class GBLookupComputations(GBGPUParallelModule):
         self.ev = WDMLookupEvaluator(table, interp="spline", force_backend=flavor)
         self.cpp = self.backend.GBComputationGroupWrap()
         if int(n_nodes) <= 0:
-            import os
-
             spacing = float(os.environ.get("GB_LOOKUP_NODE_SPACING_DAYS", "2.8")) * 86400.0
             span = (int(wdm.Nt_active) + 1) * float(wdm.layer_dt)
             n_nodes = max(64, int(np.ceil(span / spacing)) + 1)
@@ -86,7 +95,7 @@ class GBLookupComputations(GBGPUParallelModule):
         Nobs = int(wdm.Nf) * int(wdm.Nt)
         self.layer_dt = float(wdm.layer_dt)
         self.layer_df = float(wdm.layer_df)
-        self.Tobs = Tobs
+        self.Tobs = Tobs            # (s) scales the information-matrix phase-coefficient steps
         self.t0 = t0
         self.ind_min_t = int(wdm.ind_min_t)
         self.Nt_active = int(wdm.Nt_active)
@@ -193,64 +202,194 @@ class GBLookupComputations(GBGPUParallelModule):
             self.num_m_layers, int(self.k_coarse), *self._tab)
         return c0_dense, (c1_dense if with_c1 else None)
 
+    # ---- information matrix ----------------------------------------------------------
+    #: Phase (rad) every default non-amplitude step of :meth:`information_matrix` moves the
+    #: template by: the angles step by it, the phase coefficients f0 / fdot / fddot by
+    #: ``INFOMAT_PHASE_STEP / Tobs**k``. See :meth:`info_matrix_param_eps`.
+    INFOMAT_PHASE_STEP = 1e-4
+    #: Default amplitude step (strain). The template is linear in the amplitude, so the
+    #: central difference is exact at any step (the chunked delegate's table value).
+    INFOMAT_AMP_STEP = 1e-25
+
+    def info_matrix_param_eps(self):
+        """Default central-difference steps of :meth:`information_matrix` (host, ``(9,)``).
+
+        Order ``(amp, f0, fdot, fddot, phi0, inc, psi, lam, beta)``; with
+        ``s = INFOMAT_PHASE_STEP`` (1e-4) and ``T = Tobs``::
+
+            (1e-25, s / T, s / T**2, s / T**3, s, s, s, s, s)
+
+        Every non-amplitude step moves the template by O(s) over the observation (f0:
+        phase up to ``2 pi s``; fdot: up to ``pi s``; inc / psi / phi0 through the
+        polarization factors; lam / beta through the Doppler phase, up to ``2 pi f0
+        AU/c`` ~ 80 s at 25 mHz). Why the phase coefficients scale with ``Tobs``: a FIXED
+        step moves the phase by ``2 pi df T`` / ``pi dfdot T^2`` / ``pi dfddot T^3 / 3``,
+        so the chunked delegate's table (``2e-14`` Hz, ``1e-21`` Hz/s, ``1e-28`` Hz/s^2,
+        ``1e-6`` rad angles) is a ~1e-9..2e-6 rad phase step at 30 d - 6 months, where
+        the lookup's interpolation noise dominates the template difference.
+
+        Measured against the exact-template Gram (central differences of the chunked
+        fill, converged to 8e-5 between steps 1e-3 and 1e-4;
+        ``tests/test_lookup_information_matrix.py`` fixture, SNR 300, worst element
+        ``|dG_ab| / sqrt(G_aa G_bb)``): ``s`` = 1e-3 / 1e-4 -> 8e-5 / 7e-5 at 30 d and
+        1.2e-4 at 6 months; ``s`` = 1e-5 -> 1e-3; ``s`` = 1e-2 -> 8e-3 (truncation in
+        lam / beta). The chunked table gives 5 at 30 d (fdot-fdot 6x) and 0.27 at 6
+        months; its fddot step is off by ~6e2 at 30 d; with only f0 / fdot rescaled
+        (the first version of this matrix) the 1e-6 rad angle steps left 7.5e-3 at
+        30 d and 2.9e-2 at 6 months.
+        """
+        s, T = float(self.INFOMAT_PHASE_STEP), float(self.Tobs)
+        return np.array([self.INFOMAT_AMP_STEP, s / T, s / T**2, s / T**3, s, s, s, s, s])
+
+    def _info_matrix_steps(self, nparams, param_eps):
+        """Host float64 ``(nparams,)`` step table: ``param_eps`` (numpy or a device
+        array, converted through ``.get()``) or :meth:`info_matrix_param_eps`."""
+        if param_eps is None:
+            eps = self.info_matrix_param_eps()
+            if eps.size != nparams:
+                raise ValueError(f"information_matrix: default steps are for the "
+                                 f"{eps.size} GB parameters, params has {nparams} columns; "
+                                 "pass param_eps.")
+            return eps
+        eps = np.array(_host(param_eps), dtype=float).ravel()
+        if eps.size != nparams:
+            raise ValueError(f"param_eps length {eps.size} != nparams {nparams}")
+        return eps
+
     def information_matrix(self, params, wdm_holder, inds=None, param_eps=None,
                            noise_index=None, max_bytes=256 * 2**20, **kwargs):
-        """Fisher matrix ``<dh_a | dh_b>`` from lookup templates -- the chunked
-        delegate's definition (``chunked_het.information_matrix``), built from
-        2 * len(inds) lookup FILLS per source (central differences) and ONE
-        contraction against the invC rows ``noise_index`` of ``wdm_holder`` (a
-        full-band ACA), instead of 4 swap launches per parameter pair. Same
-        normalization as ``get_ll_wdm`` (plain sums). ICRS params."""
+        """Fisher (Gram) information matrix ``G_ab = <dh/dtheta_a | dh/dtheta_b>`` from
+        lookup templates, per source.
+
+        The inner product is :meth:`get_ll_wdm`'s (plain pixel sums against the XYZ
+        inverse covariance, no extra normalization):
+        ``<a|b> = sum_{c,d,m,n} a_c[m,n] invC_cd[m,n] b_d[m,n]``, so e.g.
+        ``G_AA * A**2 == h_h``. This is the chunked delegate's definition
+        (``WDMComputationsBase.information_matrix``) and, at the expansion point of a
+        residual that holds exactly the source, the curvature the ``SIGHET_INFOMAT``
+        route measures as second differences of ln L. The matrix is in the RAW
+        physical parameters and unregularized (it may be near-singular, e.g. the
+        amp / inc / psi / phi0 block of a short observation); LAT's
+        ``_compute_proposal_cholesky`` maps it to the sampling basis and floors it.
+
+        How: ``dh_a`` by central differences of the lookup template
+        (:meth:`fill_lookup`), two fills per parameter per source, each written into a
+        narrow per-source slab of ``W = 2 num_m_layers + 4`` layers starting
+        ``num_m_layers + 1`` below the carrier layer of ``f0`` (the fill's
+        ``num_m_layers`` band each side of the instantaneous carrier, with a layer of
+        drift margin below and two above; on the GB table grid the Doppler drift is
+        <= 1e-4 f0, ~0.02 layer at 25 mHz), then ONE contraction per batch against each
+        source's invC rows. No heterodyne reference, in-model block or buffer slot is
+        involved, so any set of sources can be done in one batch (the ``GB_CHOL_CACHE``
+        refresh builds every alive source at once). Cost: ``2 len(inds)`` lookup fills
+        per source, against 4 chunked swap launches per parameter PAIR on the chunked
+        route.
+
+        Steps: :meth:`info_matrix_param_eps` (Tobs-scaled phase coefficients, 1e-4 rad
+        angles; why and the measured accuracy there) unless ``param_eps`` is given.
+        Accuracy is the lookup template's: ~1e-4 of ``sqrt(G_aa G_bb)`` against the
+        exact-template Gram at 30 d - 6 months.
+
+        Device: the fills and the contraction run on this object's backend (numpy on
+        CPU, cupy on GPU) and the result stays there. ``params``, ``inds``,
+        ``param_eps`` and ``noise_index`` may be host or device arrays; the steps, slab
+        origins and invC rows are host bookkeeping (device arrays are read through
+        ``.get()``; ``np.asarray`` refuses a cupy array).
+
+        Args:
+            params: ``(n, 9)`` (or ``(9,)``) physical ICRS parameters ``(amp, f0 [Hz],
+                fdot [Hz/s], fddot [Hz/s^2], phi0, inc, psi, lam, beta)``, angles in rad,
+                ``lam`` / ``beta`` = ICRS right ascension / declination.
+            wdm_holder: the full-active-band holder (an ``AnalysisContainerArray``, or a
+                single ``AnalysisContainer``, wrapped as the chunked comp does) whose
+                ``linear_psd_arr[0]`` is ``(rows, 3, 3, Nf_active, Nt_active)`` XYZ invC.
+                A shared-psd mirror (``psd_row_index``) maps ``noise_index`` to its
+                rows; per-slot narrow invC slabs are refused.
+            inds: parameter columns to differentiate, in output order (default all).
+            param_eps: ``(nparams,)`` steps (host or device); default above.
+            noise_index: ``(n,)`` invC row (walker) per source; default row 0.
+            max_bytes: working-set budget per batch of sources (stepped fills,
+                derivatives and the gathered invC rows).
+            **kwargs: the chunked delegate's swap-kernel knobs (``grid_dim``,
+                ``m_band_half_width``, ...), accepted for signature parity and ignored;
+                ``convert_to_ra_dec=True`` is refused (ICRS only).
+
+        Returns:
+            ``(n, len(inds), len(inds))`` float64, symmetric, on the backend's device;
+            entry ``(a, b)`` in ``1 / (unit_a * unit_b)``.
+        """
+        if kwargs.get("convert_to_ra_dec"):
+            raise NotImplementedError("the lookup information matrix takes ICRS params")
         xp = self.xp
         p = xp.ascontiguousarray(xp.atleast_2d(xp.asarray(params, dtype=float)))
-        n, nparams = p.shape
-        inds = list(range(nparams)) if inds is None else [int(i) for i in np.asarray(
-            inds.get() if hasattr(inds, "get") else inds).ravel()]
+        n, nparams = int(p.shape[0]), int(p.shape[1])
+        inds = (list(range(nparams)) if inds is None
+                else [int(i) for i in np.asarray(_host(inds)).ravel()])
         nd = len(inds)
-        eps = self.chunked._info_matrix_param_eps(nparams, param_eps)
-        # the chunked helper returns an xp (cupy on GPU) array; the steps are host math
-        eps = np.asarray(eps.get() if hasattr(eps, "get") else eps, dtype=float)
-        if param_eps is None and nparams > 2:
-            # f0 / fdot steps scaled to the observation: the chunked defaults (2e-14 Hz,
-            # 1e-21 Hz/s) move the phase by ~1e-7 / 1e-8 rad, where the lookup's
-            # interpolation noise dominates the difference (fdot-fdot came out 6x the
-            # exact-template Gram at 30 d). 1e-4 / Tobs^k is flat in k over 1e-2..1e-5.
-            eps[1] = 1e-4 / self.Tobs
-            eps[2] = 1e-4 / self.Tobs ** 2
+        eps = self._info_matrix_steps(nparams, param_eps)
+        if not np.all(np.isfinite(eps[inds]) & (eps[inds] != 0.0)):
+            raise ValueError(f"information_matrix: non-finite or zero step in "
+                             f"{eps[inds]} (inds {inds})")
+
+        # invC rows: one per source, from the full active band of each walker's plane
+        holder = self._as_wdm_holder(wdm_holder)
+        rows_map = getattr(holder, "psd_row_index", None)
+        if rows_map is None and getattr(holder, "band_slab_Nf", None) is not None:
+            raise NotImplementedError(
+                "information_matrix needs the full-active-band invC (the parent ACA, or a "
+                "shared-psd mirror holder); per-slot narrow invC slabs are not supported.")
         Nt = self.Nt_active
-        W = 2 * self.num_m_layers + 4        # carrier layer(s) +- L, plus Doppler drift
-        f0 = np.asarray(p[:, 1].get() if hasattr(p, "get") else p[:, 1])
-        lo = np.clip(np.floor(f0 / self.layer_df).astype(int) - self.num_m_layers - 1,
+        iC_flat = xp.asarray(holder.linear_psd_arr[0])
+        plane = 9 * self.Nf_active * Nt
+        if int(iC_flat.size) % plane:
+            raise ValueError(f"linear_psd_arr[0] has {int(iC_flat.size)} entries, not a "
+                             f"multiple of the (3, 3, {self.Nf_active}, {Nt}) invC plane")
+        iC_all = iC_flat.reshape(-1, 3, 3, self.Nf_active, Nt)
+        ni = (np.zeros(n, dtype=np.int64) if noise_index is None
+              else np.asarray(_host(noise_index), dtype=np.int64).ravel())
+        if ni.shape[0] != n:
+            raise ValueError(f"noise_index has {ni.shape[0]} rows, params {n}")
+        if rows_map is not None:
+            ni = np.asarray(_host(rows_map), dtype=np.int64).ravel()[ni]
+        if n and (ni.min() < 0 or ni.max() >= int(iC_all.shape[0])):
+            raise IndexError(f"invC rows {ni.min()}..{ni.max()} outside the holder's "
+                             f"{int(iC_all.shape[0])} rows")
+
+        # per-source slab [lo, lo + W) around the carrier layer of f0
+        L = self.num_m_layers
+        W = min(2 * L + 4, self.Nf_active)
+        f0 = np.asarray(_host(p[:, 1]))
+        lo = np.clip(np.floor(f0 / self.layer_df).astype(np.int64) - L - 1,
                      self.ind_min_f, self.ind_max_f - W + 1).astype(np.int32)
-        ni = np.zeros(n, dtype=np.int64) if noise_index is None else np.asarray(
-            noise_index.get() if hasattr(noise_index, "get") else noise_index).ravel()
-        iC_all = xp.asarray(wdm_holder.linear_psd_arr[0]).reshape(
-            -1, 3, 3, self.Nf_active, Nt)
+
         out = xp.zeros((n, nd, nd))
-        per_src = 2 * nd * 3 * W * Nt * 8 + 9 * W * Nt * 8
+        # bytes per source: 2 nd stepped fills + nd derivatives (3 channels each) + the
+        # gathered 3 x 3 invC rows, all (W, Nt) float64
+        per_src = (3 * nd * 3 + 9) * W * Nt * 8
         chunk = max(1, int(max_bytes // per_src))
-        lay = np.arange(W)
+        lay = xp.arange(W)
+        two_eps = xp.asarray(2.0 * eps[inds])[:, None, None, None, None]
         for s0 in range(0, n, chunk):
             k = min(chunk, n - s0)
-            ps = p[s0:s0 + k]
-            rows = []
+            # 2 nd k template rows ordered [parameter a][sign +, -][source]
+            P = xp.tile(p[s0:s0 + k], (2 * nd, 1)).reshape(nd, 2, k, nparams)
             for a, i in enumerate(inds):
-                for sgn in (1.0, -1.0):
-                    q = ps.copy()
-                    q[:, i] += sgn * eps[i]
-                    rows.append(q)
-            P = xp.concatenate(rows)                     # (2 nd k, 9): [a][sign][src]
-            nr = int(P.shape[0])
+                P[a, 0, :, i] += eps[i]
+                P[a, 1, :, i] -= eps[i]
+            nr = 2 * nd * k
             buf = xp.zeros(nr * 3 * W * Nt)
-            lo_r = np.tile(lo[s0:s0 + k], 2 * nd)
-            self.fill_lookup(P, buf, data_index=xp.arange(nr, dtype=xp.int32),
-                             factors=xp.ones(nr), band_slab_Nf=W, slab_min_f=lo_r)
+            self.fill_lookup(P.reshape(nr, nparams), buf,
+                             data_index=xp.arange(nr, dtype=xp.int32), factors=xp.ones(nr),
+                             band_slab_Nf=W, slab_min_f=np.tile(lo[s0:s0 + k], 2 * nd))
             F = buf.reshape(nd, 2, k, 3, W, Nt)
-            dh = (F[:, 0] - F[:, 1]) / xp.asarray(2.0 * eps[inds])[:, None, None, None, None]
+            dh = (F[:, 0] - F[:, 1]) / two_eps                      # (nd, k, 3, W, Nt)
+            del buf, F
+            # each source's invC rows at its slab layers: (k, W, 3, 3, Nt)
             ll = xp.asarray(lo[s0:s0 + k] - self.ind_min_f)
-            iC = iC_all[xp.asarray(ni[s0:s0 + k])[:, None],
-                        :, :, (ll[:, None] + xp.asarray(lay)[None, :]), :]   # (k, W, 3, 3, Nt)
-            out[s0:s0 + k] = xp.einsum("akcwt,kwcdt,bkdwt->kab", dh, iC, dh)
+            iC = iC_all[xp.asarray(ni[s0:s0 + k])[:, None], :, :,
+                        ll[:, None] + lay[None, :], :]
+            G = xp.einsum("akcwt,kwcdt,bkdwt->kab", dh, iC, dh)
+            out[s0:s0 + k] = 0.5 * (G + G.transpose(0, 2, 1))   # exact symmetry
         return out
 
     def __getattr__(self, name):
