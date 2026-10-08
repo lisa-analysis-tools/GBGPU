@@ -1,6 +1,8 @@
 #ifndef LISA_h
 #define LISA_h
 
+#include "lisaconstants_values.h"
+
 
 /* Photon shot noise power */
 #define Sps 8.321000e-23
@@ -12,7 +14,7 @@
 #define Larm 2.5e9
 
  /* LISA orbital eccentricity */
-#define ec 0.0048241852
+#define ec (Larm / (2.0 * 1.7320508075688772 * LISACONSTANTS_ASTRONOMICAL_UNIT))
 
  /* Initial azimuthal position of the guiding center */
 #define kappa 0.000000
@@ -21,10 +23,10 @@
 #define lambda 0.000000
 
  /* LISA modulation frequency */
-#define fm 3.168753575e-8
+#define fm (1.0 / LISACONSTANTS_ASTRONOMICAL_YEAR)
 
 /* transfer frequency (Hz) */
-#define fstar 0.01908538063694777
+#define fstar (LISACONSTANTS_SPEED_OF_LIGHT / (2.0 * 3.141592653589793 * Larm))
 
 /* MLDC sampling rate */
 //#define dt 15.000000

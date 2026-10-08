@@ -11,6 +11,7 @@
 #endif
 
 #include "SharedMemoryGBGPU.hpp"
+#include "lisaconstants_values.h"
 #include "LISA.h"
 #include "global.h"
 #include "math.h"
@@ -22,7 +23,7 @@
 
 
 // # TODO: remove this
-CUDA_CALLABLE_MEMBER double Clight = 299792458.0;
+CUDA_CALLABLE_MEMBER double Clight = LISACONSTANTS_SPEED_OF_LIGHT;
 using namespace std;
 
 // Recursive FFT function

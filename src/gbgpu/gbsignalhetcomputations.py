@@ -762,7 +762,7 @@ class GBSignalHetComputations(FastLISAResponseParallelModule):
         v3 = int(g.get("v3_n_nodes", 0))
         if v3 > 0:
             return max(4, v3)
-        _YRSID_SI = 31558149.763545603
+        from lisaconstants import ASTRONOMICAL_YEAR as _YRSID_SI
         t_yr = float(g.get("Tobs", 0.0) or 0.0) / _YRSID_SI
         if t_yr > 0.0:
             for t_hi, n_tier in self._NR_TIERS:
