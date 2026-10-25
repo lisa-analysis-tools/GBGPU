@@ -75,6 +75,21 @@ FISHER_BOUND = 1e-13
 # ? whose rounding (half an ulp, 9e-13 rad) leaves the realised step off by up to 9e-7 of itself:
 # ? measured 2.1e-7 here and 1.4e-6 in the existing response (2026-10-19).
 EXACT_ENTRY_BOUND = 1e-5
+# ? The A and phi0 gradients at the default steps against (Re(d|h) - (h|h)) / A and Im(d|h). A
+# ? enters linearly, so its difference is exact to rounding (3e-14 of the component measured).
+EXACT_AMPLITUDE_GRADIENT_BOUND = 1e-5
+# ? The phase step is realised to 9e-7 of itself per evaluation (phases up to 1.4e4 rad), and the
+# ? segment terms of Im(d|h) cancel on the random data (their absolute sum is 3.7 times the total
+# ? for GB_PARAMS): measured 1.1e-5 of the component for GB_PARAMS, 1.5e-6 for GB_PARAMS_B
+# ? (2026-10-24). 1e-4 of the component is the error at which the kernel's phase would be fixed.
+EXACT_PHASE_GRADIENT_BOUND = 1e-4
+# ? Direction of the Taylor remainder: 1e2 x GRAD_EPS, calibrated once (2026-10-24). The remainder
+# ? at the smallest step stays 40 times above the linear term of the gradient's own step error;
+# ? 1e1 x pulled the last ratio of GB_PARAMS to 3.63, and 1e3 x let the cubic term push the first
+# ? of GB_PARAMS_B to 4.29.
+TAYLOR_DIRECTION_SCALE = 1e2
+TAYLOR_STEPS = (1.0, 0.5, 0.25, 0.125)
+TAYLOR_RATIO_BOUNDS = (3.5, 4.5)
 # ? CUDA Fisher against the CPU and the reference, provisional: a template that rounds differently
 # ? on the device enters the differences divided by the step, about 1e-9 in fdot on 8 parameters.
 GPU_FISHER_BOUND = 1e-7
@@ -701,6 +716,55 @@ class DFFRSelfConsistencyTest(unittest.TestCase):
         self.assertEqual(grad[4], 0.0)
         self.assertGreater(np.abs(grad).max(), 0.0)
         np.testing.assert_allclose(grad, reference, rtol=1e-6, atol=1e-25)
+
+    def test_exact_amplitude_and_phase_gradients(self):
+        """At the default steps, dlnL/dA = (Re(d|h) - (h|h)) / A, since h is linear in A, and
+        dlnL/dphi0 = Im(d|h), since the pixels carry exp(i Phi) with Phi = -phi0 + ..., so that
+        dh/dphi0 = -i h."""
+        case = self._case(window_alpha=0.5, tdi="2nd generation")
+        for params in (GB_PARAMS, GB_PARAMS_B):
+            with self.subTest(amp=params[0]):
+                grad = _host(case.comp.get_ll_grad_stft(params))[0]
+                d_h, h_h = (value[0] for value in case.get_ll(params))
+                exact_amp = (d_h.real - h_h.real) / params[0]
+                exact_phase = d_h.imag
+                # * Both components far from zero, so a relative bound means something.
+                self.assertGreater(abs(exact_amp) * params[0], 0.1 * abs(d_h))
+                self.assertGreater(abs(exact_phase), 0.1 * abs(d_h))
+                np.testing.assert_allclose(
+                    grad[0], exact_amp, rtol=EXACT_AMPLITUDE_GRADIENT_BOUND, atol=0
+                )
+                np.testing.assert_allclose(
+                    grad[4], exact_phase, rtol=EXACT_PHASE_GRADIENT_BOUND, atol=0
+                )
+
+    def test_gradient_taylor_remainder_order(self):
+        """R1(s) = |lnL(theta + s d) - lnL(theta) - s g.d| falls as s^2 over three halvings, so the
+        default-step gradient is the first-order term of get_ll along a direction of natural
+        scales."""
+        case = self._case(window_alpha=0.5, tdi="2nd generation")
+        direction = TAYLOR_DIRECTION_SCALE * GRAD_EPS
+        direction[3] = 0.0
+
+        def log_likelihood(params):
+            d_h, h_h = case.get_ll(params)
+            return d_h[0].real - 0.5 * h_h[0].real
+
+        for params in (GB_PARAMS, GB_PARAMS_B):
+            with self.subTest(amp=params[0]):
+                slope = _host(case.comp.get_ll_grad_stft(params))[0] @ direction
+                base = log_likelihood(params)
+                remainders = np.array(
+                    [
+                        abs(log_likelihood(params + step * direction) - base - step * slope)
+                        for step in TAYLOR_STEPS
+                    ]
+                )
+                ratios = remainders[:-1] / remainders[1:]
+                self.assertTrue(
+                    np.all((ratios >= TAYLOR_RATIO_BOUNDS[0]) & (ratios <= TAYLOR_RATIO_BOUNDS[1])),
+                    msg=f"remainder ratios {ratios}",
+                )
 
     def test_swap_ll_grad_matches_host_differences(self):
         """Both swap gradients equal central differences of the swap scalar."""

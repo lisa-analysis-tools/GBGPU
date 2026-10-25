@@ -1021,10 +1021,10 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
     ``response`` selects how the pixels are computed: ``"dffr"`` (default), the Direct Fast
     Fresnel Response, through the ``gb_dffr_*`` kernels on the kinematics table of the bound
     group (``cpp_kinematics``), or ``"tdi_on_the_fly"``, the response described above. DFFR
-    takes ``first_order_delays``, which the TDI-on-the-fly response ignores. It computes the XYZ
-    channels only, needs the 1st or 2nd generation combinations of ``TDIConfig``, and does not
-    read ``T``,
-    ``window_factor``, ``freq_from_tdi_phase``, ``use_midpoint`` or the Fisher's ``astro_track``.
+    takes ``first_order_delays``, which the TDI-on-the-fly response ignores: ``True`` (the default)
+    carries every light travel time to first order across a segment; ``False`` holds them
+    constant. It computes the XYZ channels only, needs the 1st or 2nd generation combinations of 
+    ``TDIConfig``, and does not read ``T``, ``window_factor``, ``freq_from_tdi_phase``, ``use_midpoint`` or the Fisher's ``astro_track``.
     Usage and limits: ``docs/response/dffr/README.md`` in lisa-analysis-tools.
     """
 
@@ -1043,7 +1043,7 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
     def __init__(self, stft_comps, T, t_ref=0.0, orbits=None, tdi_config=None,
                  force_backend=None, n_side_bins=12, window_factor=1.0,
                  freq_from_tdi_phase=True, window_alpha=None, use_midpoint=None,
-                 linear_envelope=True, response="dffr", first_order_delays=False):
+                 linear_envelope=True, response="dffr", first_order_delays=True):
         super().__init__(force_backend=force_backend)
         if response not in STFT_RESPONSES:
             raise ValueError(f"response must be one of {STFT_RESPONSES}, got {response!r}.")
@@ -1508,6 +1508,20 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         """No-op in-model teardown hook."""
         return None
 
+    _DFFR_GRADIENT_STEP_FACTORS = (3.0, 10.0, 10.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0)
+
+    def _gradient_steps(self, nparams, param_eps, param_scales, param_eps_relative):
+        """Finite-difference steps and scales of the gradients: the shared table, widened per
+        parameter for DFFR; explicit steps or scales pass through unchanged."""
+        eps_theta, scales = self._resolve_eps_and_scales(
+            nparams, param_eps, param_scales, param_eps_relative,
+        )
+        if self.response == "dffr" and param_eps is None and param_scales is None:
+            factors = list(self._DFFR_GRADIENT_STEP_FACTORS[:nparams])
+            factors += [factors[-1]] * (nparams - len(factors))
+            eps_theta = eps_theta * self.xp.asarray(factors, dtype=self.xp.float64)
+        return eps_theta, scales
+
     # ------------------------------------------------------------------
     # Gradients (Stage 3): central finite difference over the 9 params,
     # reusing get_ll_stft / get_swap_ll_stft's exact forward evaluation.
@@ -1529,9 +1543,14 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         Returns ``grad`` of shape ``(num_bin, nparams)`` holding ``dL/dtheta_k``
         (default) or ``dL/d(eta_k)`` when ``param_scales`` is supplied (see
         :meth:`GBFDComputations.get_ll_grad_fd`). ``param_eps[k] <= 0`` freezes
-        parameter ``k``. The kernel reuses ``get_ll_stft``'s exact forward
-        evaluation, so it reproduces a host-side central difference of
-        ``get_ll_stft`` to machine precision.
+        parameter ``k``; ``param_eps=None`` takes the shared table, for DFFR with the
+        f0 and fdot steps times 10 and the others times 3 (``_gradient_steps``). The
+        kernel reuses ``get_ll_stft``'s exact forward evaluation and divides by the
+        distance of the two shifted parameter values it used, so it reproduces a
+        host-side central difference of ``get_ll_stft`` up to the rounding of
+        ``theta_k +- eps_k`` to the nearest double (for f0 = 0.02 Hz the doubles are
+        3.5e-18 Hz apart, 8.7e-5 of the shared step of 2e-14 Hz), which a host
+        difference carries and the kernel does not.
 
         ``linear_envelope``: ``True`` or ``False`` forces the envelope on or off, ``None``
         inherits the group's setting. The default, :data:`RESPONSE_DEFAULT`, is ``False`` for
@@ -1543,7 +1562,7 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         num_bin = p.shape[0]
         nparams = self.num_params
         data_index, noise_index = self._resolve_indices(num_bin, data_index, noise_index)
-        eps_theta, scales = self._resolve_eps_and_scales(
+        eps_theta, scales = self._gradient_steps(
             nparams, param_eps, param_scales, param_eps_relative,
         )
         linear_envelope = self._derivative_envelope(linear_envelope)
@@ -1602,10 +1621,10 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         )
         nparams = self.num_params
         data_index, noise_index = self._resolve_indices(num_bin, data_index, noise_index)
-        eps_theta_add, scales_add = self._resolve_eps_and_scales(
+        eps_theta_add, scales_add = self._gradient_steps(
             nparams, param_eps_add, param_scales_add, param_eps_relative,
         )
-        eps_theta_remove, scales_remove = self._resolve_eps_and_scales(
+        eps_theta_remove, scales_remove = self._gradient_steps(
             nparams, param_eps_remove, param_scales_remove, param_eps_relative,
         )
 
