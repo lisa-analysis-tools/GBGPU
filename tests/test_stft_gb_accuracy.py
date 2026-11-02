@@ -142,7 +142,7 @@ class STFTGBEndToEndTest(unittest.TestCase):
             stft_comps=self.stft_group, T=self.Tobs, t_ref=self.t_ref,
             orbits=self.orbits, tdi_config=self.tdi_config, force_backend="cpu",
             n_side_bins=n_side_bins, window_factor=self.window_factor,
-            freq_from_tdi_phase=freq_from_tdi_phase,
+            freq_from_tdi_phase=freq_from_tdi_phase, response="tdi_on_the_fly",
         )
 
     def _mismatch(self, n_side_bins, freq_from_tdi_phase=True):
@@ -259,7 +259,8 @@ class STFTGBInteriorAccuracyTest(unittest.TestCase):
     def _model_grid(self, n_side):
         gb = STFTGBComputations(stft_comps=self.shim, T=self.Tobs, t_ref=0.0, orbits=self.orbits,
                                 tdi_config=self.tdi_config, force_backend="cpu", n_side_bins=n_side,
-                                window_factor=1.0, freq_from_tdi_phase=True)
+                                window_factor=1.0, freq_from_tdi_phase=True,
+                                response="tdi_on_the_fly")
         M = np.zeros((1, 3, self.settings.NT, self.settings.NF_active), np.complex128)
         gb.fill_global_stft(np.array([[AMP, self.f0, FDOT, FDDOT, PHI0, INC, PSI, LAM, BETA]]),
                             M, data_index=np.array([0], dtype=np.int32))

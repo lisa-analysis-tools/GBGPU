@@ -28,6 +28,7 @@
 // Python process.
 
 #include "gb_tdi_on_the_fly.hh"  // GBTDIonTheFly class + LAT/GBT/LISATDIonTheFly machinery
+#include "gb_physics.hh"         // the GB phase, frequency and amplitude shared with DFFR
 #include <stdexcept>
 #include <vector>
 
@@ -45,8 +46,7 @@
 // =============================================================================
 // GBTDIonTheFly --- UCB closed-form physics
 // =============================================================================
-// LDC convention: phase parameter `phi0` enters with a leading minus
-// sign (`-phi0 + 2*pi * cumulative-phase`).
+// * The formulas live in gb_physics.hh, which the DFFR source model shares.
 
 CUDA_DEVICE
 double GBTDIonTheFly::ucb_phase(double t, double *params)
@@ -55,11 +55,7 @@ double GBTDIonTheFly::ucb_phase(double t, double *params)
     double phi0  = params[phi0_index];
     double fdot  = params[fdot0_index];
     double fddot = params[fddot0_index];
-
-    double t_diff = t - t_ref;
-    return -phi0 + 2 * M_PI * (f0 * t_diff
-                              + 0.5 * fdot * t_diff * t_diff
-                              + (1.0 / 6.0) * fddot * t_diff * t_diff * t_diff);
+    return gb_phase(f0, fdot, fddot, phi0, t - t_ref);
 }
 
 CUDA_DEVICE
@@ -68,8 +64,7 @@ double GBTDIonTheFly::ucb_amplitude(double t, double *params)
     double A0    = params[amplitude_index];
     double f0    = params[f0_index];
     double fdot  = params[fdot0_index];
-    double t_diff = t - t_ref;
-    return A0 * (1.0 + (2.0 / 3.0) * fdot / f0 * t_diff);
+    return A0 * gb_amplitude_ratio(f0, fdot, t - t_ref);
 }
 
 CUDA_DEVICE
@@ -78,8 +73,7 @@ double GBTDIonTheFly::ucb_f(double t, double *params)
     double f0    = params[f0_index];
     double fdot  = params[fdot0_index];
     double fddot = params[fddot0_index];
-    double t_diff = t - t_ref;
-    return f0 + fdot * t_diff + 0.5 * fddot * t_diff * t_diff;
+    return gb_frequency(f0, fdot, fddot, t - t_ref);
 }
 
 CUDA_DEVICE
@@ -87,8 +81,7 @@ double GBTDIonTheFly::ucb_fdot(double t, double *params)
 {
     double fdot  = params[fdot0_index];
     double fddot = params[fddot0_index];
-    double t_diff = t - t_ref;
-    return fdot + fddot * t_diff;
+    return gb_frequency_derivative(fdot, fddot, t - t_ref);
 }
 
 

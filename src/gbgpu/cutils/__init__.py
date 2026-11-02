@@ -105,6 +105,8 @@ def _lat_methods_from_pycppdetector(_lat_pd, _gbt_interp, *, gpu: bool, xp):
     return {
         "OrbitsWrap": getattr(_lat_pd, f"OrbitsWrap{suffix}"),
         "Orbits": getattr(_lat_pd, f"Orbits{suffix}"),
+        # DFFR orbits cache: LAT's kinematics table is a required field of the LAT table too.
+        "KinematicsTableWrap": getattr(_lat_pd, f"KinematicsTableWrap{suffix}"),
         "check_orbits": _lat_pd.check_orbits,
         "TDSplineTDIWaveformWrap": getattr(_lat_pd, f"TDSplineTDIWaveformWrap{suffix}"),
         "FDSplineTDIWaveformWrap": getattr(_lat_pd, f"FDSplineTDIWaveformWrap{suffix}"),

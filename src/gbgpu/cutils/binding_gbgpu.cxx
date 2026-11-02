@@ -510,6 +510,225 @@ void GBComputationGroupWrap::gb_stft_information_matrix(
         stft_start_freq_pointer(start_freq_inds));
 }
 
+// ---- DFFR GB likelihood bindings (gb_dffr.hh) ------------------------------
+void GBComputationGroupWrap::gb_dffr_get_ll(
+    array_type<std::complex<double>> d_h_out, array_type<std::complex<double>> h_h_out,
+    KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+    STFTDomainWrap *stft_wrap,
+    array_type<double> params_all,
+    array_type<int> data_index_all, array_type<int> noise_index_all,
+    int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+    bool linear_envelope, bool first_order_delays,
+    array_type<int> start_freq_inds)
+{
+    gb_dffr_get_ll_wrap(
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(d_h_out, "d_h_out", num_bin, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(h_h_out, "h_h_out", num_bin, 1)),
+        &kinematics_wrap->table, fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
+        return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
+        return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
+        num_bin, nparams, t_ref, n_side_bins, tdi_generation,
+        linear_envelope, first_order_delays,
+        stft_start_freq_pointer(start_freq_inds));
+}
+
+void GBComputationGroupWrap::gb_dffr_fill_global(
+    array_type<std::complex<double>> template_fill,
+    KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+    STFTDomainWrap *stft_wrap,
+    array_type<double> params_all, array_type<int> data_index_all,
+    array_type<double> factors_all,
+    int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+    bool linear_envelope, bool first_order_delays,
+    array_type<int> start_freq_inds)
+{
+    gb_dffr_fill_global_wrap(
+        reinterpret_cast<cmplx*>(return_pointer_no_check(template_fill)),
+        &kinematics_wrap->table, fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
+        return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
+        return_pointer_and_check_length(factors_all, "factors_all", num_bin, 1),
+        num_bin, nparams, t_ref, n_side_bins, tdi_generation,
+        linear_envelope, first_order_delays,
+        stft_start_freq_pointer(start_freq_inds));
+}
+
+void GBComputationGroupWrap::gb_dffr_swap_ll(
+    array_type<std::complex<double>> d_h_add_out, array_type<std::complex<double>> d_h_remove_out,
+    array_type<std::complex<double>> add_add_out, array_type<std::complex<double>> remove_remove_out,
+    array_type<std::complex<double>> add_remove_out,
+    KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+    STFTDomainWrap *stft_wrap,
+    array_type<double> params_add_all, array_type<double> params_remove_all,
+    array_type<int> data_index_all, array_type<int> noise_index_all,
+    int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+    bool linear_envelope, bool first_order_delays,
+    int rows_per_pass, array_type<int> start_freq_inds)
+{
+    gb_dffr_swap_ll_wrap(
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(d_h_add_out, "d_h_add_out", num_bin, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(d_h_remove_out, "d_h_remove_out", num_bin, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(add_add_out, "add_add_out", num_bin, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(remove_remove_out, "remove_remove_out", num_bin, 1)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(add_remove_out, "add_remove_out", num_bin, 1)),
+        &kinematics_wrap->table, fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_add_all, "params_add_all", nparams, num_bin),
+        return_pointer_and_check_length(params_remove_all, "params_remove_all", nparams, num_bin),
+        return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
+        return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
+        num_bin, nparams, t_ref, n_side_bins, tdi_generation,
+        linear_envelope, first_order_delays,
+        rows_per_pass, stft_start_freq_pointer(start_freq_inds));
+}
+
+void GBComputationGroupWrap::gb_dffr_get_fstat_ll(
+    array_type<double> N_re_out, array_type<double> N_im_out,
+    array_type<double> M_re_out, array_type<double> M_im_out,
+    KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+    STFTDomainWrap *stft_wrap,
+    array_type<double> params_all,
+    array_type<int> data_index_all, array_type<int> noise_index_all,
+    int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+    bool linear_envelope, bool first_order_delays,
+    int rows_per_pass, array_type<int> start_freq_inds)
+{
+    gb_dffr_get_fstat_ll_wrap(
+        return_pointer_and_check_length(N_re_out, "N_re_out", num_bin, 4),
+        return_pointer_and_check_length(N_im_out, "N_im_out", num_bin, 4),
+        return_pointer_and_check_length(M_re_out, "M_re_out", num_bin, 10),
+        return_pointer_and_check_length(M_im_out, "M_im_out", num_bin, 10),
+        &kinematics_wrap->table, fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
+        return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
+        return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
+        num_bin, nparams, t_ref, n_side_bins, tdi_generation,
+        linear_envelope, first_order_delays,
+        rows_per_pass, stft_start_freq_pointer(start_freq_inds));
+}
+
+void GBComputationGroupWrap::gb_dffr_get_ll_grad(
+    array_type<double> grad_out,
+    KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+    STFTDomainWrap *stft_wrap,
+    array_type<double> params_all,
+    array_type<int> data_index_all, array_type<int> noise_index_all,
+    array_type<double> param_eps,
+    int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+    bool linear_envelope, bool first_order_delays,
+    array_type<int> start_freq_inds)
+{
+    gb_dffr_get_ll_grad_wrap(
+        return_pointer_and_check_length(grad_out, "grad_out", nparams, num_bin),
+        &kinematics_wrap->table, fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
+        return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
+        return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
+        return_pointer_and_check_length(param_eps, "param_eps", nparams, 1),
+        num_bin, nparams, t_ref, n_side_bins, tdi_generation,
+        linear_envelope, first_order_delays,
+        stft_start_freq_pointer(start_freq_inds));
+}
+
+void GBComputationGroupWrap::gb_dffr_swap_ll_grad(
+    array_type<double> grad_add_out, array_type<double> grad_remove_out,
+    KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+    STFTDomainWrap *stft_wrap,
+    array_type<double> params_add_all, array_type<double> params_remove_all,
+    array_type<int> data_index_all, array_type<int> noise_index_all,
+    array_type<double> param_eps_add, array_type<double> param_eps_remove,
+    int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+    bool linear_envelope, bool first_order_delays,
+    int rows_per_pass, array_type<int> start_freq_inds)
+{
+    gb_dffr_swap_ll_grad_wrap(
+        return_pointer_and_check_length(grad_add_out,    "grad_add_out",    nparams, num_bin),
+        return_pointer_and_check_length(grad_remove_out, "grad_remove_out", nparams, num_bin),
+        &kinematics_wrap->table, fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_add_all,    "params_add_all",    nparams, num_bin),
+        return_pointer_and_check_length(params_remove_all, "params_remove_all", nparams, num_bin),
+        return_pointer_and_check_length(data_index_all,    "data_index_all",    num_bin, 1),
+        return_pointer_and_check_length(noise_index_all,   "noise_index_all",   num_bin, 1),
+        return_pointer_and_check_length(param_eps_add,     "param_eps_add",     nparams, 1),
+        return_pointer_and_check_length(param_eps_remove,  "param_eps_remove",  nparams, 1),
+        num_bin, nparams, t_ref, n_side_bins, tdi_generation,
+        linear_envelope, first_order_delays,
+        rows_per_pass, stft_start_freq_pointer(start_freq_inds));
+}
+
+void GBComputationGroupWrap::gb_dffr_information_matrix(
+    array_type<double> info_out,
+    KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+    STFTDomainWrap *stft_wrap,
+    array_type<double> params_all, array_type<int> noise_index_all,
+    array_type<int> inds, array_type<double> param_eps,
+    int num_bin, int nparams, int num_derivs, double t_ref, int n_side_bins,
+    int tdi_generation, bool linear_envelope, bool first_order_delays,
+    bool easy_central_difference, int rows_per_pass,
+    array_type<int> start_freq_inds)
+{
+    gb_dffr_information_matrix_wrap(
+        return_pointer_and_check_length(info_out, "info_out", num_derivs * num_derivs, num_bin),
+        &kinematics_wrap->table, fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
+        return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
+        return_pointer_and_check_length(inds, "inds", num_derivs, 1),
+        return_pointer_and_check_length(param_eps, "param_eps", nparams, 1),
+        num_bin, nparams, num_derivs, t_ref, n_side_bins, tdi_generation,
+        linear_envelope, first_order_delays, easy_central_difference,
+        rows_per_pass, stft_start_freq_pointer(start_freq_inds));
+}
+
+void GBComputationGroupWrap::gb_dffr_fill_template(
+    array_type<std::complex<double>> template_out, array_type<int> start_out,
+    KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+    STFTDomainWrap *stft_wrap,
+    array_type<double> params_all, int num_bin, int nparams, double t_ref,
+    int n_side_bins, int tdi_generation, bool linear_envelope,
+    bool first_order_delays)
+{
+    const int num_times = fresnel_wrap->fresnel->num_times;
+    gb_dffr_fill_template_wrap(
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(
+            template_out, "template_out", num_bin * 3 * num_times, 2 * n_side_bins + 1)),
+        return_pointer_and_check_length(start_out, "start_out", num_bin, num_times),
+        &kinematics_wrap->table, fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
+        num_bin, nparams, t_ref, n_side_bins, tdi_generation,
+        linear_envelope, first_order_delays);
+}
+
+void GBComputationGroupWrap::gb_dffr_segment_table(
+    array_type<double> effective_frequency, array_type<double> chirp_rate,
+    array_type<std::complex<double>> reference_phasor,
+    array_type<std::complex<double>> link_amplitude,
+    array_type<std::complex<double>> envelope_slope,
+    array_type<std::complex<double>> emission_phasor,
+    array_type<double> emission_frequency,
+    array_type<std::complex<double>> tdi_weights, array_type<int> start_freq_ind,
+    KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+    STFTDomainWrap *stft_wrap,
+    array_type<double> params_all, int num_bin, int nparams, double t_ref,
+    int n_side_bins, int tdi_generation, bool linear_envelope,
+    bool first_order_delays)
+{
+    const int segments = num_bin * fresnel_wrap->fresnel->num_times;
+    gb_dffr_segment_table_wrap(
+        return_pointer_and_check_length(effective_frequency, "effective_frequency", segments, 3),
+        return_pointer_and_check_length(chirp_rate, "chirp_rate", segments, 3),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(reference_phasor, "reference_phasor", segments, 3)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(link_amplitude, "link_amplitude", segments, 6)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(envelope_slope, "envelope_slope", segments, 6)),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(emission_phasor, "emission_phasor", segments, 6)),
+        return_pointer_and_check_length(emission_frequency, "emission_frequency", segments, 6),
+        reinterpret_cast<cmplx*>(return_pointer_and_check_length(tdi_weights, "tdi_weights", segments, 18)),
+        return_pointer_and_check_length(start_freq_ind, "start_freq_ind", segments, 1),
+        &kinematics_wrap->table, fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
+        num_bin, nparams, t_ref, n_side_bins, tdi_generation,
+        linear_envelope, first_order_delays);
+}
+
 void GBComputationGroupWrap::gb_wdm_het_swap_ll(
     array_type<double> d_h_add_out, array_type<double> d_h_remove_out,
     array_type<double> add_add_out, array_type<double> remove_remove_out,
@@ -1247,6 +1466,42 @@ void gbgpu_part(nb::module_ &m) {
          "returns N_i=(d|A_i) [num_bin,4] + the upper-triangle M_ij=(A_i|A_j) "
          "[num_bin,10] (re+im). Caller forms 2F = N^T M^-1 N. Internally a thin "
          "orchestration over 4x get_ll + 6x swap_ll, so byte-identical to those.")
+    .def("gb_dffr_get_ll", &GBComputationGroupWrap::gb_dffr_get_ll,
+         "DFFR GB get_ll: (d|h),(h|h) per binary on the consumer of gb_stft_get_ll, with the DFFR "
+         "response on the grid's kinematics table. tdi_generation is 1 or 2 (TDIConfig.generation); "
+         "linear_envelope and first_order_delays are the DFFR settings.")
+    .def("gb_dffr_fill_global", &GBComputationGroupWrap::gb_dffr_fill_global,
+         "DFFR GB fill_global: adds factor times the DFFR pixel of every binary into the template "
+         "grid (num_templates, nchannels, num_times, num_freqs), as gb_stft_fill_global does.")
+    .def("gb_dffr_swap_ll", &GBComputationGroupWrap::gb_dffr_swap_ll,
+         "DFFR GB swap_ll: the 5 source-swap inner products per binary over the union of the "
+         "add/remove bands, as gb_stft_swap_ll. rows_per_pass (32 or 16) sets the segment rows "
+         "of each template's table on the GPU.")
+    .def("gb_dffr_get_fstat_ll", &GBComputationGroupWrap::gb_dffr_get_fstat_ll,
+         "DFFR GB F-statistic: N_i=(d|A_i) [num_bin,4] and the upper-triangle M_ij=(A_i|A_j) "
+         "[num_bin,10] (re+im) of the four basis filters, as gb_stft_get_fstat_ll. "
+         "rows_per_pass (32 or 16) as for gb_dffr_swap_ll.")
+    .def("gb_dffr_get_ll_grad", &GBComputationGroupWrap::gb_dffr_get_ll_grad,
+         "DFFR GB get_ll_grad: central finite-difference gradient of logL = Re(d|h) - 0.5*(h|h) "
+         "per parameter, as gb_stft_get_ll_grad; eps_k <= 0 freezes dimension k.")
+    .def("gb_dffr_swap_ll_grad", &GBComputationGroupWrap::gb_dffr_swap_ll_grad,
+         "DFFR GB swap_ll_grad: (grad_add, grad_remove) of the swap scalar, as "
+         "gb_stft_swap_ll_grad. rows_per_pass (32 or 16) as for gb_dffr_swap_ll.")
+    .def("gb_dffr_information_matrix", &GBComputationGroupWrap::gb_dffr_information_matrix,
+         "DFFR GB Fisher matrix per source with the estimator of gb_stft_information_matrix: "
+         "four-point (or two-point) central differences of the DFFR template over the parameters "
+         "in inds, each stencil template equal to its fill_global template. info_out layout "
+         "[num_bin, num_derivs, num_derivs]; param_eps[inds[d]] <= 0 gives a zero row and column. "
+         "rows_per_pass (4 or 8) sets the segment rows per pass on the GPU.")
+    .def("gb_dffr_fill_template", &GBComputationGroupWrap::gb_dffr_fill_template,
+         "Diagnostic: the compact DFFR template (num_bin, 3, num_times, 2 n_side_bins + 1) of "
+         "every binary from its band start per segment, and the band starts (num_bin, num_times). "
+         "Bins outside the grid hold zero.")
+    .def("gb_dffr_segment_table", &GBComputationGroupWrap::gb_dffr_segment_table,
+         "Diagnostic: every bin-independent quantity of the DFFR segment table per binary and "
+         "segment: effective frequencies, chirp rates and reference phasors of the 3 reception "
+         "states; link amplitudes, envelope slopes, emission phasors and emission frequencies of "
+         "the 6 links; the 18 TDI weights; and the band start.")
     ;
 }
 

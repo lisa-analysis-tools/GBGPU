@@ -36,6 +36,7 @@
 // arrived from lisa-on-gpu. The class declarations + kernel host wrappers
 // live in gb_tdi_on_the_fly.hh (also in this cutils dir).
 #include "gb_tdi_on_the_fly.hh"
+#include "gb_dffr.hh"  // the DFFR response, bound as the gb_dffr_* methods below
 
 // LAT-canonical pybind11 base + array typedefs + Orbits + TDIConfig wrappers.
 // binding_flr.hpp provides ReturnPointerBase and array_type<T>; consuming TUs
@@ -748,6 +749,109 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         int n_side_bins, double window_factor, bool freq_from_tdi_phase,
         bool easy_central_difference,
         array_type<int> start_freq_inds);
+
+    // The DFFR response (gb_dffr.hh): the consumers of the gb_stft_* methods above on LAT's
+    // KinematicsTableWrap of the grid (cross-module, like OrbitsWrap) instead of the orbits, and
+    // the TDI generation (1 or 2, TDIConfig.generation) instead of a TDIConfigWrap.
+    void gb_dffr_get_ll(
+        array_type<std::complex<double>> d_h_out, array_type<std::complex<double>> h_h_out,
+        KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+        STFTDomainWrap *stft_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+        bool linear_envelope, bool first_order_delays,
+        array_type<int> start_freq_inds);
+
+    void gb_dffr_fill_global(
+        array_type<std::complex<double>> template_fill,
+        KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+        STFTDomainWrap *stft_wrap,
+        array_type<double> params_all, array_type<int> data_index_all,
+        array_type<double> factors_all,
+        int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+        bool linear_envelope, bool first_order_delays,
+        array_type<int> start_freq_inds);
+
+    void gb_dffr_swap_ll(
+        array_type<std::complex<double>> d_h_add_out, array_type<std::complex<double>> d_h_remove_out,
+        array_type<std::complex<double>> add_add_out, array_type<std::complex<double>> remove_remove_out,
+        array_type<std::complex<double>> add_remove_out,
+        KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+        STFTDomainWrap *stft_wrap,
+        array_type<double> params_add_all, array_type<double> params_remove_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+        bool linear_envelope, bool first_order_delays,
+        int rows_per_pass, array_type<int> start_freq_inds);
+
+    void gb_dffr_get_fstat_ll(
+        array_type<double> N_re_out, array_type<double> N_im_out,
+        array_type<double> M_re_out, array_type<double> M_im_out,
+        KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+        STFTDomainWrap *stft_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+        bool linear_envelope, bool first_order_delays,
+        int rows_per_pass, array_type<int> start_freq_inds);
+
+    void gb_dffr_get_ll_grad(
+        array_type<double> grad_out,
+        KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+        STFTDomainWrap *stft_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        array_type<double> param_eps,
+        int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+        bool linear_envelope, bool first_order_delays,
+        array_type<int> start_freq_inds);
+
+    void gb_dffr_swap_ll_grad(
+        array_type<double> grad_add_out, array_type<double> grad_remove_out,
+        KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+        STFTDomainWrap *stft_wrap,
+        array_type<double> params_add_all, array_type<double> params_remove_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        array_type<double> param_eps_add, array_type<double> param_eps_remove,
+        int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+        bool linear_envelope, bool first_order_delays,
+        int rows_per_pass, array_type<int> start_freq_inds);
+
+    // info_out is num_bin * num_derivs^2, row-major, as for gb_stft_information_matrix.
+    void gb_dffr_information_matrix(
+        array_type<double> info_out,
+        KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+        STFTDomainWrap *stft_wrap,
+        array_type<double> params_all, array_type<int> noise_index_all,
+        array_type<int> inds, array_type<double> param_eps,
+        int num_bin, int nparams, int num_derivs, double t_ref, int n_side_bins,
+        int tdi_generation, bool linear_envelope, bool first_order_delays,
+        bool easy_central_difference, int rows_per_pass,
+        array_type<int> start_freq_inds);
+
+    // Diagnostics of the DFFR response: the compact template and the segment table.
+    void gb_dffr_fill_template(
+        array_type<std::complex<double>> template_out, array_type<int> start_out,
+        KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+        STFTDomainWrap *stft_wrap,
+        array_type<double> params_all, int num_bin, int nparams, double t_ref,
+        int n_side_bins, int tdi_generation, bool linear_envelope,
+        bool first_order_delays);
+
+    void gb_dffr_segment_table(
+        array_type<double> effective_frequency, array_type<double> chirp_rate,
+        array_type<std::complex<double>> reference_phasor,
+        array_type<std::complex<double>> link_amplitude,
+        array_type<std::complex<double>> envelope_slope,
+        array_type<std::complex<double>> emission_phasor,
+        array_type<double> emission_frequency,
+        array_type<std::complex<double>> tdi_weights, array_type<int> start_freq_ind,
+        KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+        STFTDomainWrap *stft_wrap,
+        array_type<double> params_all, int num_bin, int nparams, double t_ref,
+        int n_side_bins, int tdi_generation, bool linear_envelope,
+        bool first_order_delays);
 
     void gb_wdm_het_swap_ll(
         array_type<double> d_h_add_out, array_type<double> d_h_remove_out,

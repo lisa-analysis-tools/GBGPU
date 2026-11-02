@@ -259,6 +259,15 @@ if(GBGPU_WITH_CPU)
             "${CMAKE_CURRENT_BINARY_DIR}/domains.cxx"
     DEPENDS "${LISATOOLS_CUTILS}/domains.cu"
     VERBATIM)
+
+  # DFFR integration: the DFFR response of galactic binaries, in a unit of its own.
+  add_custom_command(
+    OUTPUT "gb_dffr.cxx"
+    COMMENT "Copy gb_dffr.cu to gb_dffr.cxx (for cgbgpu CPU)"
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/gb_dffr.cu"
+            "${CMAKE_CURRENT_BINARY_DIR}/gb_dffr.cxx"
+    DEPENDS "gb_dffr.cu"
+    VERBATIM)
 endif()
 
 
@@ -340,7 +349,8 @@ if(GBGPU_WITH_CPU)
     gb_tdi_on_the_fly.cxx
     lat_tdi_on_the_fly.cxx
     Interpolate.cxx
-    domains.cxx)
+    domains.cxx
+    gb_dffr.cxx)
   apply_cpu_backend_common_options(cgbgpu)
   target_include_directories(gbgpu_cpu_cgbgpu PRIVATE
     "${LISATOOLS_CUTILS}"        # ReturnPointerBase + lisatools_header_abi.hpp + LAT Detector.hpp
@@ -377,7 +387,8 @@ if(GBGPU_WITH_GPU)
     "${GBT_CUTILS}/Interpolate.cu"
     gbgpu_utils.cu
     SharedMemoryGBGPU.cu
-    gb_tdi_on_the_fly.cu)
+    gb_tdi_on_the_fly.cu
+    gb_dffr.cu)
   apply_gpu_backend_common_options(cgbgpu)
   target_include_directories(gbgpu_gpu_cgbgpu PRIVATE
     "${LISATOOLS_CUTILS}"

@@ -159,7 +159,8 @@ class STFTGBCrossDomainTest(unittest.TestCase):
         cls.d_d_stft = float(np.asarray(grp.d_d).reshape(-1)[0].real)
         gb = STFTGBComputations(stft_comps=grp, T=Tobs, t_ref=t_start, orbits=orbits,
                                 tdi_config=tdi_config, force_backend=fb, n_side_bins=20,
-                                window_factor=1.0, freq_from_tdi_phase=True)
+                                window_factor=1.0, freq_from_tdi_phase=True,
+                                response="tdi_on_the_fly")
         gb.get_ll_stft(params)
         cls.d_h_stft = complex(np.asarray(gb.d_h_out).reshape(-1)[0])
         cls.h_h_stft = float(np.asarray(gb.h_h_out).reshape(-1)[0].real)
