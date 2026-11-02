@@ -1064,9 +1064,13 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
                 self._wait_events(rows_ready)
                 ac_to_intra = buffer_aca.ac_to_intra_by_split[s]
                 intra_d = ac_to_intra[d_idx[rows]].astype(xp.int32)
-                intra_n = (
-                    None if n_idx is None else ac_to_intra[n_idx[rows]].astype(xp.int32)
-                )
+                if n_idx is not None and getattr(buffer_aca, "external_noise_rows", False):
+                    # A cell reads the row its holder names in this split's external noise array.
+                    intra_n = buffer_aca.noise_row_by_split[s][n_idx[rows]].astype(xp.int32)
+                else:
+                    intra_n = (
+                        None if n_idx is None else ac_to_intra[n_idx[rows]].astype(xp.int32)
+                    )
                 gathered = self._stream_event(device)
 
             self._wait_events(gathered)
