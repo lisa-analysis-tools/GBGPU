@@ -1258,10 +1258,10 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         h_h_c = xp.zeros(num_bin, dtype=xp.complex128)
         self.phase_angle = None
 
-        if bool(keep.any()):
-            rows_kept = xp.where(keep)[0]
-            d_idx = xp.asarray(data_index)[keep]
-            n_idx = xp.asarray(noise_index)[keep]
+        rows_kept = xp.flatnonzero(keep)
+        if rows_kept.size:
+            d_idx = xp.asarray(data_index)[rows_kept]
+            n_idx = xp.asarray(noise_index)[rows_kept]
             plan = self._split_plan(buffer_aca, d_idx, n_idx)
             plan_rows = [rows_kept[sub_rows] for _s, sub_rows, _d, _n, _dev in plan]
             caller_ready = self._stream_event(plan[0][4]) if plan else None
@@ -1341,10 +1341,10 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         hh_remove = xp.zeros(num_prop, dtype=xp.float64)
         hh_cross = xp.zeros(num_prop, dtype=xp.float64)
 
-        if bool(keep.any()):
-            rows_kept = xp.where(keep)[0]
-            d_idx = xp.asarray(data_index)[keep]
-            n_idx = xp.asarray(noise_index)[keep]
+        rows_kept = xp.flatnonzero(keep)
+        if rows_kept.size:
+            d_idx = xp.asarray(data_index)[rows_kept]
+            n_idx = xp.asarray(noise_index)[rows_kept]
             plan = self._split_plan(buffer_aca, d_idx, n_idx)
             plan_rows = [rows_kept[sub_rows] for _s, sub_rows, _d, _n, _dev in plan]
             caller_ready = self._stream_event(plan[0][4]) if plan else None
