@@ -120,9 +120,7 @@ class STFTGBEndToEndTest(unittest.TestCase):
 
         data_res = DataResidualArray(stft_signal)
         sens = XYZSensitivityBackend(orbits=cls.orbits, settings=cls.settings, force_backend=fb)
-        sens.sens_mat = sens.compute_sensitivity_matrix(
-            sens.basis_settings.f_arr, 15e-12, 3e-15
-        )
+        sens.sens_mat = sens.compute_sensitivity_matrix(15e-12, 3e-15)
 
         ac = AnalysisContainer(data_res, sens)
         acs = AnalysisContainerArray([ac], gpus=None)

@@ -135,7 +135,7 @@ class STFTGBCrossDomainTest(unittest.TestCase):
 
         def orbit_sens(settings):
             s = XYZSensitivityBackend(orbits=orbits, settings=settings, force_backend=fb)
-            s.sens_mat = s.compute_sensitivity_matrix(s.basis_settings.f_arr, OMS, ACC)
+            s.sens_mat = s.compute_sensitivity_matrix(OMS, ACC)
             return s
 
         def snr2(sig, settings, sens):
