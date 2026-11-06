@@ -796,6 +796,17 @@ class GBComputationGroupWrap: public GBComputationGroup, public ReturnPointerBas
         bool linear_envelope, bool first_order_delays,
         int rows_per_pass, array_type<int> start_freq_inds);
 
+    void gb_dffr_get_fstat_terms(
+        array_type<double> projections_out, array_type<double> overlaps_out,
+        array_type<double> two_f_out,
+        KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+        STFTDomainWrap *stft_wrap,
+        array_type<double> params_all,
+        array_type<int> data_index_all, array_type<int> noise_index_all,
+        int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+        bool linear_envelope, bool first_order_delays,
+        int rows_per_pass, array_type<int> start_freq_inds);
+
     void gb_dffr_get_ll_grad(
         array_type<double> grad_out,
         KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,

@@ -1429,6 +1429,50 @@ class STFTGBComputations(_GBGradEpsMixin, FastLISAResponseParallelModule):
         self.M_mat_cmplx = M_re + 1j * M_im
         return N_re, M_re
 
+    def get_fstat_terms_stft(self, params, data_index=None, noise_index=None,
+                             start_freq_inds=None):
+        """F-statistic per binary from the two templates T+ and Tx; DFFR response only.
+
+        T+ and Tx are the templates at the binary's intrinsic ``(f0, fdot, fddot, lam, beta)``
+        with ``(A, iota, phi0) = (2, pi/2, 0)`` and ``psi = 0`` or ``pi/4``. The four basis filters
+        of :meth:`get_fstat_ll_stft` are T+, -Tx, i T+ and -i Tx, since phi0 enters a DFFR
+        template only as ``exp(-i phi0)``. T+ and Tx share every reception state, so the kernel
+        (``dffr_get_fstat`` of LAT's ``lat_dffr_kernels.hh``) evaluates the windowed transforms of
+        a pixel once for both and forms (d|T+), (d|Tx), (T+|T+), (Tx|Tx) and (T+|Tx) in one pass.
+
+        Returns
+        -------
+        N_arr : ndarray, shape ``(num_bin, 4)``
+            ``Re(d|A_i)``, the layout of :meth:`get_fstat_ll_stft`.
+        M_mat : ndarray, shape ``(num_bin, 10)``
+            The upper triangle of ``Re(A_i|A_j)``, the layout of :meth:`get_fstat_ll_stft`, with
+            ``M02 = M13 = 0``: the real parts of i times a real norm.
+        two_F : ndarray, shape ``(num_bin,)``
+            ``2F = N^T M^-1 N`` in closed form from the five products; not finite where T+ and Tx
+            are parallel on the support.
+
+        N and M equal those of :meth:`get_fstat_ll_stft` to rounding.
+        """
+        if self.response != "dffr":
+            raise NotImplementedError(
+                "get_fstat_terms_stft needs response='dffr'; get_fstat_ll_stft serves the "
+                "TDI-on-the-fly response.")
+        prepared = self._prep_params(params)
+        num_bin = prepared.shape[0]
+        projections = self.xp.zeros((num_bin, 4))
+        overlaps = self.xp.zeros((num_bin, 10))
+        two_f = self.xp.zeros(num_bin)
+        data_index, noise_index = self._resolve_indices(num_bin, data_index, noise_index)
+        self.backend.GBComputationGroupWrap().gb_dffr_get_fstat_terms(
+            projections.reshape(-1), overlaps.reshape(-1), two_f,
+            *self._dffr_grid(self.stft_comps),
+            prepared.flatten(), data_index, noise_index,
+            num_bin, self.num_params, *self._dffr_settings(None, self.stft_comps),
+            self._DFFR_ROWS_PER_PASS, self._resolve_start_freq_inds(start_freq_inds),
+        )
+        self.N_arr, self.M_mat, self.two_F = projections, overlaps, two_f
+        return projections, overlaps, two_f
+
     @staticmethod
     def fstat_2F(N_arr, M_mat):
         """Assemble ``2F = N^T M^{-1} N`` per binary from the F-stat outputs.

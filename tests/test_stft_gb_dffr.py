@@ -11,6 +11,10 @@ compare them with the comp, to check their own arguments, and for the 16-row til
   domain inner product equals get_ll; swap(A, A) equals get_ll(A) and relabelling add and remove
   swaps the terms; the F-statistic's N and M equal the get_ll and swap terms; both gradients equal
   host central differences, and eps <= 0 freezes a component.
+* The two-template F-statistic: its N and M equal those assembled from swap(T+, Tx), bit for bit on
+  the CPU and to rounding on the GPU, on every data and noise row and in a window that cuts the
+  bands; its 2F equals the 4x4 solve, and it agrees with the four-filter F-statistic to the rounding
+  of the filters' shifted phases.
 * The compact template equals the fill_global grid bit for bit, and swap on a union band of several
   bins equals the inner products of compact templates on that band.
 * The envelope of the gradients, device replicas, and DFFR against the existing response on the
@@ -93,6 +97,18 @@ TAYLOR_RATIO_BOUNDS = (3.5, 4.5)
 # ? CUDA Fisher against the CPU and the reference, provisional: a template that rounds differently
 # ? on the device enters the differences divided by the step, about 1e-9 in fdot on 8 parameters.
 GPU_FISHER_BOUND = 1e-7
+# ? 2F in closed form against the 4x4 solve of the same N and M, relative to max(1, 2F), set before
+# ? measuring: both solve the same problem exactly, so only rounding separates them.
+FSTAT_CLOSED_FORM_BOUND = 1e-12
+# The two-template F-statistic against the four filters, per row: N against sqrt(max_i M_ii), M
+# against max_i M_ii, F absolute. The four-filter kernel evaluates the filters' phases phi0 = pi,
+# 3 pi/2 and pi/2 anew, which the exact factors -1, i and -i of the two-template path do not round;
+# N1 and M11 come from T+ in both.
+FSTAT_FILTER_BOUNDS = dict(projections=1e-8, overlaps=1e-9, fstat=1e-7, same_template=1e-12)
+# The two-template F-statistic against swap(T+, Tx) on the GPU, relative to each row's largest entry:
+# nvcc fuses multiply-adds differently in the two kernels, so they agree to rounding (up to 1e-12 on
+# this fixture, 2026-11-05), not bit for bit. On the CPU they are equal.
+FSTAT_GPU_SWAP_BOUND = 1e-11
 
 
 def _host(array):
@@ -102,6 +118,37 @@ def _host(array):
 def _arrays(values):
     """The output arrays of one method, whether it returns one array or several."""
     return list(values) if isinstance(values, (tuple, list)) else [values]
+
+
+def _two_templates(params):
+    """T+ and Tx of the F-statistic at the intrinsic parameters of every row."""
+    plus = np.atleast_2d(np.asarray(params, dtype=np.float64)).copy()
+    plus[:, [0, 5, 4, 6]] = 2.0, np.pi / 2, 0.0, 0.0
+    cross = plus.copy()
+    cross[:, 6] = np.pi / 4
+    return plus, cross
+
+
+def _fstat_from_two_templates(d_plus, d_cross, plus_plus, cross_cross, plus_cross):
+    """N and the upper triangle of M from the five products of T+ and Tx: sign changes and copies."""
+    zeros = np.zeros_like(plus_plus.real)
+    projections = np.stack([d_plus.real, -d_cross.real, -d_plus.imag, d_cross.imag], axis=1)
+    overlaps = np.stack(
+        [
+            plus_plus.real,
+            -plus_cross.real,
+            zeros,
+            plus_cross.imag,
+            cross_cross.real,
+            -plus_cross.imag,
+            zeros,
+            plus_plus.real,
+            -plus_cross.real,
+            cross_cross.real,
+        ],
+        axis=1,
+    )
+    return projections, overlaps
 
 
 def _settings(backend_name):
@@ -272,6 +319,10 @@ class _DFFRCase:
         self.comp.get_fstat_ll_stft(params, start_freq_inds=starts)
         return _host(self.comp.N_arr_cmplx), _host(self.comp.M_mat_cmplx)
 
+    def fstat_terms(self, params, starts=None):
+        outputs = self.comp.get_fstat_terms_stft(params, start_freq_inds=starts)
+        return tuple(_host(output) for output in outputs)
+
     def fill_global(self, params, starts=None):
         """The template grid (1, 3, NT, NF_active) of the sources, all with factor one."""
         settings = self.settings
@@ -350,6 +401,27 @@ class _DFFRCase:
         )
         n_re, n_im, m_re, m_im = (_host(out).reshape(num_bin, -1) for out in outs)
         return n_re + 1j * n_im, m_re + 1j * m_im
+
+    def entry_fstat_terms(self, params, rows_per_pass=32, starts=None):
+        batch = self._params(params)
+        num_bin = batch.shape[0]
+        sizes = (4, 10, 1)
+        outs = [self.xp.zeros(num_bin * size) for size in sizes]
+        self.wrap.gb_dffr_get_fstat_terms(
+            *outs,
+            *self._grid(),
+            batch.reshape(-1),
+            *self._indices(num_bin),
+            num_bin,
+            9,
+            *self.knobs,
+            rows_per_pass,
+            self._cells(starts),
+        )
+        projections, overlaps, two_f = (
+            _host(out).reshape(num_bin, size) for out, size in zip(outs, sizes)
+        )
+        return projections, overlaps, two_f[:, 0]
 
     def entry_fill_global(self, params, starts=None):
         settings = self.settings
@@ -556,6 +628,10 @@ class DFFRWiringTest(unittest.TestCase):
                         case.entry_swap(batch, batch_remove, starts=starts),
                     ),
                     "fstat": (case.fstat(batch, starts), case.entry_fstat(batch, starts=starts)),
+                    "fstat_terms": (
+                        case.fstat_terms(batch, starts),
+                        case.entry_fstat_terms(batch, starts=starts),
+                    ),
                     "fill_global": (
                         _host(case.fill_global(batch, starts)),
                         _host(case.entry_fill_global(batch, starts)),
@@ -695,6 +771,78 @@ class DFFRSelfConsistencyTest(unittest.TestCase):
                 m_reference[first, second] = case.swap(basis[first], basis[second])[4][0]
         np.testing.assert_allclose(n_values, n_reference, rtol=1e-9, atol=0)
         np.testing.assert_allclose(m_values, m_reference[np.triu_indices(4)], rtol=1e-9, atol=0)
+
+    def _assert_same_terms(self, values, reference):
+        """Equal bit for bit on the CPU; on the GPU within FSTAT_GPU_SWAP_BOUND of each row's
+        largest entry."""
+        if self.backend_name == "cpu":
+            np.testing.assert_array_equal(values, reference)
+            return
+        scale = np.abs(reference).max(axis=1, keepdims=True)
+        self.assertLessEqual(float(np.max(np.abs(values - reference) / scale)), FSTAT_GPU_SWAP_BOUND)
+
+    def test_fstat_terms_equal_two_template_swap(self):
+        """N and M of the two-template F-statistic equal their assembly from swap(T+, Tx), on the
+        full grid and in a window that cuts the bands; 2F equals the 4x4 solve."""
+        case = self._case(window_alpha=0.5, tdi="2nd generation")
+        batch = np.stack([GB_PARAMS, GB_PARAMS_B, GB_PARAMS_C])
+        plus, cross = _two_templates(batch)
+        # * Window start 6 cuts the lowest bins of the first two bands.
+        for starts in (None, [6]):
+            with self.subTest(starts=starts):
+                projections, overlaps, two_f = case.fstat_terms(batch, starts)
+                reference = _fstat_from_two_templates(*case.swap(plus, cross, starts))
+                self.assertGreater(np.abs(overlaps).max(), 0.0)
+                self._assert_same_terms(projections, reference[0])
+                self._assert_same_terms(overlaps, reference[1])
+                solved = STFTGBComputations.fstat_2F(projections, overlaps)
+                gap = np.abs(two_f - solved) / np.maximum(1.0, np.abs(solved))
+                self.assertLessEqual(gap.max(), FSTAT_CLOSED_FORM_BOUND)
+
+    def test_fstat_terms_match_the_filters(self):
+        """N, M and F of the two-template F-statistic equal those of the four filters
+        (get_fstat_ll_stft) to the rounding of the filters' shifted phases."""
+        case = self._case(window_alpha=0.5, tdi="2nd generation")
+        batch = np.stack([GB_PARAMS, GB_PARAMS_B, GB_PARAMS_C])
+        projections, overlaps, two_f = case.fstat_terms(batch)
+        filter_projections, filter_overlaps = (values.real for values in case.fstat(batch))
+        diagonal_scale = filter_overlaps[:, [0, 4, 7, 9]].max(axis=1)
+        projection_gap = np.abs(projections - filter_projections) / np.sqrt(diagonal_scale)[:, None]
+        overlap_gap = np.abs(overlaps - filter_overlaps) / diagonal_scale[:, None]
+        filter_two_f = STFTGBComputations.fstat_2F(filter_projections, filter_overlaps)
+        fstat_gap = 0.5 * np.abs(two_f - filter_two_f)
+        bounds = FSTAT_FILTER_BOUNDS
+        self.assertLessEqual(projection_gap.max(), bounds["projections"])
+        self.assertLessEqual(overlap_gap.max(), bounds["overlaps"])
+        self.assertLessEqual(fstat_gap.max(), bounds["fstat"])
+        self.assertLessEqual(projection_gap[:, 0].max(), bounds["same_template"])
+        self.assertLessEqual(overlap_gap[:, 0].max(), bounds["same_template"])
+
+    def test_fstat_terms_read_their_data_and_noise_rows(self):
+        """Every row is evaluated against its own data and noise rows, as swap(T+, Tx) is."""
+        case = _DFFRFisherCase(self.backend_name, window_alpha=0.5, tdi="2nd generation")
+        rng = np.random.default_rng(11)
+        shape = case.shim.data.shape
+        # * In place: the domain reads this array.
+        case.shim.data[...] = case.xp.asarray(
+            rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+        )
+        batch = np.stack([GB_PARAMS, GB_PARAMS_B, GB_PARAMS_C, GB_PARAMS])
+        data_index = case.xp.asarray(np.array([0, 1, 1, 0], dtype=np.int32))
+        noise_index = case.xp.asarray(np.array([1, 0, 1, 0], dtype=np.int32))
+        plus, cross = _two_templates(batch)
+        outputs = case.comp.get_fstat_terms_stft(
+            batch, data_index=data_index, noise_index=noise_index
+        )
+        projections, overlaps, _ = (_host(output) for output in outputs)
+        terms = case.comp.get_swap_ll_stft(
+            plus, cross, data_index=data_index, noise_index=noise_index
+        )[2:]
+        reference = _fstat_from_two_templates(*(_host(term) for term in terms))
+        self._assert_same_terms(projections, reference[0])
+        self._assert_same_terms(overlaps, reference[1])
+        # * Rows 0 and 3 hold the same source against other noise rows.
+        self.assertFalse(np.array_equal(overlaps[0], overlaps[3]))
 
     def test_get_ll_grad_matches_host_differences(self):
         """The gradient kernel equals central differences of get_ll; eps <= 0 freezes."""
@@ -1221,6 +1369,22 @@ class DFFRArgumentTest(unittest.TestCase):
             response="tdi_on_the_fly",
         )
 
+    def test_fstat_terms_empty_batch_and_response(self):
+        """An empty batch gives empty outputs without a launch; the TDI-on-the-fly response refuses
+        the two-template F-statistic."""
+        case = _DFFRCase("cpu")
+        expected = ((0, 4), (0, 10), (0,))
+        for outputs in (
+            case.entry_fstat_terms(np.zeros((0, 9))),
+            case.fstat_terms(np.zeros((0, 9))),
+        ):
+            self.assertEqual(tuple(output.shape for output in outputs), expected)
+        other = STFTGBComputations(
+            stft_comps=None, T=1.0, force_backend="cpu", response="tdi_on_the_fly"
+        )
+        with self.assertRaises(NotImplementedError):
+            other.get_fstat_terms_stft(GB_PARAMS)
+
     def test_group_without_kinematics_raises(self):
         case = _DFFRCase("cpu")
         bare = type("BareGroup", (), {})()
@@ -1267,7 +1431,7 @@ class DFFRGPUTest(DFFRSelfConsistencyTest):
 
     def test_gpu_matches_cpu(self):
         """Compact templates and inner products agree with the CPU, and the 16-row and 32-row
-        tiles of swap and the F-statistic with each other, within GPU_RELATIVE_BOUND of their
+        tiles of swap and both F-statistics with each other, within GPU_RELATIVE_BOUND of their
         peaks."""
         gpu = self._case(window_alpha=0.5, tdi="2nd generation")
         cpu = _DFFRCase("cpu", window_alpha=0.5, tdi="2nd generation")
@@ -1283,6 +1447,14 @@ class DFFRGPUTest(DFFRSelfConsistencyTest):
                 gpu.entry_swap(GB_PARAMS, GB_PARAMS_B, 32)[4],
             ),
             "fstat rows": (gpu.entry_fstat(GB_PARAMS, 16)[1], gpu.entry_fstat(GB_PARAMS, 32)[1]),
+            "fstat_terms": (
+                np.concatenate([output.ravel() for output in gpu.fstat_terms(GB_PARAMS)[:2]]),
+                np.concatenate([output.ravel() for output in cpu.fstat_terms(GB_PARAMS)[:2]]),
+            ),
+            "fstat_terms rows": (
+                np.concatenate([output.ravel() for output in gpu.entry_fstat_terms(GB_PARAMS, 16)[:2]]),
+                np.concatenate([output.ravel() for output in gpu.entry_fstat_terms(GB_PARAMS, 32)[:2]]),
+            ),
         }
         for name, (first, second) in pairs.items():
             with self.subTest(quantity=name):

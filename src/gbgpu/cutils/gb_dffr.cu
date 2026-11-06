@@ -150,6 +150,31 @@ void gb_dffr_get_fstat_ll_wrap(
             data_index_all, noise_index_all, num_bin, nparams, n_side_bins, start_freq_inds);
 }
 
+void gb_dffr_get_fstat_terms_wrap(
+    double *projections_out, double *overlaps_out, double *two_f_out,
+    KinematicsTable *kinematics, STFTFresnel *fresnel, STFTDomain *stft,
+    double *params_all, int *data_index_all, int *noise_index_all,
+    int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+    bool linear_envelope, bool first_order_delays,
+    int rows_per_pass, int *start_freq_inds)
+{
+    STFTDomain *stft_launch = nullptr;
+    const auto inputs = gb_dffr_inputs(kinematics, fresnel, stft, nparams, t_ref, n_side_bins,
+                                       tdi_generation, linear_envelope, first_order_delays,
+                                       &stft_launch);
+    const bool half_rows = gb_dffr_half_rows(rows_per_pass);
+    if (num_bin < 1)
+        return;
+    if (half_rows)
+        dffr_get_fstat<GBDFFRSource, DFFR_ROWS_PER_PASS_HALF>(
+            projections_out, overlaps_out, two_f_out, inputs, stft_launch, params_all,
+            data_index_all, noise_index_all, num_bin, nparams, start_freq_inds);
+    else
+        dffr_get_fstat<GBDFFRSource, DFFR_ROWS_PER_PASS>(
+            projections_out, overlaps_out, two_f_out, inputs, stft_launch, params_all,
+            data_index_all, noise_index_all, num_bin, nparams, start_freq_inds);
+}
+
 void gb_dffr_get_ll_grad_wrap(
     double *grad_out,
     KinematicsTable *kinematics, STFTFresnel *fresnel, STFTDomain *stft,
