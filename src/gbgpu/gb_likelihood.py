@@ -1064,9 +1064,13 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
                 self._wait_events(rows_ready)
                 ac_to_intra = buffer_aca.ac_to_intra_by_split[s]
                 intra_d = ac_to_intra[d_idx[rows]].astype(xp.int32)
-                intra_n = (
-                    None if n_idx is None else ac_to_intra[n_idx[rows]].astype(xp.int32)
-                )
+                if n_idx is not None and getattr(buffer_aca, "external_noise_rows", False):
+                    # A cell reads the row its holder names in this split's external noise array.
+                    intra_n = buffer_aca.noise_row_by_split[s][n_idx[rows]].astype(xp.int32)
+                else:
+                    intra_n = (
+                        None if n_idx is None else ac_to_intra[n_idx[rows]].astype(xp.int32)
+                    )
                 gathered = self._stream_event(device)
 
             self._wait_events(gathered)
@@ -1254,10 +1258,10 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         h_h_c = xp.zeros(num_bin, dtype=xp.complex128)
         self.phase_angle = None
 
-        if bool(keep.any()):
-            rows_kept = xp.where(keep)[0]
-            d_idx = xp.asarray(data_index)[keep]
-            n_idx = xp.asarray(noise_index)[keep]
+        rows_kept = xp.flatnonzero(keep)
+        if rows_kept.size:
+            d_idx = xp.asarray(data_index)[rows_kept]
+            n_idx = xp.asarray(noise_index)[rows_kept]
             plan = self._split_plan(buffer_aca, d_idx, n_idx)
             plan_rows = [rows_kept[sub_rows] for _s, sub_rows, _d, _n, _dev in plan]
             caller_ready = self._stream_event(plan[0][4]) if plan else None
@@ -1337,10 +1341,10 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
         hh_remove = xp.zeros(num_prop, dtype=xp.float64)
         hh_cross = xp.zeros(num_prop, dtype=xp.float64)
 
-        if bool(keep.any()):
-            rows_kept = xp.where(keep)[0]
-            d_idx = xp.asarray(data_index)[keep]
-            n_idx = xp.asarray(noise_index)[keep]
+        rows_kept = xp.flatnonzero(keep)
+        if rows_kept.size:
+            d_idx = xp.asarray(data_index)[rows_kept]
+            n_idx = xp.asarray(noise_index)[rows_kept]
             plan = self._split_plan(buffer_aca, d_idx, n_idx)
             plan_rows = [rows_kept[sub_rows] for _s, sub_rows, _d, _n, _dev in plan]
             caller_ready = self._stream_event(plan[0][4]) if plan else None
@@ -1447,6 +1451,104 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             "STFTGBComputations has no hessian_stft kernel. Use the "
             "WDM/chunked-het Buffer for NUTS metric construction."
         )
+
+    # ---------- cross terms of residual and template cells -------------------
+
+    def cross_terms(
+        self,
+        buffer_aca: AnalysisContainerArray,
+        template_aca: AnalysisContainerArray,
+        residual_cells,
+        template_cells,
+        window_lo,
+        window_hi,
+    ):
+        """Inner products of residual cells with template cells, per table, on the host.
+
+        Table ``b`` scores the residual of ``buffer_aca`` cell ``residual_cells[b, i]`` against the
+        template of ``template_aca`` cell ``template_cells[b, j]``, under the noise row of residual
+        ``i`` and over the active bins ``[window_lo[b], window_hi[b])``; see
+        ``STFTComputationGroup.compute_cross_terms`` for the window rules. ``template_aca`` has the
+        buffer's split layout, as its template twin has. Every cell of a table must sit in one
+        split: each split's tables run on its own device, and only the outputs cross devices.
+
+        Returns:
+            Host float64 arrays ``(cross, template, residual)`` of shapes
+            ``(num_tables, num_residuals, num_templates)``, the same, and
+            ``(num_tables, num_residuals)``: ``(r_i|t_j)``, ``(t_j|t_j)`` and ``(r_i|r_i)``.
+        """
+        xp = self.xp
+
+        def host(values, dtype):
+            return np.asarray(values.get() if hasattr(values, "get") else values, dtype=dtype)
+
+        residual_cells = host(residual_cells, np.int64)
+        template_cells = host(template_cells, np.int64)
+        window_lo = host(window_lo, np.int32)
+        window_hi = host(window_hi, np.int32)
+        num_tables, num_residuals = residual_cells.shape
+        num_templates = template_cells.shape[1]
+        cross = np.zeros((num_tables, num_residuals, num_templates))
+        template = np.zeros((num_tables, num_residuals, num_templates))
+        residual = np.zeros((num_tables, num_residuals))
+        if num_tables == 0:
+            return cross, template, residual
+
+        split_map = np.asarray(buffer_aca.split_map)
+        table_split = split_map[residual_cells[:, 0]]
+        if (
+            (split_map[residual_cells] != table_split[:, None]).any()
+            or (np.asarray(template_aca.split_map)[template_cells] != table_split[:, None]).any()
+        ):
+            raise ValueError(
+                "STFTBandLikelihoodEngine.cross_terms: every cell of a table must sit in the "
+                "split of its first residual."
+            )
+        ac_to_intra = np.asarray(buffer_aca.ac_to_intra)
+        template_ac_to_intra = np.asarray(template_aca.ac_to_intra)
+        external_noise = getattr(buffer_aca, "external_noise_rows", False)
+
+        launched = []
+        for split in np.unique(table_split).tolist():
+            tables = np.flatnonzero(table_split == split)
+            device = buffer_aca.gpus[split] if buffer_aca.gpus is not None else None
+            cells_here = residual_cells[tables]
+            residual_rows = ac_to_intra[cells_here]
+            # A cell reads the row its holder names in this split's noise array: its walker's row
+            # for external rows, else its own.
+            noise_rows = (
+                np.asarray(buffer_aca.noise_row_of_ac)[cells_here] if external_noise
+                else residual_rows
+            )
+            template_rows = template_ac_to_intra[template_cells[tables]]
+            with buffer_aca.device_context(device):
+                residual_starts = self._split_window_starts(buffer_aca, split, residual_rows)
+                template_starts = self._split_window_starts(template_aca, split, template_rows)
+                num_cells = len(template_aca.gpu_splits[split])
+                templates = template_aca.linear_data_arr[split].reshape(
+                    num_cells, self.nchannels, int(self.basis_settings.NT), -1
+                )
+                outputs = buffer_aca.cpp_splits[split].compute_cross_terms(
+                    residual_rows, noise_rows, residual_starts, templates, template_rows,
+                    template_starts, window_lo[tables], window_hi[tables], run_async=True,
+                )
+                launched.append((tables, outputs, self._stream_event(device), device))
+
+        # * Collect after every split has launched, so the splits run at the same time.
+        for tables, outputs, ready, device in launched:
+            with device_context(xp, device):
+                self._wait_events(ready)
+                cross[tables], template[tables], residual[tables] = (
+                    host(output, np.float64) for output in outputs
+                )
+        return cross, template, residual
+
+    def _split_window_starts(self, holder, split, intra_rows):
+        """Window starts of the intra-split rows ``intra_rows`` of ``split``, on its device."""
+        store = self._split_start_inds(holder, split)
+        if store is None:
+            return np.zeros(intra_rows.shape, dtype=np.int32)
+        return store[self.xp.asarray(intra_rows)]
 
 
 def make_band_likelihood_engine(

@@ -137,6 +137,16 @@ void gb_dffr_get_fstat_ll_wrap(
     bool linear_envelope, bool first_order_delays,
     int rows_per_pass, int *start_freq_inds);
 
+// The F-statistic from the two templates T+ and Tx (dffr_get_fstat of lat_dffr_kernels.hh): N,
+// the upper triangle of M and 2F per binary.
+void gb_dffr_get_fstat_terms_wrap(
+    double *projections_out, double *overlaps_out, double *two_f_out,
+    KinematicsTable *kinematics, STFTFresnel *fresnel, STFTDomain *stft,
+    double *params_all, int *data_index_all, int *noise_index_all,
+    int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+    bool linear_envelope, bool first_order_delays,
+    int rows_per_pass, int *start_freq_inds);
+
 void gb_dffr_get_ll_grad_wrap(
     double *grad_out,
     KinematicsTable *kinematics, STFTFresnel *fresnel, STFTDomain *stft,

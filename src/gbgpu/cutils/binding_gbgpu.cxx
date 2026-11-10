@@ -607,6 +607,30 @@ void GBComputationGroupWrap::gb_dffr_get_fstat_ll(
         rows_per_pass, stft_start_freq_pointer(start_freq_inds));
 }
 
+void GBComputationGroupWrap::gb_dffr_get_fstat_terms(
+    array_type<double> projections_out, array_type<double> overlaps_out,
+    array_type<double> two_f_out,
+    KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
+    STFTDomainWrap *stft_wrap,
+    array_type<double> params_all,
+    array_type<int> data_index_all, array_type<int> noise_index_all,
+    int num_bin, int nparams, double t_ref, int n_side_bins, int tdi_generation,
+    bool linear_envelope, bool first_order_delays,
+    int rows_per_pass, array_type<int> start_freq_inds)
+{
+    gb_dffr_get_fstat_terms_wrap(
+        return_pointer_and_check_length(projections_out, "projections_out", num_bin, 4),
+        return_pointer_and_check_length(overlaps_out, "overlaps_out", num_bin, 10),
+        return_pointer_and_check_length(two_f_out, "two_f_out", num_bin, 1),
+        &kinematics_wrap->table, fresnel_wrap->fresnel, stft_wrap->domain,
+        return_pointer_and_check_length(params_all, "params_all", nparams, num_bin),
+        return_pointer_and_check_length(data_index_all, "data_index_all", num_bin, 1),
+        return_pointer_and_check_length(noise_index_all, "noise_index_all", num_bin, 1),
+        num_bin, nparams, t_ref, n_side_bins, tdi_generation,
+        linear_envelope, first_order_delays,
+        rows_per_pass, stft_start_freq_pointer(start_freq_inds));
+}
+
 void GBComputationGroupWrap::gb_dffr_get_ll_grad(
     array_type<double> grad_out,
     KinematicsTableWrap *kinematics_wrap, STFTFresnelWrap *fresnel_wrap,
@@ -1481,6 +1505,11 @@ void gbgpu_part(nb::module_ &m) {
          "DFFR GB F-statistic: N_i=(d|A_i) [num_bin,4] and the upper-triangle M_ij=(A_i|A_j) "
          "[num_bin,10] (re+im) of the four basis filters, as gb_stft_get_fstat_ll. "
          "rows_per_pass (32 or 16) as for gb_dffr_swap_ll.")
+    .def("gb_dffr_get_fstat_terms", &GBComputationGroupWrap::gb_dffr_get_fstat_terms,
+         "DFFR GB F-statistic from the two templates T+ and Tx (A = 2, iota = pi/2, phi0 = 0, "
+         "psi = 0 or pi/4), which share their reception states: N [num_bin,4] and the upper "
+         "triangle of M [num_bin,10] in the layout of gb_dffr_get_fstat_ll (real parts), and 2F "
+         "[num_bin] in closed form. rows_per_pass (32 or 16) as for gb_dffr_swap_ll.")
     .def("gb_dffr_get_ll_grad", &GBComputationGroupWrap::gb_dffr_get_ll_grad,
          "DFFR GB get_ll_grad: central finite-difference gradient of logL = Re(d|h) - 0.5*(h|h) "
          "per parameter, as gb_stft_get_ll_grad; eps_k <= 0 freezes dimension k.")
