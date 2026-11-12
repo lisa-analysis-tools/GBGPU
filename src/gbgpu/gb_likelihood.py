@@ -69,6 +69,36 @@ class SwapLLResult:
     kept: Any
 
 
+@dataclass
+class PairProducts:
+    """The five complex inner products of two templates per row, against the row's cell residual.
+
+    All arrays are 1-D, length ``num_rows``, on the engine's xp. With
+    ``<x, y> = 4 df sum conj(x) C^-1 y``, conjugate-linear in its first argument as the STFT kernels
+    accumulate it, they are the raw complex products: no real part is taken, since the F-statistic
+    split and merge move combines them with the filters' complex coefficients. Rows that fail the
+    band check hold zeros.
+
+    Attributes
+    ----------
+    d_h_first, d_h_second
+        ``<d, h_first>`` and ``<d, h_second>``, with ``d`` the residual of the row's cell.
+    first_first, second_second
+        ``<h_first, h_first>`` and ``<h_second, h_second>``.
+    first_second
+        ``<h_first, h_second>``; swapping the two templates conjugates it.
+    kept
+        Boolean mask, True where the f0 bins of both templates lie inside the band.
+    """
+
+    d_h_first: Any
+    d_h_second: Any
+    first_first: Any
+    second_second: Any
+    first_second: Any
+    kept: Any
+
+
 # Physical GB parameter layout shared by every fast-computation wrap:
 # (amp, f0[Hz], fdot, fddot, phi0, inc, psi, lam, beta).
 PHYS_IDX_PHI0 = 4
@@ -333,6 +363,43 @@ class BandLikelihoodEngine(Protocol):
         implements this; the FD legacy path raises. The compute
         backend (currently JAX autograd only) is fixed at engine
         construction.
+        """
+        ...
+
+    def get_fstat_terms(
+        self,
+        buffer_aca: AnalysisContainerArray,
+        params_phys,
+        *,
+        data_index,
+        noise_index,
+    ):
+        """F-statistic terms of each row's intrinsic point against its cell's residual.
+
+        Returns ``(projections, overlaps, two_f, kept)`` on the engine's xp: N ``(n, 4)``, the
+        upper triangle of M ``(n, 10)`` in ``numpy.triu_indices(4)`` order, 2F ``(n,)`` and the keep
+        mask ``(n,)``. The two templates T+ and Tx are built at each row's intrinsic point, so the
+        extrinsic columns of ``params_phys`` play no part. Rows whose f0 bin lies outside the band
+        keep zeros and ``kept`` False. Implemented by the STFT engine with the DFFR response only;
+        the FD and WDM engines raise ``NotImplementedError``.
+        """
+        ...
+
+    def get_pair_products(
+        self,
+        buffer_aca: AnalysisContainerArray,
+        params_first_phys,
+        params_second_phys,
+        *,
+        data_index,
+        noise_index,
+    ) -> PairProducts:
+        """The five complex inner products of the two templates of each row, against its cell.
+
+        Returns a :class:`PairProducts` on the engine's xp. A row is kept when the f0 bins of both
+        templates lie inside the band; the other rows hold zeros and ``kept`` False. Implemented by
+        the STFT engine, through the swap kernel of the comp's response; the FD and WDM engines
+        raise ``NotImplementedError``.
         """
         ...
 
@@ -644,6 +711,18 @@ class FDBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             "GBFDComputations.information_matrix for proposal shaping."
         )
 
+    def get_fstat_terms(self, *_args, **_kwargs):
+        raise NotImplementedError(
+            "FDBandLikelihoodEngine.get_fstat_terms is not implemented: the F-statistic terms "
+            "come from STFTBandLikelihoodEngine with the DFFR response."
+        )
+
+    def get_pair_products(self, *_args, **_kwargs):
+        raise NotImplementedError(
+            "FDBandLikelihoodEngine.get_pair_products is not implemented: the pair products "
+            "come from STFTBandLikelihoodEngine."
+        )
+
 
 # ---------------------------------------------------------------------------
 # WDM-domain engine (wraps gbgpu.gbcomps.GBWDMComputations)
@@ -952,6 +1031,18 @@ class WDMBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             params_phys, buffer_aca,
             data_index=data_index, noise_index=noise_index,
             chunk=chunk, psd_fix=psd_fix, psd_floor_rel=psd_floor_rel,
+        )
+
+    def get_fstat_terms(self, *_args, **_kwargs):
+        raise NotImplementedError(
+            "WDMBandLikelihoodEngine.get_fstat_terms is not implemented: the F-statistic terms "
+            "come from STFTBandLikelihoodEngine with the DFFR response."
+        )
+
+    def get_pair_products(self, *_args, **_kwargs):
+        raise NotImplementedError(
+            "WDMBandLikelihoodEngine.get_pair_products is not implemented: the pair products "
+            "come from STFTBandLikelihoodEngine."
         )
 
 
@@ -1394,6 +1485,122 @@ class STFTBandLikelihoodEngine(TwoQuadraturePhaseMaxMixin):
             opt_snr_add=opt_snr,
             phase_angle=None,
             kept=keep,
+        )
+
+    # ---------- F-statistic terms and pair products --------------------------
+
+    def get_fstat_terms(
+        self,
+        buffer_aca: AnalysisContainerArray,
+        params_phys,
+        *,
+        data_index,
+        noise_index,
+    ):
+        """F-statistic terms of each row's intrinsic point against its cell's residual.
+
+        One :meth:`STFTGBComputations.get_fstat_terms_stft` call per split, with the split
+        dispatch, stream ordering, window starts and central-bin keep of :meth:`get_ll`. The comp
+        raises when its response is not DFFR, and that error passes through unchanged. Nothing is
+        stashed on the engine: the terms are return values only.
+
+        Returns:
+            ``(projections, overlaps, two_f, kept)`` on the engine's xp: ``Re(d|A_i)`` of the four
+            filters ``(n, 4)``, the upper triangle of ``Re(A_i|A_j)`` ``(n, 10)`` in
+            ``numpy.triu_indices(4)`` order, ``2F = N^T M^-1 N`` ``(n,)`` and the keep mask
+            ``(n,)``. Rows outside the band hold zeros.
+        """
+        xp = self.xp
+        params_phys = xp.atleast_2d(xp.asarray(params_phys))
+        num_rows = params_phys.shape[0]
+
+        keep = self._central_bin_keep(params_phys)
+        projections = xp.zeros((num_rows, 4), dtype=xp.float64)
+        overlaps = xp.zeros((num_rows, 10), dtype=xp.float64)
+        two_f = xp.zeros(num_rows, dtype=xp.float64)
+
+        rows_kept = xp.flatnonzero(keep)
+        if rows_kept.size:
+            data_kept = xp.asarray(data_index)[rows_kept]
+            noise_kept = xp.asarray(noise_index)[rows_kept]
+            plan = self._split_plan(buffer_aca, data_kept, noise_kept)
+            plan_rows = [rows_kept[sub_rows] for _split, sub_rows, _data, _noise, _device in plan]
+            caller_ready = self._stream_event(plan[0][4]) if plan else None
+            launched = []
+            for (split, _sub_rows, intra_data, intra_noise, device), rows in zip(plan, plan_rows):
+                with buffer_aca.device_context(device):
+                    self._wait_events(caller_ready)
+                    comp = self._comp_for_split(buffer_aca, split, device)
+                    terms_split = comp.get_fstat_terms_stft(
+                        params_phys[rows], data_index=intra_data, noise_index=intra_noise,
+                        start_freq_inds=self._split_start_inds(buffer_aca, split),
+                    )
+                    launched.append((rows, terms_split, self._stream_event(device)))
+            for rows, (projections_split, overlaps_split, two_f_split), ready in launched:
+                self._wait_events(ready)
+                projections[rows] = projections_split
+                overlaps[rows] = overlaps_split
+                two_f[rows] = two_f_split
+        return projections, overlaps, two_f, keep
+
+    def get_pair_products(
+        self,
+        buffer_aca: AnalysisContainerArray,
+        params_first_phys,
+        params_second_phys,
+        *,
+        data_index,
+        noise_index,
+    ) -> PairProducts:
+        """The five complex inner products of the two templates of each row, against its cell.
+
+        One :meth:`STFTGBComputations.get_swap_ll_stft` call per split, with the split dispatch,
+        stream ordering and window starts of :meth:`get_swap_ll`. The comp's "add" template is the
+        first row and its "remove" template the second, so its ``d_h_add``, ``d_h_remove``,
+        ``add_add``, ``remove_remove`` and ``add_remove`` are ``d_h_first``, ``d_h_second``,
+        ``first_first``, ``second_second`` and ``first_second``; its two likelihoods are dropped.
+        A row is kept when the f0 bins of both templates lie inside the band, as in
+        :meth:`get_swap_ll`. Nothing is stashed on the engine.
+        """
+        xp = self.xp
+        params_first = xp.atleast_2d(xp.asarray(params_first_phys))
+        params_second = xp.atleast_2d(xp.asarray(params_second_phys))
+
+        keep = self._central_bin_keep(params_first, params_second)
+        num_rows = keep.shape[0]
+        d_h_first = xp.zeros(num_rows, dtype=xp.complex128)
+        d_h_second = xp.zeros(num_rows, dtype=xp.complex128)
+        first_first = xp.zeros(num_rows, dtype=xp.complex128)
+        second_second = xp.zeros(num_rows, dtype=xp.complex128)
+        first_second = xp.zeros(num_rows, dtype=xp.complex128)
+
+        rows_kept = xp.flatnonzero(keep)
+        if rows_kept.size:
+            data_kept = xp.asarray(data_index)[rows_kept]
+            noise_kept = xp.asarray(noise_index)[rows_kept]
+            plan = self._split_plan(buffer_aca, data_kept, noise_kept)
+            plan_rows = [rows_kept[sub_rows] for _split, sub_rows, _data, _noise, _device in plan]
+            caller_ready = self._stream_event(plan[0][4]) if plan else None
+            launched = []
+            for (split, _sub_rows, intra_data, intra_noise, device), rows in zip(plan, plan_rows):
+                with buffer_aca.device_context(device):
+                    self._wait_events(caller_ready)
+                    comp = self._comp_for_split(buffer_aca, split, device)
+                    outputs = comp.get_swap_ll_stft(
+                        params_first[rows], params_second[rows],
+                        data_index=intra_data, noise_index=intra_noise,
+                        start_freq_inds=self._split_start_inds(buffer_aca, split),
+                    )
+                    # The first two outputs are the two likelihoods, which the products do not need.
+                    launched.append((rows, outputs[2:], self._stream_event(device)))
+            for rows, products_split, ready in launched:
+                self._wait_events(ready)
+                (d_h_first[rows], d_h_second[rows], first_first[rows], second_second[rows],
+                 first_second[rows]) = products_split
+
+        return PairProducts(
+            d_h_first=d_h_first, d_h_second=d_h_second, first_first=first_first,
+            second_second=second_second, first_second=first_second, kept=keep,
         )
 
     # ---------- get_ll_grad / hessian ---------------------------------------
