@@ -11,8 +11,9 @@
 
 namespace {
 
-template <int Rows>
-using GBDFFRTile = DFFRTile<GBDFFRSource, Rows>;
+// * The tile of either window; DFFR_WINDOW_DISPATCH takes the one of a launch's settings.
+template <int Rows, bool SymmetricWindow>
+using GBDFFRTile = DFFRTile<GBDFFRSource, Rows, SymmetricWindow>;
 
 // Launch inputs of the galactic-binary tile, with the checks of dffr_tile_inputs and the parameter
 // count. Host only.
@@ -70,9 +71,10 @@ void gb_dffr_get_ll_wrap(
                                        &stft_launch);
     if (num_bin < 1)
         return;
-    stft_get_ll_launch<GBDFFRTile<DFFR_ROWS_PER_PASS>>(
-        d_h_out, h_h_out, inputs, stft_launch, params_all, data_index_all, noise_index_all,
-        num_bin, nparams, n_side_bins, start_freq_inds);
+    DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+        stft_get_ll_launch<GBDFFRTile<DFFR_ROWS_PER_PASS, symmetric_window>>(
+            d_h_out, h_h_out, inputs, stft_launch, params_all, data_index_all, noise_index_all,
+            num_bin, nparams, n_side_bins, start_freq_inds));
 }
 
 void gb_dffr_fill_global_wrap(
@@ -90,9 +92,10 @@ void gb_dffr_fill_global_wrap(
     if (num_bin < 1)
         return;
     // ? The STFT grid is the active band, so the fill writes the active-band layout.
-    stft_fill_global_launch<GBDFFRTile<DFFR_ROWS_PER_PASS>>(
-        template_fill, inputs, stft_launch, params_all, data_index_all, factors_all, num_bin,
-        nparams, n_side_bins, true, start_freq_inds);
+    DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+        stft_fill_global_launch<GBDFFRTile<DFFR_ROWS_PER_PASS, symmetric_window>>(
+            template_fill, inputs, stft_launch, params_all, data_index_all, factors_all, num_bin,
+            nparams, n_side_bins, true, start_freq_inds));
 }
 
 void gb_dffr_swap_ll_wrap(
@@ -113,15 +116,17 @@ void gb_dffr_swap_ll_wrap(
     if (num_bin < 1)
         return;
     if (half_rows)
-        stft_swap_ll_launch<GBDFFRTile<DFFR_ROWS_PER_PASS_HALF>>(
-            d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out, inputs,
-            stft_launch, params_add_all, params_remove_all, data_index_all, noise_index_all,
-            num_bin, nparams, n_side_bins, start_freq_inds);
+        DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+            stft_swap_ll_launch<GBDFFRTile<DFFR_ROWS_PER_PASS_HALF, symmetric_window>>(
+                d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
+                inputs, stft_launch, params_add_all, params_remove_all, data_index_all,
+                noise_index_all, num_bin, nparams, n_side_bins, start_freq_inds));
     else
-        stft_swap_ll_launch<GBDFFRTile<DFFR_ROWS_PER_PASS>>(
-            d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out, inputs,
-            stft_launch, params_add_all, params_remove_all, data_index_all, noise_index_all,
-            num_bin, nparams, n_side_bins, start_freq_inds);
+        DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+            stft_swap_ll_launch<GBDFFRTile<DFFR_ROWS_PER_PASS, symmetric_window>>(
+                d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
+                inputs, stft_launch, params_add_all, params_remove_all, data_index_all,
+                noise_index_all, num_bin, nparams, n_side_bins, start_freq_inds));
 }
 
 void gb_dffr_get_fstat_ll_wrap(
@@ -141,13 +146,15 @@ void gb_dffr_get_fstat_ll_wrap(
     if (num_bin < 1)
         return;
     if (half_rows)
-        stft_get_fstat_ll_launch<GBDFFRTile<DFFR_ROWS_PER_PASS_HALF>>(
-            N_re_out, N_im_out, M_re_out, M_im_out, inputs, stft_launch, params_all,
-            data_index_all, noise_index_all, num_bin, nparams, n_side_bins, start_freq_inds);
+        DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+            stft_get_fstat_ll_launch<GBDFFRTile<DFFR_ROWS_PER_PASS_HALF, symmetric_window>>(
+                N_re_out, N_im_out, M_re_out, M_im_out, inputs, stft_launch, params_all,
+                data_index_all, noise_index_all, num_bin, nparams, n_side_bins, start_freq_inds));
     else
-        stft_get_fstat_ll_launch<GBDFFRTile<DFFR_ROWS_PER_PASS>>(
-            N_re_out, N_im_out, M_re_out, M_im_out, inputs, stft_launch, params_all,
-            data_index_all, noise_index_all, num_bin, nparams, n_side_bins, start_freq_inds);
+        DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+            stft_get_fstat_ll_launch<GBDFFRTile<DFFR_ROWS_PER_PASS, symmetric_window>>(
+                N_re_out, N_im_out, M_re_out, M_im_out, inputs, stft_launch, params_all,
+                data_index_all, noise_index_all, num_bin, nparams, n_side_bins, start_freq_inds));
 }
 
 void gb_dffr_get_fstat_terms_wrap(
@@ -190,9 +197,10 @@ void gb_dffr_get_ll_grad_wrap(
                                        &stft_launch);
     if (num_bin < 1)
         return;
-    stft_get_ll_grad_launch<GBDFFRTile<DFFR_ROWS_PER_PASS>>(
-        grad_out, inputs, stft_launch, params_all, data_index_all, noise_index_all, param_eps,
-        num_bin, nparams, n_side_bins, start_freq_inds);
+    DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+        stft_get_ll_grad_launch<GBDFFRTile<DFFR_ROWS_PER_PASS, symmetric_window>>(
+            grad_out, inputs, stft_launch, params_all, data_index_all, noise_index_all, param_eps,
+            num_bin, nparams, n_side_bins, start_freq_inds));
 }
 
 void gb_dffr_swap_ll_grad_wrap(
@@ -213,15 +221,17 @@ void gb_dffr_swap_ll_grad_wrap(
     if (num_bin < 1)
         return;
     if (half_rows)
-        stft_swap_ll_grad_launch<GBDFFRTile<DFFR_ROWS_PER_PASS_HALF>>(
-            grad_add_out, grad_remove_out, inputs, stft_launch, params_add_all, params_remove_all,
-            data_index_all, noise_index_all, param_eps_add, param_eps_remove, num_bin, nparams,
-            n_side_bins, start_freq_inds);
+        DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+            stft_swap_ll_grad_launch<GBDFFRTile<DFFR_ROWS_PER_PASS_HALF, symmetric_window>>(
+                grad_add_out, grad_remove_out, inputs, stft_launch, params_add_all,
+                params_remove_all, data_index_all, noise_index_all, param_eps_add,
+                param_eps_remove, num_bin, nparams, n_side_bins, start_freq_inds));
     else
-        stft_swap_ll_grad_launch<GBDFFRTile<DFFR_ROWS_PER_PASS>>(
-            grad_add_out, grad_remove_out, inputs, stft_launch, params_add_all, params_remove_all,
-            data_index_all, noise_index_all, param_eps_add, param_eps_remove, num_bin, nparams,
-            n_side_bins, start_freq_inds);
+        DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+            stft_swap_ll_grad_launch<GBDFFRTile<DFFR_ROWS_PER_PASS, symmetric_window>>(
+                grad_add_out, grad_remove_out, inputs, stft_launch, params_add_all,
+                params_remove_all, data_index_all, noise_index_all, param_eps_add,
+                param_eps_remove, num_bin, nparams, n_side_bins, start_freq_inds));
 }
 
 void gb_dffr_information_matrix_wrap(
