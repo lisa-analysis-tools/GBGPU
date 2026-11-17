@@ -25,6 +25,9 @@ compare them with the comp, to check their own arguments, and for the 16-row til
   subsets, window starts and frozen steps; a carrier crossing and a chirp that changes sign; and
   the parameters the source model declares free of the reception states.
 * Argument checks, and the CUDA backend against the CPU backend (skipped without a usable GPU).
+* The symmetric Tukey window of the data (scipy's ``sym=True``, N and h on STFTFresnelWrap) in
+  place of the periodic one: the consumer identities, the Fisher matrix and the CUDA tests again,
+  and DFFR and the existing response moving together from one window to the other.
 """
 
 import unittest
@@ -109,6 +112,11 @@ FSTAT_FILTER_BOUNDS = dict(projections=1e-8, overlaps=1e-9, fstat=1e-7, same_tem
 # nvcc fuses multiply-adds differently in the two kernels, so they agree to rounding (up to 1e-12 on
 # this fixture, 2026-11-05), not bit for bit. On the CPU they are equal.
 FSTAT_GPU_SWAP_BOUND = 1e-11
+# ? The symmetric window against the periodic one: the change of the DFFR template relative to its
+# ? norm, measured 1.06e-3 on this grid, and the difference of the two responses' changes relative
+# ? to the change, measured 2.6e-3 (2026-11-16; the two responses differ by 1.4e-3 with either).
+WINDOW_CHANGE_FLOOR = 5e-4
+WINDOW_CHANGE_DISAGREEMENT = 1e-2
 
 
 def _host(array):
@@ -161,6 +169,14 @@ def _settings(backend_name):
     )
 
 
+def _window_kwargs(use_sym_window, window_alpha):
+    """N and h of the symmetric Tukey window of a segment for STFTFresnelWrap; none for the
+    periodic window and the boxcar, as STFTComputationGroup does."""
+    if not (use_sym_window and window_alpha > 0.0):
+        return {}
+    return dict(window_samples=int(round(SEGMENT_DT / SAMPLE_DT)), sample_cadence=SAMPLE_DT)
+
+
 class _StftCompsShim:
     """Stand-in for STFTComputationGroup: ``cpp_fresnel``, ``cpp_domain``, ``d_d``, the group's
     ``linear_envelope``, ``tdi_type`` and ``num_noise``, and ``cpp_kinematics``, which returns a
@@ -200,8 +216,10 @@ class _DFFRCase:
         linear_envelope=True,
         first_order_delays=True,
         t_ref=0.0,
+        use_sym_window=False,
     ):
         self.settings = _settings(backend_name)
+        self.use_sym_window = use_sym_window
         # * Bound after construction: the shim needs the comp's backend and orbits.
         self.comp = STFTGBComputations(
             stft_comps=None,
@@ -270,6 +288,7 @@ class _DFFRCase:
             settings.df,
             window_alpha=window_alpha,
             use_midpoint=use_midpoint,
+            **_window_kwargs(self.use_sym_window, window_alpha),
         )
         shim = _StftCompsShim(fresnel, domain, self.table, linear_envelope, tdi_type)
         shim.keepalive = (data, inv_c)
@@ -667,9 +686,11 @@ class DFFRSelfConsistencyTest(unittest.TestCase):
     """The consumer identities of test_stft_gb.py for the DFFR response, CPU backend."""
 
     backend_name = "cpu"
+    #: The symmetric Tukey window of the data in place of the periodic one.
+    use_sym_window = False
 
     def _case(self, **options):
-        return _DFFRCase(self.backend_name, **options)
+        return _DFFRCase(self.backend_name, use_sym_window=self.use_sym_window, **options)
 
     def test_fill_global_matches_get_ll(self):
         """get_ll equals fill_global followed by the domain inner product."""
@@ -820,7 +841,12 @@ class DFFRSelfConsistencyTest(unittest.TestCase):
 
     def test_fstat_terms_read_their_data_and_noise_rows(self):
         """Every row is evaluated against its own data and noise rows, as swap(T+, Tx) is."""
-        case = _DFFRFisherCase(self.backend_name, window_alpha=0.5, tdi="2nd generation")
+        case = _DFFRFisherCase(
+            self.backend_name,
+            window_alpha=0.5,
+            tdi="2nd generation",
+            use_sym_window=self.use_sym_window,
+        )
         rng = np.random.default_rng(11)
         shape = case.shim.data.shape
         # * In place: the domain reads this array.
@@ -1104,6 +1130,7 @@ class _DFFRFisherCase(_DFFRCase):
             settings.df,
             window_alpha=window_alpha,
             use_midpoint=use_midpoint,
+            **_window_kwargs(self.use_sym_window, window_alpha),
         )
         grid = type("Grid", (), {"NT": nt, "NF_active": nf, "df": settings.df})()
         shim = _FisherShim(fresnel, domain, self.table, linear_envelope, inv_c, grid, num_noise)
@@ -1131,6 +1158,8 @@ class DFFRFisherTest(unittest.TestCase):
     |F_kernel - F_ref| / sqrt(F_ii F_jj), because off-diagonal entries pass through zero."""
 
     backend_name = "cpu"
+    #: The symmetric Tukey window of the data in place of the periodic one.
+    use_sym_window = False
     # * Two settings that differ in the TDI generation, the window, the envelope and the delays.
     SETTINGS = (
         dict(tdi="2nd generation", window_alpha=0.5, linear_envelope=True, first_order_delays=True),
@@ -1140,7 +1169,7 @@ class DFFRFisherTest(unittest.TestCase):
     )
 
     def _case(self, **options):
-        return _DFFRFisherCase(self.backend_name, **options)
+        return _DFFRFisherCase(self.backend_name, use_sym_window=self.use_sym_window, **options)
 
     def _sources(self):
         return np.stack([GB_PARAMS, GB_PARAMS_B]), np.array([0, 1], dtype=np.int32)
@@ -1434,7 +1463,9 @@ class DFFRGPUTest(DFFRSelfConsistencyTest):
         tiles of swap and both F-statistics with each other, within GPU_RELATIVE_BOUND of their
         peaks."""
         gpu = self._case(window_alpha=0.5, tdi="2nd generation")
-        cpu = _DFFRCase("cpu", window_alpha=0.5, tdi="2nd generation")
+        cpu = _DFFRCase(
+            "cpu", window_alpha=0.5, tdi="2nd generation", use_sym_window=self.use_sym_window
+        )
         pairs = {
             "compact template": (gpu.fill_template(GB_PARAMS)[0], cpu.fill_template(GB_PARAMS)[0]),
             "get_ll": (
@@ -1470,6 +1501,9 @@ class DFFRGPUFisherTest(unittest.TestCase):
     8 parameters of the global fit; and against the CPU on A and phi0 alone, whose variants share
     one set of reception states."""
 
+    #: The symmetric Tukey window of the data in place of the periodic one.
+    use_sym_window = False
+
     def _assert_close(self, first, second):
         diagonal = np.abs(np.diagonal(second, axis1=1, axis2=2))
         scale = np.sqrt(diagonal[:, :, None] * diagonal[:, None, :])
@@ -1478,8 +1512,8 @@ class DFFRGPUFisherTest(unittest.TestCase):
     def test_gpu_matches_reference_and_cpu(self):
         params, noise_index = np.stack([GB_PARAMS, GB_PARAMS_B]), np.array([0, 1], dtype=np.int32)
         setting = DFFRFisherTest.SETTINGS[0]
-        gpu = _DFFRFisherCase("gpu", **setting)
-        cpu = _DFFRFisherCase("cpu", **setting)
+        gpu = _DFFRFisherCase("gpu", use_sym_window=self.use_sym_window, **setting)
+        cpu = _DFFRFisherCase("cpu", use_sym_window=self.use_sym_window, **setting)
         eps = cpu.comp._information_matrix_steps(9, None, None, 1e-6)[0]
         kernel = gpu.fisher(params, noise_index, inds=TEST_INDS)
         pairs = {
@@ -1501,6 +1535,74 @@ class DFFRGPUFisherTest(unittest.TestCase):
         for name, (first, second) in pairs.items():
             with self.subTest(quantity=name):
                 self._assert_close(first, second)
+
+
+@unittest.skipUnless(HAVE_STFT_GB, "requires the GBGPU STFT-GB build")
+class DFFRSymmetricWindowTest(DFFRSelfConsistencyTest):
+    """The consumer identities with the symmetric Tukey window of the data, CPU backend."""
+
+    use_sym_window = True
+
+
+@unittest.skipUnless(HAVE_STFT_GB, "requires the GBGPU STFT-GB build")
+class DFFRSymmetricWindowFisherTest(DFFRFisherTest):
+    """The Fisher matrix tests with the symmetric Tukey window of the data, CPU backend."""
+
+    use_sym_window = True
+
+
+@unittest.skipUnless(HAVE_STFT_GB and _cuda_backend_name(), "requires a usable CUDA backend")
+class DFFRSymmetricWindowGPUTest(DFFRGPUTest):
+    """The CUDA tests and the CUDA values against the CPU values with the symmetric window."""
+
+    use_sym_window = True
+
+
+@unittest.skipUnless(HAVE_STFT_GB and _cuda_backend_name(), "requires a usable CUDA backend")
+class DFFRSymmetricWindowGPUFisherTest(DFFRGPUFisherTest):
+    """The CUDA Fisher matrix against the reference and the CPU with the symmetric window."""
+
+    use_sym_window = True
+
+
+@unittest.skipUnless(HAVE_STFT_GB, "requires the GBGPU STFT-GB build")
+class DFFRWindowChangeTest(unittest.TestCase):
+    """The symmetric window moves DFFR and the existing response by the same change of their
+    templates: both read it from the one STFTFresnel object."""
+
+    def _templates(self, use_sym_window):
+        case = _DFFRCase(
+            "cpu",
+            window_alpha=0.5,
+            use_midpoint=True,
+            tdi="2nd generation",
+            linear_envelope=True,
+            use_sym_window=use_sym_window,
+        )
+        existing = STFTGBComputations(
+            stft_comps=case.shim,
+            T=NUM_SAMPLES * SAMPLE_DT,
+            t_ref=0.0,
+            orbits=None,
+            tdi_config=TDIConfig("2nd generation", force_backend="cpu"),
+            force_backend="cpu",
+            n_side_bins=N_SIDE_BINS,
+            linear_envelope=True,
+            response="tdi_on_the_fly",
+        )
+        column = case.xp.zeros((1, 3, case.settings.NT, case.settings.NF_active), dtype=np.complex128)
+        existing.fill_global_stft(GB_PARAMS, column)
+        return _host(case.fill_global(GB_PARAMS)).ravel(), _host(column).ravel()
+
+    def test_both_responses_follow_the_window(self):
+        dffr_periodic, existing_periodic = self._templates(False)
+        dffr_symmetric, existing_symmetric = self._templates(True)
+        dffr_change = dffr_symmetric - dffr_periodic
+        existing_change = existing_symmetric - existing_periodic
+        change = np.linalg.norm(dffr_change) / np.linalg.norm(dffr_periodic)
+        disagreement = np.linalg.norm(dffr_change - existing_change) / np.linalg.norm(dffr_change)
+        self.assertGreater(change, WINDOW_CHANGE_FLOOR, msg=f"window change {change:.3e}")
+        self.assertLess(disagreement, WINDOW_CHANGE_DISAGREEMENT, msg=f"{disagreement:.3e}")
 
 
 if __name__ == "__main__":
