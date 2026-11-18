@@ -129,9 +129,8 @@ class Guide(ABC):
             self.run_single_directory(directory)
 
     def check_run_status(self, indicator: str) -> bool:
-        # if indicator != "planets":
+        # if indicator == "A2_s555" or indicator == "A2_s633" or indicator == "C2_s633":
         #     return False
-
         if not os.path.exists(self.status_file):
             with open(self.status_file, "w") as fp:
                 pass
@@ -165,9 +164,7 @@ class Guide(ABC):
         for fp in os.listdir(directory):
             if fp[-4:] == ".dat":
                 indicator = fp.split("data_")[-1].split(".dat")[0]
-
                 need_to_run = self.check_run_status(indicator)
-
                 if need_to_run:
                     yield (indicator, fp)
                 else:
@@ -420,7 +417,7 @@ class Guide(ABC):
 
 class TriplesSetupGuide(Guide):
 
-    def __init__(self, *args, N=2048, batch_size=1000, **kwargs):
+    def __init__(self, *args, N=16384, batch_size=1000, **kwargs):
         name = "triples_setup"
         self.batch_size = batch_size
         self.N = N
@@ -454,7 +451,7 @@ class TriplesSetupGuide(Guide):
         e2 = data_input['e3']
         M_tot_kg = (m1 + m2) * MSUN + m3 * Mjup
         P2 = (2 * np.pi * np.sqrt(a2 ** 3 / (G * M_tot_kg))) / YEAR
-
+        # breakpoint()
         Omega2 = np.random.rand(len(f0)) * 2 * np.pi
         omega2 = np.random.rand(len(f0)) * 2 * np.pi
 
@@ -742,7 +739,7 @@ class SearchRuns(Guide):
             template_params[4] = (template_params[4] + phase_shift) % (2 * np.pi)
 
             N_found = self.determine_N(injection_params)
-            
+            # breakpoint()
             if N_found > self.N_max:
                 if self.verbose:
                     print(f"ID {int(orig_id)} (index: {int(index)}) has too high of N value so not running.")
@@ -1428,6 +1425,7 @@ class EvidenceRuns(Guide):
                 )
                 if few_left:
                     counter_few[running] += 1
+                    print(counter_few)
 
                 check_convergence = (
                     (current_old_bf_count >= number_old_evidences)

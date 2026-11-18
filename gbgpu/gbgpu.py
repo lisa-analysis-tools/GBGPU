@@ -131,6 +131,7 @@ class GBGPU(object):
         oversample=1,
         tdi2=False,
         use_c_implementation=False,
+        T_channel = False
     ):
         """Create waveforms in batches.
 
@@ -325,11 +326,14 @@ class GBGPU(object):
 
         # adjust for TDI2 if needed
         if tdi2:
-            omegaL = 2 * np.pi * f0_out * (Larm / Clight)
+            omegaL = 2 * np.pi * f0 * (Larm / Clight)
             tdi2_factor = 2.0j * self.xp.sin(2 * omegaL) * self.xp.exp(-2j * omegaL)
             fctr *= tdi2_factor
 
-        XYZf *= fctr
+        if isinstance(fctr, float):
+            fctr = self.xp.array([fctr])
+
+        XYZf *= fctr[:, None, None]
 
         # we do not care about T right now
         Af, Ef, Tf = AET(XYZf[:, 0], XYZf[:, 1], XYZf[:, 2])
@@ -337,7 +341,8 @@ class GBGPU(object):
         # setup waveforms for efficient GPU likelihood or global template building
         self.A_out = Af.T.flatten()
         self.E_out = Ef.T.flatten()
-
+        if T_channel:
+            self.T_out = Tf.T.flatten()
         self.X_out = XYZf[:, 0].T.flatten()
 
     def _computeXYZ(self, T, Gs, f0, fdot, fddot, fstar, ampl, q, tm, *add_args):
@@ -591,6 +596,11 @@ class GBGPU(object):
     def E(self):
         """return E channel reshaped based on number of binaries"""
         return self.E_out.reshape(self.N, self.num_bin).T
+    
+    @property
+    def T(self):
+        """return E channel reshaped based on number of binaries"""
+        return self.T_out.reshape(self.N, self.num_bin).T
 
     @property
     def freqs(self):
@@ -1873,7 +1883,7 @@ class GBGPU(object):
     #     E_out[i_idx, col_inds] = E_temp
     #     return A_out, E_out
 
-    def inject_signal(self, *args, fmax=None, num_waves :int = 1, combine=False, T=4.0 * YEAR, dt=10.0, **kwargs):
+    def inject_signal(self, *args, fmax=None, num_waves :int = 1, combine=False, T=4.0 * YEAR, dt=10.0, T_output = False, **kwargs):
         """Inject a single signal
 
         Provides the injection of a single signal into a data stream with frequencies
@@ -1895,7 +1905,44 @@ class GBGPU(object):
                 on GPU.
 
         """
+        # if fmax is None:
+        #     fmax = 1 / (2 * dt)
 
+        # # adjust inputs for run wave
+        # N_obs = int(T / dt)
+        # T = N_obs * dt
+        # kwargs["T"] = T
+        # kwargs["dt"] = dt
+        # self.df = df = 1 / T
+
+        # # create frequencies
+        # f = np.arange(0.0, fmax + df, df)
+        # num = len(f)
+
+        # # NumPy arrays for data streams of injections
+        # A_out = np.zeros(num, dtype=np.complex128)
+        # E_out = np.zeros(num, dtype=np.complex128)
+
+        # # build the templates
+        # self.run_wave(*args, **kwargs)
+
+        # # add each mode to the templates
+        # start = self.start_inds[0]
+
+        # # if using GPU, will return to CPU
+        # if self.use_gpu:
+        #     A_temp = self.A_out.squeeze().get()
+        #     E_temp = self.E_out.squeeze().get()
+
+        # else:
+        #     A_temp = self.A_out.squeeze()
+        #     E_temp = self.E_out.squeeze()
+
+        # # fill the data streams at the4 proper frqeuencies
+        # A_out[start.item() : start.item() + self.N] = A_temp
+        # E_out[start.item() : start.item() + self.N] = E_temp
+
+        # return A_out, E_out
         # get binspacing
         if fmax is None:
             fmax = 1 / (2 * dt)
@@ -1916,6 +1963,7 @@ class GBGPU(object):
 
         A_out = np.zeros((num_waves, num), dtype=np.complex128)
         E_out = np.zeros((num_waves, num), dtype=np.complex128)
+        T_out = np.zeros((num_waves, num), dtype=np.complex128)
 
         # build the templates
         self.run_wave(*args, **kwargs)
@@ -1924,31 +1972,43 @@ class GBGPU(object):
         if self.use_gpu:
             A_temp = self.A.squeeze().get()
             E_temp = self.E.squeeze().get()
+            if T_output:
+                T_temp = self.T.squeeze().get()
 
         else:
             A_temp = self.A.squeeze()
             E_temp = self.E.squeeze()
+            if T_output:
+                T_temp = self.T.squeeze()
+
 
         # for one or more than 1 wave    
         i_idx = np.arange(num_waves)[:, None]
-        start_inds = self.start_inds.get()
+        if self.use_gpu:
+            start_inds = self.start_inds.get()
+        else:
+            start_inds = self.start_inds
         col_inds = start_inds[:, None] + np.arange(self.N)[None, :]
-
+        # breakpoint()
         # fill the data streams at the proper frqeuencies
         A_out[i_idx, col_inds] = A_temp
         E_out[i_idx, col_inds] = E_temp
+        if T_output:
+            T_out[i_idx, col_inds] = T_temp
         if combine:
             A_summed = np.sum(A_out, axis=0)
             E_summed = np.sum(E_out, axis=0)
+            if T_output:
+                T_summed = np.sum(T_out, axis=0)
 
         assert num_waves > 0
 
         if num_waves == 1:
-            return A_out[0], E_out[0]
+            return (A_out[0], E_out[0]) if T_output == False else (A_out[0], E_out[0], T_out[0])
         elif num_waves > 1 and combine == False:
-            return A_out, E_out 
+            return (A_out, E_out) if T_output == False else (A_out, E_out, T_out)
         elif num_waves > 1 and combine == True:
-            return A_summed, E_summed
+            return (A_summed, E_summed) if T_output == False else (A_summed, E_summed, T_summed)
 
     def _apply_parameter_transforms(self, params, parameter_transforms):
         """Apply parameter transformations to params for Information Matrix."""

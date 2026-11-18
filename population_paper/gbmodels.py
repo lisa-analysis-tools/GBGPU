@@ -145,6 +145,7 @@ class PriorTransformFn:
         self.is_third =  self.P2_min is not None
 
     def adjust_logp(self, logp, groups_running):
+        # breakpoint()
         if groups_running is None:
             groups_running = xp.arange(len(self.f_min))
         f_min_here = self.f_min[groups_running]

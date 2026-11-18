@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=Es442M1640
+#SBATCH --job-name=E4R40s444
 #SBATCH --time=2-0:00:00
 #SBATCH --partition=gpu-shared
 #SBATCH --nodes=1
@@ -9,7 +9,7 @@
 #SBATCH --mem=90G
 #SBATCH --gpus=1
 #SBATCH --export=ALL
-#SBATCH --output=Es442M1640.out
+#SBATCH --output=E4R40s444.out
 
 module load python
 module add gpu/0.17.3b

@@ -20,17 +20,18 @@ def get_settings(copy_settings_file=False):
         use_c_implementation=True,
     )
  
-    base_string = "FINAL_RUN_2"
+    base_string = "FR_3_YEAR_4"
     main_dir = "/expanse/lustre/projects/umn131/vgupta1/GBGPU/population_paper/"
-    population_directory_list = [main_dir + f"Realizations_all/Realization_{i}/" for i in range(2, 7)][0:1]
+    population_directory_list = [main_dir + f"Realizations_bd/Realization_{i}/" for i in range(2, 7)][2:3]
     # population_directory_list = [main_dir + f"Old_Realization_2019/"]
 
-    triples_setup_directory = main_dir + "populations_for_search/"
-    search_dir = main_dir + "final_run_2/search_info/"
-    evidence_dir = main_dir + "final_run_2/evidence_info/evidence_info_brown_dwarfs/evidence_info_bd_1640/"
-    pe_dir = main_dir + "pe_info_brown_dwarfs/pe_info_bd_5864/"
-    status_file_base = "status_file_1640"
-    bad_file = main_dir + base_string + "_1640_bad_file.txt"
+    triples_setup_directory = main_dir + "final_run_3/four_year/populations_for_search/"
+    search_dir = main_dir + "final_run_3/four_year/search_info/"
+    evidence_dir = main_dir + "final_run_3/four_year/evidence_info/evidence_info_brown_dwarfs/evidence_info_bd_4058/"
+    # evidence_dir = main_dir + "final_run_3/four_year/evidence_info/evidence_info_exo/"
+    pe_dir = main_dir + "final_run_3/four_year/pe_info_exo/"
+    status_file_base = "status_file_4058"
+    bad_file = main_dir + base_string + "_4058_bad_file.txt"
     
     directory_info = dict(
         base_string=base_string,
@@ -54,7 +55,7 @@ def get_settings(copy_settings_file=False):
 
     verbose = True
 
-    m3_lims = [16.0, 40.0]
+    m3_lims = [40.0, 58.0]
     e2_lims = [0.0, 0.985]
     opt_snr_lims = [0.0, 1e6]
 

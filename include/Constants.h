@@ -5,17 +5,16 @@
 
 /* --------------  MATHEMATICAL CONSTANTS  -------------- */
 /* Square root of 3 */
-#define SQ3   1.73205080757
+#define SQ3   1.7320508075688772
 
-/* Pi's and frinds */
+/* Pi's and freinds */
 //use math.h (M_PI) for PI
 #define PI2   6.283185307179586
-#define PIon2 1.57079632679
-#define PIon4 0.78539816339
+#define PIon2 1.5707963267948966
+#define PIon4 0.7853981633974483
 
 /* Natural log of 2 */
-#define LN2 0.693147180559945
-
+#define LN2   0.6931471805599453
 
 
 
@@ -25,20 +24,20 @@
 #define Clight 299792458.
 
 /* Mass of the Sun (s) */
-#define TSUN  4.9169e-6
+#define TSUN  4.925490947641158e-06
 
 /* Number of meters in a parsec */
-#define PC 3.0856775807e16
+#define PC 3.085677581491367e16
 
 /* Number of seconds in a year */
-#define YEAR 31457280.0
+#define YEAR 31558149.7635456
 
 /* Astronomical unit (meters) */
-#define AU 1.49597870660e11
+#define AU 1.49597870700e11
 
-#define MSUN 1.989e30
-#define Mjup 1.898e27
-#define G 6.67e-11
+#define MSUN 1.9884754153381438e30
+#define Mjup 1.89819e27
+#define G 6.67408e-11
 
 
 /* Photon shot noise power */
